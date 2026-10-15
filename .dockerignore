@@ -1,0 +1,12 @@
+node_modules
+dist
+storage
+test
+scripts
+.git
+.env
+.env.*
+!.env.example
+*.log
+src/generated
+vitest.config.ts

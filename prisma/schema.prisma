@@ -1,0 +1,485 @@
+// MemberFrame database schema. MySQL 8.0+ via Prisma.
+//
+// Mirrors `docs/memberframe-backend-prd.md` section 5 and the entity list in
+// the main PRD section 11.1. Only the tables the implemented routes need are
+// declared: the repo's own rule is to declare nothing preemptively, the same way
+// `framer.json` adds a permission in the task that first needs it.
+//
+// THREE THINGS PRISMA CANNOT EXPRESS, handled in `migrations/` by hand:
+//
+//   1. The email column collation. MySQL 8's default collation is case
+//      insensitive, which is what `CITEXT` gave us for free, but it is also
+//      ACCENT insensitive, which would make jose@x.com and the accented
+//      spelling the same mailbox. They are not. Pinned to utf8mb4_0900_as_ci.
+//
+//   2. The `active_email` generated column and its unique index. PRD section
+//      11.2 wants soft delete plus unique email per site, which PostgreSQL does
+//      with a partial index. MySQL has no partial indexes, and the obvious
+//      workaround is wrong: a unique key over (site_id, email, deleted_at)
+//      allows unlimited active duplicates, because MySQL treats every NULL in
+//      a unique index as distinct.
+//
+//   3. `ON DELETE CASCADE` ordering for the self-referential cases, which there
+//      are none of yet. Noted so the next person does not look for it.
+//
+// Run `npm run db:migrate` after editing. The hand-written SQL lives in its own
+// migration so `prisma migrate dev` never overwrites it.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// CREATORS AND TENANTS
+// ============================================================================
+
+/// A MemberFrame customer. Owns Framer projects and pays us.
+///
+/// Distinct from `Member`, which is a visitor to one of their sites and pays
+/// THEM. Backend PRD section 3.3 keeps the two apart: a human can be both, and
+/// those are unrelated rows with unrelated passwords.
+model User {
+  // uuid(7) rather than uuid(4). MySQL InnoDB clusters rows by primary key and
+  // copies the key into every secondary index, so a random v4 scatters inserts
+  // across pages and fragments the index. v7 is time ordered, so inserts
+  // append. Needs Prisma 5.18 or newer.
+  id              String    @id @default(uuid(7)) @db.Char(36)
+  name            String    @db.VarChar(255)
+  email           String    @unique @db.VarChar(255)
+  emailVerifiedAt DateTime? @map("email_verified_at") @db.DateTime(3)
+  /// Nullable since the connect flow. A creator who arrived through the plugin
+  /// proved an address by email code and never chose a password, so there is
+  /// nothing to store. Same reasoning as Member.passwordHash, and the same
+  /// rule: NULL is a failed credential check, never a bypass.
+  passwordHash    String?   @map("password_hash") @db.VarChar(255)
+
+  /// What `framer.getCurrentUser()` can supply. Nullable and NOT unique:
+  /// blocker B7 records that the SDK exposes no email, so a creator arriving
+  /// through the plugin cannot be matched to an account by address. The join
+  /// stays best effort until B7 is resolved.
+  framerUserId String? @map("framer_user_id") @db.VarChar(255)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  sites    Site[]
+  sessions CreatorSession[]
+
+  @@index([framerUserId])
+  @@map("users")
+}
+
+/// The tenant. One Framer project.
+///
+/// Every member, tier, and session row carries `siteId`, and no query may omit
+/// it. Backend PRD section 3.1 enforces that in three layers.
+model Site {
+  id       String @id @default(uuid(7)) @db.Char(36)
+  userId   String @map("user_id") @db.Char(36)
+  siteName String @map("site_name") @db.VarChar(255)
+
+  /// Public. Baked into each generated canvas component, exactly like
+  /// `apiBaseUrl` already is, and no more secret than a Stripe publishable key.
+  ///
+  /// It identifies; the `Origin` header verifies. Backend PRD section 3.2, and
+  /// the resolution of conflict C17, where three documents disagreed on how a
+  /// request names its tenant.
+  siteKey String @unique @map("site_key") @db.VarChar(64)
+
+  /// Exact origins. No wildcards, ever. See `middleware/cors.ts` for why a
+  /// wildcard is not merely unwise here but non-functional: the CORS spec makes
+  /// `Allow-Credentials: true` and `Allow-Origin: *` mutually exclusive.
+  allowedOrigins Json @map("allowed_origins")
+
+  /// The Framer project id from framer.getProjectInfo(). Unique, because one
+  /// Framer project is one tenant: a second connect attempt for the same
+  /// project must find this row rather than make another. MySQL treats every
+  /// NULL in a unique index as distinct, so a site created some other way and
+  /// never connected does not occupy the slot.
+  framerSiteId String? @unique @map("framer_site_id") @db.VarChar(255)
+
+  /// Per-site salt for F22 shared-password grants. Rotating it invalidates
+  /// every outstanding grant for this site and nothing else.
+  grantSalt String @map("grant_salt") @db.Char(64)
+
+  sharedPasswordHash String? @map("shared_password_hash") @db.VarChar(255)
+  defaultLocale      String  @default("en") @map("default_locale") @db.VarChar(10)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  user           User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  settings       SiteSettings?
+  tiers          Tier[]
+  members        Member[]
+  otps           MemberOtp[]
+  passwordResets MemberPasswordReset[]
+  emailLogs      EmailLog[]
+
+  @@index([userId])
+  @@map("sites")
+}
+
+// ============================================================================
+// TIERS
+// ============================================================================
+
+/// A membership plan.
+///
+/// `rank` is the field `isEntitled` compares, which makes its uniqueness the
+/// most consequential constraint in this schema. Two tiers sharing a rank makes
+/// a Gold member and a Silver member identical to every gate on the site, with
+/// no error raised anywhere.
+///
+/// The unique key is unconditional and includes inactive tiers, because the
+/// resolver looks a tier up by key without checking `isActive`.
+model Tier {
+  id     String @id @default(uuid(7)) @db.Char(36)
+  siteId String @map("site_id") @db.Char(36)
+
+  /// free_member, tier_1, tier_2, vip, or a creator-defined key. Conflict C9:
+  /// the gate's control is a fixed enum of four until the generator can read
+  /// this table and emit the site's real keys.
+  key  String @db.VarChar(50)
+  name String @db.VarChar(100)
+  rank Int
+
+  // Integer minor units. PRD section 11.2: floating point currency produces
+  // rounding errors. 1900 is $19.00.
+  monthlyPriceMinor  Int? @map("monthly_price_minor")
+  annualPriceMinor   Int? @map("annual_price_minor")
+  lifetimePriceMinor Int? @map("lifetime_price_minor")
+
+  currency String  @default("USD") @db.Char(3)
+  isActive Boolean @default(true) @map("is_active")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  site Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
+
+  @@unique([siteId, key], map: "uniq_tiers_site_key")
+  @@unique([siteId, rank], map: "uniq_tiers_site_rank")
+  @@map("tiers")
+}
+
+// ============================================================================
+// MEMBERS
+// ============================================================================
+
+model Member {
+  id     String @id @default(uuid(7)) @db.Char(36)
+  siteId String @map("site_id") @db.Char(36)
+
+  /// Unique per site, not globally. PRD section 11.2: the same person may be a
+  /// member of two different creators' sites.
+  ///
+  /// The unique index is NOT declared here. It is on the generated
+  /// `active_email` column, added by hand in
+  /// `migrations/*_mysql_specifics/migration.sql`, so that a soft-deleted
+  /// member stops occupying their address and can re-register.
+  email String @db.VarChar(255)
+
+  emailVerifiedAt DateTime? @map("email_verified_at") @db.DateTime(3)
+  name            String?   @db.VarChar(255)
+  avatarUrl       String?   @map("avatar_url") @db.Text
+
+  /// Nullable, and that is load bearing.
+  ///
+  /// A member who signed up with Google has no password. The sign-in path must
+  /// treat NULL as a failed credential check, never as a bypass and never as a
+  /// distinguishable error, because the difference is a user-enumeration
+  /// oracle. See `services/memberAuthService.ts`.
+  passwordHash      String?   @map("password_hash") @db.VarChar(255)
+  passwordUpdatedAt DateTime? @map("password_updated_at") @db.DateTime(3)
+
+  activeTier String @default("free_member") @map("active_tier") @db.VarChar(50)
+
+  /// active, trialing, past_due, canceled. A string rather than a MySQL enum:
+  /// adding a value to a MySQL enum is an ALTER TABLE, and `isEntitled` already
+  /// treats an unrecognised status as not entitled, which fails closed.
+  status String @default("active") @db.VarChar(20)
+
+  /// FP-09 custom profile fields. One JSON column rather than a table per
+  /// creator-defined field, which would mean schema migrations driven by
+  /// creator input. See `00-member-data-model.md` section 5.4.
+  metadata Json? @db.Json
+
+  // FP-02 lockout. Five consecutive failures, fifteen minutes, counted per
+  // member and cleared on success.
+  failedLoginCount Int       @default(0) @map("failed_login_count")
+  lockedUntil      DateTime? @map("locked_until") @db.DateTime(3)
+  lastLoginAt      DateTime? @map("last_login_at") @db.DateTime(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  /// Soft delete, per PRD section 11.2, to preserve invoice history.
+  deletedAt DateTime? @map("deleted_at") @db.DateTime(3)
+
+  site           Site                  @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  sessions       MemberSession[]
+  passwordResets MemberPasswordReset[]
+
+  @@index([siteId, status])
+  @@index([siteId, activeTier])
+  @@index([lockedUntil])
+  @@map("members")
+}
+
+/// An opaque server-side session.
+///
+/// Not a JWT. PRD section 14.1 S2 forbids a token in `localStorage`, and the
+/// canvas components are written so they never see one. An opaque row also
+/// makes revocation a DELETE rather than a wait for expiry, which is what lets
+/// a password reset invalidate every other session.
+///
+/// Only the hash is stored. A database read does not hand over live sessions.
+model MemberSession {
+  id        String @id @default(uuid(7)) @db.Char(36)
+  memberId  String @map("member_id") @db.Char(36)
+  siteId    String @map("site_id") @db.Char(36)
+  tokenHash String @unique @map("token_hash") @db.VarChar(255)
+
+  /// Diagnostics only. Never used to authorize: an IP changes mid-session on
+  /// mobile, and pinning a session to one would log members out on the train.
+  userAgent String? @map("user_agent") @db.VarChar(512)
+  ipAddress String? @map("ip_address") @db.VarChar(45)
+
+  expiresAt  DateTime  @map("expires_at") @db.DateTime(3)
+  revokedAt  DateTime? @map("revoked_at") @db.DateTime(3)
+  lastSeenAt DateTime? @map("last_seen_at") @db.DateTime(3)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+
+  member Member @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@index([memberId])
+  @@index([expiresAt])
+  @@map("member_sessions")
+}
+
+/// FP-02 password reset. Hashed, single use, fifteen minutes.
+///
+/// The token in the emailed URL is the only copy that exists in plaintext, and
+/// it exists there because FP-02 section 2.3 puts it in a query string. See
+/// `05-member-auth.md` section 9.6 for what that costs and what the component
+/// does about it.
+model MemberPasswordReset {
+  id        String @id @default(uuid(7)) @db.Char(36)
+  siteId    String @map("site_id") @db.Char(36)
+  memberId  String @map("member_id") @db.Char(36)
+  tokenHash String @unique @map("token_hash") @db.VarChar(255)
+
+  expiresAt  DateTime  @map("expires_at") @db.DateTime(3)
+  consumedAt DateTime? @map("consumed_at") @db.DateTime(3)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+
+  site   Site   @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  member Member @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@index([memberId])
+  @@index([expiresAt])
+  @@map("member_password_resets")
+}
+
+/// A six-digit code. Hashed at rest.
+///
+/// Keyed by email rather than by member, because a code can be requested for an
+/// address that has no account yet: the OTP path doubles as sign-up. That also
+/// means this table must never reveal whether the address is registered.
+model MemberOtp {
+  id     String @id @default(uuid(7)) @db.Char(36)
+  siteId String @map("site_id") @db.Char(36)
+  email  String @db.VarChar(255)
+
+  codeHash String @map("code_hash") @db.VarChar(255)
+
+  /// Three verification attempts, then the code is dead. F05 requires a fourth
+  /// attempt to be rejected AND the code invalidated.
+  attempts Int @default(0)
+
+  expiresAt         DateTime  @map("expires_at") @db.DateTime(3)
+  resendAvailableAt DateTime  @map("resend_available_at") @db.DateTime(3)
+  consumedAt        DateTime? @map("consumed_at") @db.DateTime(3)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+
+  site Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
+
+  @@index([siteId, email, expiresAt])
+  @@index([expiresAt])
+  @@map("member_otps")
+}
+
+/// Every message the API tried to send.
+///
+/// Exists mainly so the flows are testable without an SMTP account: the `log`
+/// mail driver writes here and to a file, so a developer can read the OTP or
+/// the reset link during the cookie spike in backend PRD section 2.3 without
+/// configuring a provider.
+///
+/// It stores the SUBJECT and the recipient, never the body. A reset link in a
+/// database row is a reset link an operator can use.
+model EmailLog {
+  id     String  @id @default(uuid(7)) @db.Char(36)
+  siteId String? @map("site_id") @db.Char(36)
+
+  toAddress String  @map("to_address") @db.VarChar(255)
+  subject   String  @db.VarChar(255)
+  template  String  @db.VarChar(64)
+  driver    String  @db.VarChar(32)
+  messageId String? @map("message_id") @db.VarChar(255)
+
+  sentAt DateTime? @map("sent_at") @db.DateTime(3)
+  error  String?   @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  site Site? @relation(fields: [siteId], references: [id], onDelete: SetNull)
+
+  @@index([toAddress, createdAt])
+  @@map("email_logs")
+}
+
+// ============================================================================
+// SITE SETTINGS: ONE JSON DOCUMENT, NOT A COLUMN PER SWITCH
+// ============================================================================
+
+/// Everything a creator configures about one site, as a single JSON document.
+///
+/// A deliberate instruction, and the right one. The alternative is a column per
+/// setting, and this product adds settings continuously: a login path, a
+/// redirect, an auth method, a locale, a from-address. Each would be an
+/// ALTER TABLE on a table holding a row per customer, and a deploy window where
+/// the code expects a column the database does not have yet.
+///
+/// What is given up is real, and worth stating rather than discovering:
+///
+///   1. **The database no longer validates the shape.** Nothing stops a null
+///      where a boolean belongs. lib/siteSettings.ts is therefore the only
+///      writer: it validates on the way in and fills defaults on the way out,
+///      so a row written by an older version still reads.
+///   2. **A setting cannot be indexed or queried across sites.** "Which sites
+///      allow registration" is a full scan. Nothing asks that today. A setting
+///      that needs to be queried should be promoted to its own column, which is
+///      a migration rather than a redesign.
+///   3. **Concurrent writes are last-write-wins.** Two plugin panels open on one
+///      project would overwrite each other. "version" makes that detectable: a
+///      write carrying a stale version is refused instead of silently winning.
+///
+/// Keyed by site_id and nothing else: one row per site, created with the site,
+/// so a read never has to handle "no row yet".
+model SiteSettings {
+  siteId String @id @map("site_id") @db.Char(36)
+
+  /// The whole document. Shape and defaults in lib/siteSettings.ts, which owns
+  /// SETTINGS_SCHEMA_VERSION and upgrades an older document on read.
+  ///
+  /// NEVER a secret. Gateway keys live encrypted in their own table (backend
+  /// PRD phase B3) because this document is returned to the panel whole.
+  settings Json @db.Json
+
+  /// Bumped on every write. See the note above.
+  version Int @default(1)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  site Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
+
+  @@map("site_settings")
+}
+
+// ============================================================================
+// CREATOR IDENTITY
+// ============================================================================
+// Conflict C10 closes here. Every /api/site/* route needed a creator session
+// and no task in the 72-task plan built one, so the plugin's Manage and
+// Settings tabs have been signed out since the project began.
+//
+// The creator proves an address with a six-digit code, exactly as a member
+// does, and gets an opaque session token. Separate tables from the member ones
+// throughout: a creator and a member are different principals with very
+// different blast radii, and sharing a table is how a member session ends up
+// accepted on a creator route.
+
+/// A six-digit code sent to a creator's address during connect.
+///
+/// Not keyed to a user row, because the address may have no account yet: the
+/// connect flow doubles as sign-up. Which also means this table must never
+/// reveal whether an address is already registered.
+model CreatorOtp {
+  id    String @id @default(uuid(7)) @db.Char(36)
+  email String @db.VarChar(255)
+
+  codeHash String @map("code_hash") @db.VarChar(255)
+
+  /// Three attempts, then dead, matching the member OTP. A fourth attempt is
+  /// rejected AND invalidates the code, so guessing cannot be extended.
+  attempts Int @default(0)
+
+  /// What the code is for, carried through verification so a code minted for
+  /// one Framer project cannot be used to claim another.
+  framerProjectId String @map("framer_project_id") @db.VarChar(255)
+
+  expiresAt         DateTime  @map("expires_at") @db.DateTime(3)
+  resendAvailableAt DateTime  @map("resend_available_at") @db.DateTime(3)
+  consumedAt        DateTime? @map("consumed_at") @db.DateTime(3)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@index([email, framerProjectId, expiresAt])
+  @@index([expiresAt])
+  @@map("creator_otps")
+}
+
+/// An opaque creator session, held by the plugin panel.
+///
+/// Sent as "Authorization: Bearer", not as a cookie, and that is what makes the
+/// panel work at all: the panel is an iframe on an origin we do not control, so
+/// a cross-site cookie there would hit exactly the Safari and Firefox blocking
+/// that backend PRD section 2.3 calls the project's largest risk. A bearer
+/// header has no such problem, and a request carrying no cookie cannot be
+/// CSRF'd, which is why the creator API needs no CSRF token.
+///
+/// Only the hash is stored, as everywhere else.
+model CreatorSession {
+  id        String @id @default(uuid(7)) @db.Char(36)
+  userId    String @map("user_id") @db.Char(36)
+  tokenHash String @unique @map("token_hash") @db.VarChar(255)
+
+  /// Diagnostics only, never used to authorize. See MemberSession.
+  userAgent String? @map("user_agent") @db.VarChar(512)
+  ipAddress String? @map("ip_address") @db.VarChar(45)
+
+  expiresAt  DateTime  @map("expires_at") @db.DateTime(3)
+  revokedAt  DateTime? @map("revoked_at") @db.DateTime(3)
+  lastSeenAt DateTime? @map("last_seen_at") @db.DateTime(3)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("creator_sessions")
+}
+
+// ============================================================================
+// NOT DECLARED YET, AND DELIBERATELY
+// ============================================================================
+// Each arrives with the feature that needs it, so the schema never carries a
+// table nothing reads:
+//
+//   gateway_configs, subscriptions, invoices   payments, backend PRD phase B3
+//   webhook_events                             the idempotency ledger, B3
+//   custom_fields                              FP-09
+//   assets, asset_grants                       FP-12
+//   course_progress                            FP-11
+//   bookmarks                                  FP-10
+//   organizations, seat_invites                F12
+//   metered_sessions                           FP-07
+//   plugin_trials                              F19, and its rows are never
+//                                              deleted, per PRD section 11.2

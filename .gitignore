@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.env.local
+storage/
+*.log
+
+# Prisma writes the generated client here
+src/generated/
