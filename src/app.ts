@@ -62,6 +62,12 @@ export function createApp(): Express {
   // what a human checks, and it is kept out of the balancer's path so a
   // database blip does not take every instance out of rotation.
 
+  // The root, so a person opening the domain in a browser sees what this is
+  // instead of a 404. Names the service and nothing more: no version.
+  app.get("/", (_req, res) => {
+    ok(res, { service: "MemberFrame API", status: "ok", health: "/health" });
+  });
+
   app.get("/health", (_req, res) => {
     ok(res, { status: "ok", environment: env.nodeEnv });
   });
