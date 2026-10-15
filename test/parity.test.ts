@@ -272,3 +272,83 @@ describe("the server copy is the rule, not the hint", () => {
     );
   });
 });
+
+// ============================================================================
+// PROFILE FIELDS, FP-09
+// ============================================================================
+// The server's rules against the plugin's copy. The plugin's copy is in turn
+// compared with the two canvas copies by the frontend's
+// `test/customFieldsParity.test.ts`, so the chain covers all four.
+
+/**
+ * A body extractor that survives an object-literal return type.
+ *
+ * `checkValue` returns `{ value } | { problem }`, and the extractor above
+ * counts from the first brace after the name, which is that return type. So
+ * this one matches the parameter list by its parentheses and takes the first
+ * brace after it that ends a line, which a type literal never does.
+ */
+function extractBody(source: string, name: string): string {
+  const signature = new RegExp(`function\\s+${name}\\s*\\(`).exec(source);
+  if (!signature) throw new Error(`No function named ${name} in the source.`);
+
+  let parens = 0;
+  let paramsEnd = -1;
+  for (let index = source.indexOf("(", signature.index); index < source.length; index += 1) {
+    if (source[index] === "(") parens += 1;
+    if (source[index] === ")") parens -= 1;
+    if (parens === 0) {
+      paramsEnd = index;
+      break;
+    }
+  }
+
+  const body = /\{[ \t]*\r?\n/.exec(source.slice(paramsEnd));
+  if (paramsEnd === -1 || !body) throw new Error(`No body found for ${name}.`);
+
+  let depth = 0;
+  for (let index = paramsEnd + body.index; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") depth -= 1;
+    if (depth === 0) return source.slice(signature.index, index + 1);
+  }
+
+  throw new Error(`Unbalanced braces while extracting ${name}.`);
+}
+
+describe("profile field rules match the plugin", () => {
+  const plugin = read(path.join(ROOT, "src", "utils", "customFields.ts"));
+  const metadata = read(path.join(process.cwd(), "src", "lib", "memberMetadata.ts"));
+  const settings = read(path.join(process.cwd(), "src", "lib", "siteSettings.ts"));
+
+  const pairs: Array<[string, string]> = [
+    ["isSafeUrl", metadata],
+    ["isPhoneLike", metadata],
+    ["checkValue", metadata],
+    ["isFieldVisible", metadata],
+    ["conditionProblem", settings],
+    ["isValidFieldKey", settings],
+  ];
+
+  for (const [name, backendSource] of pairs) {
+    it(`${name} is identical`, () => {
+      expect(normalize(extractBody(backendSource, name))).toBe(normalize(extractBody(plugin, name)));
+    });
+  }
+
+  for (const name of ["MAX_TEXT_LENGTH", "MAX_TEXTAREA_LENGTH", "MAX_URL_LENGTH"]) {
+    it(`${name} is identical`, () => {
+      expect(extractConstant(metadata, name)).toBe(extractConstant(plugin, name));
+    });
+  }
+
+  for (const name of ["MAX_CUSTOM_FIELDS", "MAX_FIELD_OPTIONS"]) {
+    it(`${name} is identical`, () => {
+      expect(extractConstant(settings, name)).toBe(extractConstant(plugin, name));
+    });
+  }
+
+  it("reaches the body of checkValue, not only its signature", () => {
+    expect(extractBody(metadata, "checkValue")).toContain("MAX_TEXTAREA_LENGTH : MAX_TEXT_LENGTH");
+  });
+});

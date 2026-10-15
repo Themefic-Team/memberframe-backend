@@ -325,3 +325,95 @@ describe("gatedPages rules handling", () => {
 });
 
 
+
+// ============================================================================
+// PROFILE FIELD CONDITIONS, FP-09 AND CONFLICT C31
+// ============================================================================
+
+describe("customFields showWhen", () => {
+  const role = {
+    key: "role",
+    label: "Role",
+    type: "select",
+    required: true,
+    options: ["Freelancer", "Agency"],
+    placeholder: "",
+    order: 0,
+  };
+  const team = {
+    key: "team_size",
+    label: "Team size",
+    type: "number",
+    required: false,
+    options: [],
+    placeholder: "",
+    order: 1,
+    showWhen: { key: "role", value: "Agency" },
+  };
+
+  it("accepts a condition on an earlier dropdown option", () => {
+    expect(validatePatch({ customFields: [role, team] })).toEqual([]);
+  });
+
+  it("refuses a condition naming an option the dropdown lacks, with the field named", () => {
+    const problems = validatePatch({
+      customFields: [role, { ...team, showWhen: { key: "role", value: "Enterprise" } }],
+    });
+
+    expect(problems).toEqual([
+      {
+        path: "customFields.1.showWhen",
+        message: "Choose one of the options of the dropdown this depends on.",
+      },
+    ]);
+  });
+
+  it("refuses a parent placed after the child", () => {
+    const problems = validatePatch({
+      customFields: [
+        { ...team, order: 0 },
+        { ...role, order: 1 },
+      ],
+    });
+
+    expect(problems.map((problem) => problem.path)).toEqual(["customFields.0.showWhen"]);
+  });
+
+  it("refuses a chain of conditions", () => {
+    const seats = {
+      ...team,
+      key: "seats",
+      label: "Seats",
+      order: 2,
+      showWhen: { key: "team_size", value: "8" },
+    };
+
+    expect(validatePatch({ customFields: [role, team, seats] })).toHaveLength(1);
+  });
+
+  it("stores and returns the condition through the JSON column", () => {
+    const document = mergeSettings(defaultSettings(), { customFields: [role, team] });
+    const stored = JSON.parse(JSON.stringify(toJsonDocument(document))) as unknown;
+
+    expect(withDefaults(stored).customFields[1]?.showWhen).toEqual({ key: "role", value: "Agency" });
+    expect(withDefaults(stored).customFields[0]?.showWhen).toBeUndefined();
+  });
+
+  it("salvages a stored condition whose parent is gone by showing the field always", () => {
+    // Refused on write, so this is a row edited by hand. Hiding the field
+    // forever would be worse than showing it.
+    const read = withDefaults({ customFields: [team] });
+
+    expect(read.customFields).toHaveLength(1);
+    expect(read.customFields[0]?.showWhen).toBeUndefined();
+  });
+
+  it("drops a malformed condition rather than the field", () => {
+    const read = withDefaults({
+      customFields: [role, { ...team, showWhen: { key: "Not A Key", value: "x" } }],
+    });
+
+    expect(read.customFields.map((field) => field.key)).toEqual(["role", "team_size"]);
+    expect(read.customFields[1]?.showWhen).toBeUndefined();
+  });
+});

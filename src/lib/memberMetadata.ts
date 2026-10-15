@@ -172,6 +172,30 @@ function checkValue(
 }
 
 /**
+ * Does this field apply, given the values around it?
+ *
+ * A field with no condition always applies. A conditional one applies only
+ * while its parent holds the expected value, compared as a string because a
+ * boolean parent stores `true` and the condition says `"true"`. An empty parent
+ * hides the child: "no industry chosen" is not "Agency".
+ *
+ * The plugin and both canvas components carry identical copies, held together
+ * by the parity tests, because a form that shows a field the server considers
+ * hidden would collect a value the server then throws away.
+ */
+export function isFieldVisible(
+  field: CustomFieldDefinition,
+  values: Readonly<Record<string, MetadataValue | undefined>>
+): boolean {
+  if (!field.showWhen) return true;
+
+  const parent = values[field.showWhen.key];
+  if (parent === null || parent === undefined) return false;
+
+  return String(parent) === field.showWhen.value;
+}
+
+/**
  * Apply a submitted patch to a member's stored metadata.
  *
  * A merge rather than a replacement, keyed on what the patch actually contains.
@@ -181,6 +205,13 @@ function checkValue(
  *
  * Fields the creator has since deleted are dropped from the stored object, so
  * the column does not accumulate values for fields nobody can see or edit.
+ *
+ * So are fields whose condition is not met, and their `required` is not
+ * enforced. A member who switches from "Agency" to "Freelancer" has no team
+ * size, and keeping the old one would show the creator a team size for a
+ * freelancer. Unconditional fields go first so that every parent is settled
+ * before any child asks about it; `conditionProblem` guarantees a parent is
+ * never itself conditional, so one pass of each is enough.
  */
 export function applyMetadata(
   fields: ReadonlyArray<CustomFieldDefinition>,
@@ -193,7 +224,14 @@ export function applyMetadata(
   const metadata: MemberMetadata = {};
   const problems: MetadataProblem[] = [];
 
-  for (const field of fields) {
+  const ordered = [
+    ...fields.filter((field) => !field.showWhen),
+    ...fields.filter((field) => field.showWhen),
+  ];
+
+  for (const field of ordered) {
+    if (!isFieldVisible(field, metadata)) continue;
+
     const submitted = Object.prototype.hasOwnProperty.call(incoming, field.key);
     const raw = submitted ? incoming[field.key] : current[field.key];
 
@@ -240,5 +278,8 @@ export function publicFieldDefinitions(
     required: field.required,
     options: [...field.options],
     placeholder: field.placeholder,
+    // Sent so the member's form can show and hide the field as they answer,
+    // which it must do the same way `applyMetadata` decides it.
+    showWhen: field.showWhen ? { ...field.showWhen } : null,
   }));
 }

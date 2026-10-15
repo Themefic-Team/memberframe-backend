@@ -23,7 +23,8 @@ import {
   normalizeOrigins,
   requireOwnedSite,
 } from "../services/creatorAuthService.js";
-import { invalidateSiteSettings } from "../services/settingsService.js";
+import { invalidateSiteSettings, loadSiteSettings } from "../services/settingsService.js";
+import { applyMetadata } from "../lib/memberMetadata.js";
 import {
   mergeSettings,
   toJsonDocument,
@@ -113,9 +114,18 @@ siteRouter.get(
           activeTier: true,
           status: true,
           createdAt: true,
+          metadata: true,
         },
       }),
     ]);
+
+    // FP-09. Through `applyMetadata` with an empty patch rather than returned
+    // raw, so the flyout sees exactly what the member's own profile form sees:
+    // no value for a deleted field and none for a field whose condition is not
+    // met. One settings read per page, not per member.
+    const settings = await loadSiteSettings(site.id);
+    const metadataOf = (stored: unknown) =>
+      applyMetadata(settings.customFields, stored, {}).metadata;
 
     ok(res, {
       members: rows.map((row) => ({
@@ -132,6 +142,7 @@ siteRouter.get(
         lifetimeSpend: 0,
         currency: "USD",
         gateway: "stripe",
+        metadata: metadataOf(row.metadata),
       })),
       page: query.page,
       pageSize: PAGE_SIZE,
@@ -202,8 +213,13 @@ siteRouter.patch(
         activeTier: true,
         status: true,
         createdAt: true,
+        metadata: true,
       },
     });
+
+    // Returned so the panel can replace its row wholesale after a tier change
+    // without the flyout losing the member's profile values.
+    const settings = await loadSiteSettings(site.id);
 
     ok(res, {
       member: {
@@ -217,6 +233,7 @@ siteRouter.patch(
         lifetimeSpend: 0,
         currency: "USD",
         gateway: "stripe",
+        metadata: applyMetadata(settings.customFields, updated.metadata, {}).metadata,
       },
     });
   })

@@ -148,6 +148,69 @@ export interface CustomFieldDefinition {
   options: string[];
   placeholder: string;
   order: number;
+  /**
+   * Shown only when another field holds a given value. FP-09 section 3, the
+   * "Agency selected, so ask for team size" branch.
+   *
+   * Absent from the plan's own schema in section 4.1, which is conflict C31:
+   * the flow chart branches and the interface it specifies cannot express a
+   * branch. Optional, so every document written before it existed reads back
+   * unchanged with every field always shown.
+   */
+  showWhen?: FieldCondition | null;
+}
+
+/**
+ * One level deep, on purpose.
+ *
+ * The parent must be an earlier `select` or `boolean` with no condition of its
+ * own. A chain of conditions is a questionnaire engine, and the cost of one is
+ * a member who answers three questions and watches a fourth appear and vanish
+ * as they go back. `value` is a string for both parent types: an option for a
+ * select, `"true"` or `"false"` for a boolean.
+ */
+export interface FieldCondition {
+  key: string;
+  value: string;
+}
+
+/**
+ * Why a field's condition is unusable, or null when it is fine.
+ *
+ * The plugin's field editor carries an identical copy so a creator is told
+ * before they save, and `backend/test/parity.test.ts` holds the two together.
+ * Every refusal is a condition that could never be satisfied or that would make
+ * visibility depend on visibility, and a required field behind either one
+ * would block members with nothing on screen to fill in.
+ */
+export function conditionProblem(
+  fields: ReadonlyArray<CustomFieldDefinition>,
+  index: number
+): string | null {
+  const field = fields[index];
+  if (!field || !field.showWhen) return null;
+
+  const parentIndex = fields.findIndex((candidate) => candidate.key === field.showWhen?.key);
+  if (parentIndex === -1) return "The field this depends on no longer exists.";
+  if (parentIndex >= index) return "A field can only depend on a field above it.";
+
+  const parent = fields[parentIndex];
+  if (!parent) return "The field this depends on no longer exists.";
+  if (parent.showWhen) return "A field cannot depend on a field that is itself conditional.";
+
+  if (parent.type === "boolean") {
+    return field.showWhen.value === "true" || field.showWhen.value === "false"
+      ? null
+      : "Choose on or off for the checkbox this depends on.";
+  }
+
+  if (parent.type === "select") {
+    return parent.options.includes(field.showWhen.value)
+      ? null
+      : "Choose one of the options of the dropdown this depends on.";
+  }
+
+  return "A field can only depend on a dropdown or a checkbox.";
 }
 
 /**
@@ -370,6 +433,8 @@ function readFieldDefinition(value: unknown): CustomFieldDefinition | null {
   // satisfy and a required one would block them entirely.
   if (type === "select" && options.length === 0) return null;
 
+  const showWhen = readCondition(value["showWhen"]);
+
   return {
     key,
     label,
@@ -380,7 +445,22 @@ function readFieldDefinition(value: unknown): CustomFieldDefinition | null {
     order: typeof value["order"] === "number" && Number.isInteger(value["order"])
       ? value["order"]
       : 0,
+    ...(showWhen ? { showWhen } : {}),
   };
+}
+
+/**
+ * The condition's shape only. Whether it points at a usable parent depends on
+ * the whole list, so `conditionProblem` decides that once the list is built.
+ */
+function readCondition(value: unknown): FieldCondition | null {
+  if (!isRecord(value)) return null;
+
+  const key = typeof value["key"] === "string" ? value["key"] : "";
+  const expected = typeof value["value"] === "string" ? value["value"].slice(0, 120) : "";
+
+  if (!isValidFieldKey(key) || expected === "") return null;
+  return { key, value: expected };
 }
 
 /**
@@ -406,7 +486,19 @@ function readCustomFields(value: unknown): CustomFieldDefinition[] {
     if (fields.length >= MAX_CUSTOM_FIELDS) break;
   }
 
-  return fields.sort((left, right) => left.order - right.order);
+  const ordered = fields.sort((left, right) => left.order - right.order);
+
+  // Salvage rather than drop. A stored condition that no longer resolves, say
+  // because its parent was removed by a hand edit, makes the field always
+  // shown. Dropping the field would hide a member's existing answer; keeping a
+  // dead condition would hide the field forever, and a required one would then
+  // block nobody and collect nothing. The write path refuses these instead.
+  return ordered.map((field, index) => {
+    if (!field.showWhen || conditionProblem(ordered, index) === null) return field;
+    const { showWhen: _dropped, ...rest } = field;
+    void _dropped;
+    return rest;
+  });
 }
 
 function readGatedPages(value: unknown): GatedPageRule[] {
@@ -705,6 +797,7 @@ export function validatePatch(patch: unknown): SettingsProblem[] {
       });
     } else {
       const keys = new Set<string>();
+      const parsed: CustomFieldDefinition[] = [];
 
       patch["customFields"].forEach((entry, index) => {
         const field = readFieldDefinition(entry);
@@ -730,7 +823,22 @@ export function validatePatch(patch: unknown): SettingsProblem[] {
         }
 
         keys.add(field.key);
+        parsed.push(field);
       });
+
+      // Conditions last, against the list as it will be stored. Only worth
+      // running when every entry parsed: an index into a list with holes in it
+      // would name the wrong field.
+      if (parsed.length === patch["customFields"].length) {
+        const ordered = [...parsed].sort((left, right) => left.order - right.order);
+
+        ordered.forEach((field, index) => {
+          const problem = conditionProblem(ordered, index);
+          if (problem) {
+            problems.push({ path: `customFields.${parsed.indexOf(field)}.showWhen`, message: problem });
+          }
+        });
+      }
     }
   }
 
@@ -938,6 +1046,9 @@ export function toJsonDocument(document: SiteSettingsDocument): Prisma.InputJson
       options: [...field.options],
       placeholder: field.placeholder,
       order: field.order,
+      ...(field.showWhen
+        ? { showWhen: { key: field.showWhen.key, value: field.showWhen.value } }
+        : {}),
     })),
     gatedPages: (document.gatedPages ?? []).map((rule) => ({
       path: rule.path,

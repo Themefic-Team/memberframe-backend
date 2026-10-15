@@ -18,6 +18,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyMetadata,
+  isFieldVisible,
   isPhoneLike,
   isSafeUrl,
   publicFieldDefinitions,
@@ -227,5 +228,110 @@ describe("publicFieldDefinitions", () => {
     // change the settings document it came from.
     published[0]?.options.push("B");
     expect(fields[0]?.options).toEqual(["A"]);
+  });
+});
+
+// ============================================================================
+// CONDITIONAL FIELDS, CONFLICT C31
+// ============================================================================
+
+describe("conditional fields", () => {
+  const role = field({
+    key: "role",
+    label: "Role",
+    type: "select",
+    required: true,
+    options: ["Freelancer", "Agency"],
+  });
+  const team = field({
+    key: "team_size",
+    label: "Team size",
+    type: "number",
+    required: true,
+    order: 1,
+    showWhen: { key: "role", value: "Agency" },
+  });
+
+  it("isFieldVisible follows the parent's answer", () => {
+    expect(isFieldVisible(team, {})).toBe(false);
+    expect(isFieldVisible(team, { role: "Freelancer" })).toBe(false);
+    expect(isFieldVisible(team, { role: "Agency" })).toBe(true);
+    expect(isFieldVisible(role, {})).toBe(true);
+  });
+
+  it("does not enforce a hidden required field", () => {
+    const result = applyMetadata([role, team], {}, { role: "Freelancer" });
+
+    expect(result.problems).toEqual([]);
+    expect(result.metadata).toEqual({ role: "Freelancer" });
+  });
+
+  it("enforces it once its condition is met and the member submits it", () => {
+    // Submitted as null, which is what both canvas forms send for a visible
+    // field left blank. Not submitting it at all leaves it unenforced, the
+    // same rule as every other required field: see the test above about a
+    // required field the member is not editing.
+    const result = applyMetadata([role, team], {}, { role: "Agency", team_size: null });
+
+    expect(result.problems).toEqual([{ key: "team_size", message: "Team size is required." }]);
+  });
+
+  it("drops the stored answer when the parent changes away", () => {
+    // A freelancer with a team size would be shown to the creator as both.
+    const result = applyMetadata([role, team], { role: "Agency", team_size: 8 }, { role: "Freelancer" });
+
+    expect(result.problems).toEqual([]);
+    expect(result.metadata).toEqual({ role: "Freelancer" });
+  });
+
+  it("settles the parent first, whatever order the definitions arrive in", () => {
+    const result = applyMetadata([team, role], {}, { role: "Agency", team_size: 4 });
+
+    expect(result.problems).toEqual([]);
+    expect(result.metadata).toEqual({ role: "Agency", team_size: 4 });
+  });
+
+  it("ignores a value posted for a hidden field rather than storing it", () => {
+    const result = applyMetadata([role, team], {}, { role: "Freelancer", team_size: 12 });
+
+    expect(result.metadata).not.toHaveProperty("team_size");
+  });
+
+  it("matches a boolean parent by on or off", () => {
+    const newsletter = field({ key: "newsletter", label: "Newsletter", type: "boolean" });
+    const frequency = field({
+      key: "frequency",
+      label: "Frequency",
+      type: "select",
+      options: ["Weekly"],
+      required: true,
+      showWhen: { key: "newsletter", value: "true" },
+    });
+
+    const off = { newsletter: false, frequency: null };
+    const on = { newsletter: true, frequency: null };
+
+    expect(applyMetadata([newsletter, frequency], {}, off).problems).toEqual([]);
+    expect(applyMetadata([newsletter, frequency], {}, on).problems).toHaveLength(1);
+  });
+
+  it("publishes the condition so the member's form can apply it", () => {
+    const [published] = publicFieldDefinitions([team]);
+    expect(published?.showWhen).toEqual({ key: "role", value: "Agency" });
+    expect(publicFieldDefinitions([role])[0]?.showWhen).toBeNull();
+  });
+});
+
+describe("UTF-8", () => {
+  it("passes non-Latin text through the validator unchanged", () => {
+    // FP-09 section 5 asks for this explicitly. The MySQL column is the other
+    // half and needs a real server; this proves the code does not mangle it.
+    const studio = field({ key: "studio", label: "Studio" });
+    const value = "Ateliê Ñandú, 東京デザイン, مرحبا, \u{1F3A8}";
+
+    const result = applyMetadata([studio], {}, { studio: value });
+    const stored = JSON.parse(JSON.stringify(result.metadata)) as Record<string, string>;
+
+    expect(stored["studio"]).toBe(value);
   });
 });
