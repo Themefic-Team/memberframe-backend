@@ -204,6 +204,34 @@ export function otpMail(to: string, code: string, siteName: string, siteId: stri
   };
 }
 
+/** The code that confirms a new account's address. Same code store as sign in. */
+export function verifyEmailMail(to: string, code: string, siteName: string, siteId: string): Mail {
+  const minutes = Math.round(env.otp.ttlSeconds / 60);
+
+  return {
+    to,
+    siteId,
+    template: "member_verify_email",
+    subject: `Confirm your email for ${siteName}`,
+    text: [
+      `Your confirmation code is ${code}`,
+      "",
+      `Enter it on the sign up page to finish creating your account.`,
+      `It works for ${minutes} minutes and can be used once.`,
+      "",
+      "If you did not create an account, you can ignore this message.",
+    ].join("\n"),
+    html: [
+      `<p>Your confirmation code is</p>`,
+      `<p style="font-size:28px;font-weight:700;letter-spacing:6px">${code}</p>`,
+      `<p>Enter it on the sign up page to finish creating your account.`,
+      ` It works for ${minutes} minutes and can be used once.</p>`,
+      `<p style="color:#5b6472;font-size:13px">If you did not create an account,`,
+      ` you can ignore this message.</p>`,
+    ].join(""),
+  };
+}
+
 export function passwordResetMail(
   to: string,
   token: string,

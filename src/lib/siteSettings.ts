@@ -232,7 +232,14 @@ export interface StoredIntegration {
 }
 
 export type GatedPageFallbackAction = "redirect" | "blur" | "custom_card";
-export type GatedPageTier = "signed_in" | "free_member" | "tier_1" | "tier_2" | "vip";
+/**
+ * "signed_in", or any tier key: the four built in ones or a creator's own.
+ * Conflict C9, resolved: a page lock can require a custom tier, and the shield
+ * compares ranks from the site's tier table, so nothing else needs to know it.
+ */
+export type GatedPageTier = string;
+
+const GATED_TIER_PATTERN = /^[a-z][a-z0-9_]{1,49}$/;
 
 export interface GatedPageRule {
   path: string;
@@ -292,6 +299,23 @@ const RESERVED_KEYS: ReadonlyArray<string> = ["__proto__", "constructor", "proto
 
 export function isValidFieldKey(value: string): boolean {
   if (!/^[a-z][a-z0-9_]{0,48}$/.test(value)) return false;
+  return !RESERVED_KEYS.includes(value);
+}
+
+/**
+ * A key inside one integration's stored values, such as `clientId`.
+ *
+ * Wider than `isValidFieldKey` by exactly one thing, uppercase letters. The
+ * integration fields are named by the plugin's registry in camelCase, and the
+ * OAuth routes read them back by those names, so the narrower rule silently
+ * discarded every integration value ever saved: `clientId`, `clientSecret`,
+ * `publishableKey`, all of them. Custom profile field keys keep the lowercase
+ * rule, because those become form field names a creator types.
+ *
+ * Still no dot, bracket, or prototype key, for the same reason as above.
+ */
+export function isValidIntegrationValueKey(value: string): boolean {
+  if (!/^[a-zA-Z][a-zA-Z0-9_]{0,48}$/.test(value)) return false;
   return !RESERVED_KEYS.includes(value);
 }
 
@@ -367,7 +391,7 @@ function readStoredIntegration(value: unknown): StoredIntegration | null {
   const values: Record<string, string> = {};
 
   for (const [key, entry] of Object.entries(rawValues)) {
-    if (!isValidFieldKey(key)) continue;
+    if (!isValidIntegrationValueKey(key)) continue;
     if (typeof entry !== "string") continue;
     if (entry.length > MAX_INTEGRATION_VALUE_LENGTH) continue;
 
@@ -514,10 +538,7 @@ function readGatedPages(value: unknown): GatedPageRule[] {
 
     const rawTier = entry["requiredTier"];
     const tier: GatedPageTier =
-      typeof rawTier === "string" &&
-      ["signed_in", "free_member", "tier_1", "tier_2", "vip"].includes(rawTier)
-        ? (rawTier as GatedPageTier)
-        : "signed_in";
+      typeof rawTier === "string" && GATED_TIER_PATTERN.test(rawTier) ? rawTier : "signed_in";
 
     const rawFallback = entry["fallbackAction"];
     const fallback: GatedPageFallbackAction =
@@ -782,6 +803,21 @@ export function validatePatch(patch: unknown): SettingsProblem[] {
             path: `integrations.${id}.values`,
             message: "Integration values must be an object.",
           });
+          continue;
+        }
+
+        // Refused here rather than dropped on merge. Dropping is what made
+        // every integration "save" with a 200 while storing nothing: the panel
+        // was told it succeeded and the values were gone.
+        if (isRecord(entry["values"])) {
+          for (const key of Object.keys(entry["values"])) {
+            if (!isValidIntegrationValueKey(key)) {
+              problems.push({
+                path: `integrations.${id}.values.${key}`,
+                message: "That is not a valid integration field.",
+              });
+            }
+          }
         }
       }
     }

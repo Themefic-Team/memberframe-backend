@@ -174,6 +174,52 @@ export const env = {
     lockoutSeconds: int("LOGIN_LOCKOUT_SECONDS", 900),
   },
 
+  payments: {
+    /**
+     * 32 bytes, base64. Encrypts every gateway secret at rest (`lib/secretBox.ts`).
+     * Empty means payments are off: the payment routes answer 503 with
+     * `payments_not_configured` rather than store a key in the clear.
+     */
+    encryptionKey: process.env["PAYMENTS_ENCRYPTION_KEY"] ?? "",
+    /**
+     * Development only. The `whsec_` secret `stripe listen` prints, accepted
+     * for Stripe webhooks in addition to the stored one, so a forwarded test
+     * event verifies without registering an endpoint. Ignored in production.
+     */
+    stripeCliWebhookSecret: process.env["STRIPE_CLI_WEBHOOK_SECRET"] ?? "",
+    /** How often the expiry sweep runs, in seconds. F18 and period-end cancels. */
+    sweepSeconds: int("PAYMENTS_SWEEP_SECONDS", 300),
+  },
+
+  /**
+   * FP-12 protected files. `local` keeps uploads on this machine's disk, which
+   * is right for one server with a persistent volume. `s3` keeps them in any
+   * S3 compatible bucket (AWS S3, Cloudflare R2, Backblaze B2, MinIO): set it
+   * for more than one server, or a host whose disk is wiped on deploy.
+   */
+  assets: {
+    driver: oneOf("ASSET_STORAGE", ["local", "s3"] as const, "local"),
+    localDir: str("ASSET_STORAGE_DIR", "storage/assets"),
+    maxBytes: int("ASSET_MAX_BYTES", 250 * 1024 * 1024),
+    /** Seconds a download link works. PRD F10 and S5: 60. */
+    linkSeconds: int("ASSET_LINK_SECONDS", 60),
+    /**
+     * Signs download links. Leave empty on one server: a random secret is made
+     * at startup, which only ends links younger than a minute on a restart.
+     * Set the same value on every server behind a load balancer.
+     */
+    signingSecret: process.env["ASSET_SIGNING_SECRET"] ?? "",
+    s3: {
+      /** e.g. https://<account>.r2.cloudflarestorage.com or https://s3.eu-west-1.amazonaws.com */
+      endpoint: process.env["ASSET_S3_ENDPOINT"] ?? "",
+      bucket: process.env["ASSET_S3_BUCKET"] ?? "",
+      /** `auto` for R2. */
+      region: process.env["ASSET_S3_REGION"] ?? "auto",
+      accessKeyId: process.env["ASSET_S3_ACCESS_KEY_ID"] ?? "",
+      secretAccessKey: process.env["ASSET_S3_SECRET_ACCESS_KEY"] ?? "",
+    },
+  },
+
   rateLimit: {
     windowSeconds: int("RATE_LIMIT_WINDOW_SECONDS", 900),
     maxPerEmail: int("RATE_LIMIT_MAX_PER_EMAIL", 5),
@@ -191,6 +237,19 @@ function crossChecks(): void {
     invalid.push("MAIL_DRIVER=smtp needs MAIL_HOST. Use MAIL_DRIVER=log to skip sending.");
   }
 
+  if (env.assets.driver === "s3") {
+    const s3 = env.assets.s3;
+    if (!s3.endpoint.startsWith("https://") || !s3.bucket || !s3.accessKeyId || !s3.secretAccessKey) {
+      invalid.push(
+        "ASSET_STORAGE=s3 needs ASSET_S3_ENDPOINT (https), ASSET_S3_BUCKET, ASSET_S3_ACCESS_KEY_ID and ASSET_S3_SECRET_ACCESS_KEY."
+      );
+    }
+  }
+
+  if (env.assets.linkSeconds < 10 || env.assets.linkSeconds > 600) {
+    invalid.push("ASSET_LINK_SECONDS must be between 10 and 600. PRD F10 asks for 60.");
+  }
+
   if (!env.passwordReset.urlTemplate.includes("{token}")) {
     invalid.push("PASSWORD_RESET_URL_TEMPLATE must contain {token} or the link cannot work.");
   }
@@ -204,6 +263,10 @@ function crossChecks(): void {
 
     if (env.mail.driver === "log") {
       invalid.push("MAIL_DRIVER=log in production means no member ever receives an email.");
+    }
+
+    if (env.payments.encryptionKey === "") {
+      invalid.push("PAYMENTS_ENCRYPTION_KEY is required in production. Generate one with: openssl rand -base64 32");
     }
 
     if (env.session.crossSite && !env.apiBaseUrl.startsWith("https://")) {

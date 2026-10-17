@@ -31,6 +31,7 @@ import {
   verifyConnect,
 } from "../services/creatorAuthService.js";
 import { withDefaults } from "../lib/siteSettings.js";
+import { withoutSecrets } from "../services/integrationSecrets.js";
 
 export const connectRouter = Router();
 
@@ -123,7 +124,7 @@ connectRouter.post(
       expiresAt: result.expiresAt.toISOString(),
       creator: { email: result.user.email, name: result.user.name },
       site: result.site,
-      settings: withDefaults(settings?.settings),
+      settings: withoutSecrets(withDefaults(settings?.settings)),
       settingsVersion: settings?.version ?? 1,
     });
   })
@@ -165,7 +166,7 @@ connectRouter.get(
         framerProjectId: site.framerSiteId,
         allowedOrigins: Array.isArray(site.allowedOrigins) ? site.allowedOrigins : [],
         memberCount: site._count.members,
-        settings: withDefaults(site.settings?.settings),
+        settings: withoutSecrets(withDefaults(site.settings?.settings)),
         settingsVersion: site.settings?.version ?? 1,
       })),
     });

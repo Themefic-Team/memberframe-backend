@@ -120,6 +120,11 @@ model Site {
   otps           MemberOtp[]
   passwordResets MemberPasswordReset[]
   emailLogs      EmailLog[]
+  paymentSettings PaymentSettings?
+  gatewayConfigs  GatewayConfig[]
+  subscriptions   Subscription[]
+  /// FP-12
+  assets          Asset[]
 
   @@index([userId])
   @@map("sites")
@@ -161,7 +166,9 @@ model Tier {
   createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
   updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
 
-  site Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  site        Site        @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  /// FP-16. Prices in other currencies than `currency`, e.g. INR for Razorpay.
+  extraPrices TierPrice[]
 
   @@unique([siteId, key], map: "uniq_tiers_site_key")
   @@unique([siteId, rank], map: "uniq_tiers_site_rank")
@@ -225,6 +232,11 @@ model Member {
   site           Site                  @relation(fields: [siteId], references: [id], onDelete: Cascade)
   sessions       MemberSession[]
   passwordResets MemberPasswordReset[]
+  subscriptions  Subscription[]
+  /// FP-10
+  bookmarks      Bookmark[]
+  /// FP-07, one row while signed in
+  meterCycle     MeterCycle?
 
   @@index([siteId, status])
   @@index([siteId, activeTier])
@@ -473,8 +485,6 @@ model CreatorSession {
 // Each arrives with the feature that needs it, so the schema never carries a
 // table nothing reads:
 //
-//   gateway_configs, subscriptions, invoices   payments, backend PRD phase B3
-//   webhook_events                             the idempotency ledger, B3
 //   custom_fields                              FP-09
 //   assets, asset_grants                       FP-12
 //   course_progress                            FP-11
@@ -483,3 +493,319 @@ model CreatorSession {
 //   metered_sessions                           FP-07
 //   plugin_trials                              F19, and its rows are never
 //                                              deleted, per PRD section 11.2
+
+// ============================================================================
+// PAYMENTS. Feature plan FP-16, backend PRD phase B3
+// ============================================================================
+// Money moves from a buyer straight into the creator's own gateway account.
+// These tables hold the creator's encrypted keys, what was sold, and the
+// ledger that makes webhooks idempotent. There is no fee column anywhere, and
+// a test keeps it that way: PRD F03, "No fee line item exists in the codebase".
+
+/// One row per site. Payment behaviour the creator configures.
+model PaymentSettings {
+  siteId String @id @map("site_id") @db.Char(36)
+
+  /// test or live. Which set of gateway keys a checkout uses. New sites start
+  /// in test, so a first purchase can never take real money by accident.
+  mode String @default("test") @db.VarChar(8)
+
+  /// stripe, lemonsqueezy, razorpay, or empty for "the first connected one".
+  defaultGateway String @default("") @map("default_gateway") @db.VarChar(20)
+
+  autoDetectGeolocation Boolean @default(true) @map("auto_detect_geolocation")
+  defaultCurrency       String  @default("USD") @map("default_currency") @db.Char(3)
+
+  /// F18. How long a failed renewal keeps access before it ends.
+  graceDays Int @default(3) @map("grace_days")
+
+  /// Site-relative paths, checked by `isSafeSitePath` before they are stored.
+  afterPurchasePath String @default("/dashboard") @map("after_purchase_path") @db.VarChar(255)
+  pricingPath       String @default("/pricing") @map("pricing_path") @db.VarChar(255)
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  site Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
+
+  @@map("payment_settings")
+}
+
+/// A creator's keys for one gateway in one mode. Secrets are AES-256-GCM
+/// (`lib/secretBox.ts`) and no read shape in this codebase carries them.
+model GatewayConfig {
+  id      String @id @default(uuid(7)) @db.Char(36)
+  siteId  String @map("site_id") @db.Char(36)
+  gateway String @db.VarChar(20)
+  mode    String @db.VarChar(8)
+
+  /// Safe to show: Razorpay key id, Lemon Squeezy store id, Stripe account id.
+  publicId String? @map("public_id") @db.VarChar(255)
+
+  /// Encrypted JSON of every secret value, e.g. `{ secretKey }`.
+  secretsEncrypted String @map("secrets_encrypted") @db.Text
+
+  /// Encrypted webhook signing secret.
+  webhookSecretEncrypted String? @map("webhook_secret_encrypted") @db.Text
+
+  /// The endpoint MemberFrame registered on the gateway, so disconnect can remove it.
+  webhookEndpointId String? @map("webhook_endpoint_id") @db.VarChar(255)
+
+  /// Non-secret settings, e.g. Lemon Squeezy variant ids per interval.
+  options Json?
+
+  accountName   String?   @map("account_name") @db.VarChar(255)
+  maskedSuffix  String?   @map("masked_suffix") @db.VarChar(8)
+  verifiedAt    DateTime? @map("verified_at") @db.DateTime(3)
+  lastWebhookAt DateTime? @map("last_webhook_at") @db.DateTime(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  site Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
+
+  @@unique([siteId, gateway, mode], map: "uniq_gateway_configs_site_gateway_mode")
+  @@map("gateway_configs")
+}
+
+/// What a gateway charges against for one tier price.
+///
+/// Keyed by the amount as well as the interval, so changing a tier's price
+/// makes a new gateway price and leaves the old one for the members already on
+/// it. That is grandfathering, and it falls out of the key rather than code.
+model GatewayPrice {
+  id          String @id @default(uuid(7)) @db.Char(36)
+  siteId      String @map("site_id") @db.Char(36)
+  tierKey     String @map("tier_key") @db.VarChar(50)
+  interval    String @db.VarChar(10)
+  amountMinor Int    @map("amount_minor")
+  currency    String @db.Char(3)
+  gateway     String @db.VarChar(20)
+  mode        String @db.VarChar(8)
+
+  /// Stripe price id, Razorpay plan id.
+  externalId        String  @map("external_id") @db.VarChar(255)
+  externalProductId String? @map("external_product_id") @db.VarChar(255)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@unique([siteId, tierKey, interval, amountMinor, currency, gateway, mode], map: "uniq_gateway_prices_lookup")
+  @@map("gateway_prices")
+}
+
+/// A checkout MemberFrame started, and what the return page polls.
+model Checkout {
+  id         String  @id @default(uuid(7)) @db.Char(36)
+  siteId     String  @map("site_id") @db.Char(36)
+  memberId   String  @map("member_id") @db.Char(36)
+  tierKey    String  @map("tier_key") @db.VarChar(50)
+  interval   String  @db.VarChar(10)
+  gateway    String  @db.VarChar(20)
+  mode       String  @db.VarChar(8)
+  externalId String? @map("external_id") @db.VarChar(255)
+
+  /// open, complete, expired, failed
+  state      String @default("open") @db.VarChar(10)
+  returnPath String @map("return_path") @db.VarChar(255)
+
+  /// What the buyer was quoted, in the currency they were shown. FP-16 section 6.2.
+  amountMinor Int?    @map("amount_minor")
+  currency    String? @db.Char(3)
+  /// A running subscription this purchase replaces, credited for its unused time.
+  replacesSubscriptionId String? @map("replaces_subscription_id") @db.Char(36)
+
+  createdAt   DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  completedAt DateTime? @map("completed_at") @db.DateTime(3)
+
+  @@index([siteId, memberId])
+  @@index([gateway, externalId])
+  @@map("checkouts")
+}
+
+/// A member's paid access. Lifetime purchases are rows too, with no period end.
+model Subscription {
+  id       String @id @default(uuid(7)) @db.Char(36)
+  siteId   String @map("site_id") @db.Char(36)
+  memberId String @map("member_id") @db.Char(36)
+  tierKey  String @map("tier_key") @db.VarChar(50)
+
+  /// month, year, lifetime
+  interval String @db.VarChar(10)
+  gateway  String @db.VarChar(20)
+  mode     String @db.VarChar(8)
+
+  /// The gateway's subscription id, or the order or payment id for lifetime.
+  externalId         String  @map("external_id") @db.VarChar(255)
+  externalCustomerId String? @map("external_customer_id") @db.VarChar(255)
+
+  /// active, past_due, canceling, ended
+  status            String    @db.VarChar(12)
+  currentPeriodEnd  DateTime? @map("current_period_end") @db.DateTime(3)
+  gracePeriodEndsAt DateTime? @map("grace_period_ends_at") @db.DateTime(3)
+  cancelAtPeriodEnd Boolean   @default(false) @map("cancel_at_period_end")
+
+  amountMinor Int    @map("amount_minor")
+  currency    String @db.Char(3)
+
+  /// Razorpay's hosted page for updating the payment method.
+  manageUrl String? @map("manage_url") @db.Text
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.DateTime(3)
+  endedAt   DateTime? @map("ended_at") @db.DateTime(3)
+
+  site   Site   @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  member Member @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@unique([gateway, externalId], map: "uniq_subscriptions_gateway_external")
+  @@index([siteId, memberId, status])
+  @@index([status, currentPeriodEnd])
+  @@index([status, gracePeriodEndsAt])
+  @@map("subscriptions")
+}
+
+/// Every successful charge, for spend totals and the member's history.
+model Payment {
+  id             String  @id @default(uuid(7)) @db.Char(36)
+  siteId         String  @map("site_id") @db.Char(36)
+  memberId       String  @map("member_id") @db.Char(36)
+  subscriptionId String? @map("subscription_id") @db.Char(36)
+  gateway        String  @db.VarChar(20)
+  mode           String  @db.VarChar(8)
+  externalId     String  @map("external_id") @db.VarChar(255)
+  amountMinor    Int     @map("amount_minor")
+  currency       String  @db.Char(3)
+
+  /// paid, refunded
+  status     String   @db.VarChar(10)
+  receiptUrl String?  @map("receipt_url") @db.Text
+  paidAt     DateTime @map("paid_at") @db.DateTime(3)
+
+  @@unique([gateway, externalId], map: "uniq_payments_gateway_external")
+  @@index([siteId, memberId])
+  @@map("payments")
+}
+
+/// The idempotency ledger. Insert before processing; a duplicate insert means
+/// the event was already handled and the answer is 200 with no action.
+/// Conflict C22: a table, because a cache key can be evicted and a gateway can
+/// replay days later.
+model WebhookEvent {
+  id          String    @id @default(uuid(7)) @db.Char(36)
+  gateway     String    @db.VarChar(20)
+  eventId     String    @map("event_id") @db.VarChar(255)
+  siteId      String?   @map("site_id") @db.Char(36)
+  type        String    @db.VarChar(100)
+  receivedAt  DateTime  @default(now()) @map("received_at") @db.DateTime(3)
+  processedAt DateTime? @map("processed_at") @db.DateTime(3)
+  error       String?   @db.Text
+
+  @@unique([gateway, eventId], map: "uniq_webhook_events_gateway_event")
+  @@map("webhook_events")
+}
+
+/// A tier's price in a currency other than its own. FP-16 section 6.2.
+///
+/// The tier's three price columns stay its base price list. These rows add the
+/// same tier in another currency, so an Indian buyer can be charged a real INR
+/// price through Razorpay rather than a converted dollar amount.
+model TierPrice {
+  id          String @id @default(uuid(7)) @db.Char(36)
+  tierId      String @map("tier_id") @db.Char(36)
+  currency    String @db.Char(3)
+  /// month, year, lifetime
+  interval    String @db.VarChar(10)
+  amountMinor Int    @map("amount_minor")
+
+  tier Tier @relation(fields: [tierId], references: [id], onDelete: Cascade)
+
+  @@unique([tierId, currency, interval], map: "uniq_tier_prices_tier_currency_interval")
+  @@map("tier_prices")
+}
+
+/// Sign in provider secrets (Google, GitHub, Apple, Discord client secrets),
+/// AES-256-GCM like the gateway keys. The settings document keeps only the
+/// non-secret values and a list of which secrets are stored, so the plugin is
+/// never sent a client secret again.
+model IntegrationSecret {
+  siteId           String   @map("site_id") @db.Char(36)
+  integrationId    String   @map("integration_id") @db.VarChar(40)
+  secretsEncrypted String   @map("secrets_encrypted") @db.Text
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  @@id([siteId, integrationId])
+  @@map("integration_secrets")
+}
+
+// ============================================================================
+// ENGAGEMENT AND CONTENT, FP-07, FP-10, FP-12
+// ============================================================================
+
+/// FP-10. One saved item per member per slug: the unique key is what makes a
+/// rapid double click land once, whatever order the two requests arrive in.
+model Bookmark {
+  id       String @id @default(uuid(7)) @db.Char(36)
+  siteId   String @map("site_id") @db.Char(36)
+  memberId String @map("member_id") @db.Char(36)
+  itemSlug String @map("item_slug") @db.VarChar(191)
+  title    String @db.VarChar(255)
+  /// Site-relative path, or an absolute http(s) address. Checked on the way in.
+  url      String @db.VarChar(1000)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  member Member @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@unique([memberId, itemSlug], map: "uniq_bookmarks_member_slug")
+  @@index([siteId])
+  @@map("bookmarks")
+}
+
+/// FP-07. The exact meter for a signed-in member, PRD F07: one row, the
+/// current cycle's start and the articles counted in it. A visitor who is not
+/// signed in is metered on their device instead.
+model MeterCycle {
+  memberId   String   @id @map("member_id") @db.Char(36)
+  siteId     String   @map("site_id") @db.Char(36)
+  cycleStart DateTime @map("cycle_start") @db.DateTime(3)
+  /// 7 or 30. A change of window starts a new cycle.
+  periodDays Int      @map("period_days")
+  /// Article slugs counted this cycle, oldest first. Capped at 500.
+  slugs      Json
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  member Member @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@index([siteId])
+  @@map("meter_cycles")
+}
+
+/// FP-12. A protected file. The id is the opaque `assetId` a creator pastes
+/// into `<ProtectedDownload>`; the storage key and a linked file's address are
+/// server-side only and never sent to a visitor.
+model Asset {
+  id           String  @id @db.VarChar(40)
+  siteId       String  @map("site_id") @db.Char(36)
+  name         String  @db.VarChar(200)
+  /// What the visitor's browser saves the file as.
+  fileName     String  @map("file_name") @db.VarChar(255)
+  mimeType     String  @map("mime_type") @db.VarChar(127)
+  sizeBytes    BigInt  @default(0) @map("size_bytes")
+  /// upload (stored by MemberFrame) or url (a private address MemberFrame fetches).
+  source       String  @db.VarChar(10)
+  /// local:<path> or s3:<key>, for an upload.
+  storageKey   String? @map("storage_key") @db.VarChar(255)
+  /// For a linked file. Fetched server side, so it never reaches a visitor.
+  remoteUrl    String? @map("remote_url") @db.Text
+  /// signed_in, or a tier key. Checked against the member's tier on every sign.
+  requiredTier String  @default("signed_in") @map("required_tier") @db.VarChar(50)
+  downloadCount Int    @default(0) @map("download_count")
+  lastDownloadAt DateTime? @map("last_download_at") @db.DateTime(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  site Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
+
+  @@index([siteId])
+  @@map("assets")
+}

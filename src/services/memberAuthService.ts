@@ -35,7 +35,13 @@ import {
 import { isAcceptablePassword, normalizeEmail, passwordProblems } from "../lib/credentials.js";
 import { expiryFrom, generateOtpCode, generateToken, hashToken, isExpired, tokensMatch } from "../lib/tokens.js";
 import { badRequest, forbidden, unauthorized } from "../middleware/errors.js";
-import { otpMail, passwordChangedMail, passwordResetMail, sendMail } from "../lib/mailer.js";
+import {
+  otpMail,
+  passwordChangedMail,
+  passwordResetMail,
+  sendMail,
+  verifyEmailMail,
+} from "../lib/mailer.js";
 import { revokeAllSessionsForMember } from "./sessionService.js";
 import { loadSiteSettings } from "./settingsService.js";
 
@@ -62,7 +68,12 @@ const SAFE_MEMBER_FIELDS = {
 // ============================================================================
 
 /**
- * Create a member and return them signed in.
+ * Create a member, unverified, and email them a confirmation code.
+ *
+ * The member is NOT signed in. `verifyMemberEmail` confirms the address and
+ * the member then signs in with their password. Until then
+ * `signInWithPassword` refuses them with `email_not_verified`, so an account
+ * opened with someone else's address cannot be used.
  *
  * CONFLICT C16. This is the one endpoint that does reveal whether an address is
  * registered, through `email_already_exists`, and FP-02 specifies it that way.
@@ -74,10 +85,11 @@ const SAFE_MEMBER_FIELDS = {
  */
 export async function registerMember(input: {
   siteId: string;
+  siteName: string;
   email: string;
   password: string;
   name: string | null;
-}): Promise<AuthenticatedMember> {
+}): Promise<{ member: AuthenticatedMember; verification: SendMemberOtpResult }> {
   const email = normalizeEmail(input.email);
 
   // Server-side policy, independent of the client's copy. The client's rules
@@ -106,18 +118,22 @@ export async function registerMember(input: {
         name: input.name?.trim() === "" ? null : (input.name?.trim() ?? null),
         passwordHash,
         passwordUpdatedAt: new Date(),
-        // Not verified. Whether access should wait on a verified address is a
-        // product decision nobody has made, so the member is signed in and the
-        // column records the truth. `05-member-auth.md` section 9.9.
+        // Set by `verifyMemberEmail`. Sign in waits on it.
         emailVerifiedAt: null,
         activeTier: "free_member",
         status: "active",
-        lastLoginAt: new Date(),
       },
       select: SAFE_MEMBER_FIELDS,
     });
 
-    return member;
+    const verification = await sendMemberOtp({
+      siteId: input.siteId,
+      siteName: input.siteName,
+      email,
+      purpose: "verify",
+    });
+
+    return { member, verification };
   } catch (error) {
     // The check above is not a guarantee. Two simultaneous sign-ups for the
     // same address both pass it, and the unique index on the generated
@@ -141,6 +157,7 @@ export async function registerMember(input: {
  */
 export async function signInWithPassword(input: {
   siteId: string;
+  siteName: string;
   email: string;
   password: string;
 }): Promise<AuthenticatedMember> {
@@ -153,6 +170,7 @@ export async function signInWithPassword(input: {
       passwordHash: true,
       failedLoginCount: true,
       lockedUntil: true,
+      emailVerifiedAt: true,
     },
   });
 
@@ -188,6 +206,36 @@ export async function signInWithPassword(input: {
   if (!matches) {
     await recordFailure(member.id, member.failedLoginCount);
     throw unauthorized("invalid_credentials");
+  }
+
+  // 5. Right password, unconfirmed address. Checked only after the password
+  //    matched, so this reveals nothing to someone guessing. A fresh code goes
+  //    out unless one is still within its resend lock, and the client opens
+  //    its code step. Members who registered before verification existed land
+  //    here once, on their next sign in.
+  if (member.emailVerifiedAt === null) {
+    await prisma.member.update({
+      where: { id: member.id },
+      data: { failedLoginCount: 0, lockedUntil: null },
+    });
+
+    let resendAfterSeconds = 0;
+    try {
+      const sent = await sendMemberOtp({
+        siteId: input.siteId,
+        siteName: input.siteName,
+        email,
+        purpose: "verify",
+      });
+      resendAfterSeconds = sent.resendAfterSeconds;
+    } catch (error) {
+      // A code from a moment ago is still live. Point at it rather than fail.
+      const extra = (error as { extra?: { retryAfterSeconds?: number } }).extra;
+      if (typeof extra?.retryAfterSeconds !== "number") throw error;
+      resendAfterSeconds = extra.retryAfterSeconds;
+    }
+
+    throw forbidden("email_not_verified", { resendAfterSeconds });
   }
 
   // Success. Clear the counter: FP-02's lockout counts *consecutive* failures,
@@ -392,6 +440,8 @@ export interface SendMemberOtpInput {
   siteId: string;
   siteName: string;
   email: string;
+  /** Which email carries the code. The code itself is the same either way. */
+  purpose?: "signin" | "verify";
 }
 
 export type SendMemberOtpResult = {
@@ -437,7 +487,11 @@ export async function sendMemberOtp(input: SendMemberOtpInput): Promise<SendMemb
   });
 
   // Send mail without throwing on delivery errors
-  await sendMail(otpMail(email, code, input.siteName, input.siteId));
+  await sendMail(
+    input.purpose === "verify"
+      ? verifyEmailMail(email, code, input.siteName, input.siteId)
+      : otpMail(email, code, input.siteName, input.siteId)
+  );
 
   return {
     resendAfterSeconds: env.otp.resendLockSeconds,
@@ -451,12 +505,15 @@ export interface VerifyMemberOtpInput {
   code: string;
 }
 
-export async function verifyMemberOtp(input: VerifyMemberOtpInput): Promise<AuthenticatedMember> {
-  const email = normalizeEmail(input.email);
-  const now = new Date();
-
+/**
+ * Spend the newest outstanding code for this address, or throw.
+ *
+ * Shared by code sign in and by email confirmation, so the attempt limit and
+ * the expiry rules cannot drift between them.
+ */
+async function consumeOtp(siteId: string, email: string, code: string, now: Date): Promise<void> {
   const otp = await prisma.memberOtp.findFirst({
-    where: { siteId: input.siteId, email, consumedAt: null },
+    where: { siteId, email, consumedAt: null },
     orderBy: { createdAt: "desc" },
   });
 
@@ -474,7 +531,7 @@ export async function verifyMemberOtp(input: VerifyMemberOtpInput): Promise<Auth
     throw unauthorized("too_many_attempts");
   }
 
-  if (!tokensMatch(otp.codeHash, hashToken(input.code.trim()))) {
+  if (!tokensMatch(otp.codeHash, hashToken(code.trim()))) {
     const updated = await prisma.memberOtp.update({
       where: { id: otp.id },
       data: { attempts: { increment: 1 } },
@@ -490,6 +547,13 @@ export async function verifyMemberOtp(input: VerifyMemberOtpInput): Promise<Auth
 
   // Code matches! Mark consumed immediately
   await prisma.memberOtp.update({ where: { id: otp.id }, data: { consumedAt: now } });
+}
+
+export async function verifyMemberOtp(input: VerifyMemberOtpInput): Promise<AuthenticatedMember> {
+  const email = normalizeEmail(input.email);
+  const now = new Date();
+
+  await consumeOtp(input.siteId, email, input.code, now);
 
   // Find or create member
   // `emailVerifiedAt` is selected here and nowhere it would leave the service,
@@ -533,3 +597,52 @@ export async function verifyMemberOtp(input: VerifyMemberOtpInput): Promise<Auth
   return member;
 }
 
+// ============================================================================
+// EMAIL CONFIRMATION
+// ============================================================================
+
+/**
+ * Confirm a new account's address with the code `registerMember` sent.
+ *
+ * Signs nobody in: the member goes on to the sign in form, which is the flow
+ * the creator designed. An address with no account answers `invalid_code`,
+ * the same as a wrong code, so this cannot be used to list members.
+ */
+export async function verifyMemberEmail(input: VerifyMemberOtpInput): Promise<void> {
+  const email = normalizeEmail(input.email);
+  const now = new Date();
+
+  const member = await prisma.member.findFirst({
+    where: { siteId: input.siteId, email, deletedAt: null },
+    select: { id: true, emailVerifiedAt: true },
+  });
+
+  await consumeOtp(input.siteId, email, input.code, now);
+
+  if (!member) throw unauthorized("invalid_code");
+  if (member.emailVerifiedAt !== null) return;
+
+  await prisma.member.update({
+    where: { id: member.id },
+    data: { emailVerifiedAt: now },
+  });
+}
+
+/**
+ * Send a fresh confirmation code. Answers the same whether or not the address
+ * has an unconfirmed account, and only actually sends when it does.
+ */
+export async function resendEmailVerification(input: SendMemberOtpInput): Promise<SendMemberOtpResult> {
+  const email = normalizeEmail(input.email);
+
+  const member = await prisma.member.findFirst({
+    where: { siteId: input.siteId, email, deletedAt: null },
+    select: { emailVerifiedAt: true },
+  });
+
+  if (!member || member.emailVerifiedAt !== null) {
+    return { resendAfterSeconds: env.otp.resendLockSeconds, expiresInSeconds: env.otp.ttlSeconds };
+  }
+
+  return sendMemberOtp({ ...input, email, purpose: "verify" });
+}

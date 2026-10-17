@@ -65,7 +65,8 @@ describe("generateShieldJs", () => {
 
     expect(js).toContain("memberframe-shield-veil");
     expect(js).toContain("html { visibility: hidden !important; opacity: 0 !important; }");
-    expect(js).toContain("unhideTimer = setTimeout");
+    // Locked pages fail closed on a slow check: the timer denies, never reveals.
+    expect(js).toContain("if (id === seq) deny(rule, path, null);");
     expect(js).toContain("window.location.replace");
   });
 

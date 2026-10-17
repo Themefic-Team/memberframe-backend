@@ -25,6 +25,7 @@ import {
 } from "../services/creatorAuthService.js";
 import { invalidateSiteSettings, loadSiteSettings } from "../services/settingsService.js";
 import { applyMetadata } from "../lib/memberMetadata.js";
+import { storePatchSecrets, takePatchSecrets, withoutSecrets } from "../services/integrationSecrets.js";
 import {
   mergeSettings,
   toJsonDocument,
@@ -127,6 +128,29 @@ siteRouter.get(
     const metadataOf = (stored: unknown) =>
       applyMetadata(settings.customFields, stored, {}).metadata;
 
+    // FP-16. Lifetime spend from paid charges, and the gateway of each
+    // member's latest purchase. Two grouped reads for the page, not one per row.
+    const memberIds = rows.map((row) => row.id);
+    const [spend, latest] = await Promise.all([
+      prisma.payment.groupBy({
+        by: ["memberId", "currency"],
+        where: { siteId: site.id, memberId: { in: memberIds }, status: "paid" },
+        _sum: { amountMinor: true },
+      }),
+      prisma.subscription.findMany({
+        where: { siteId: site.id, memberId: { in: memberIds } },
+        orderBy: { createdAt: "desc" },
+        select: { memberId: true, gateway: true },
+      }),
+    ]);
+    const spendOf = (memberId: string) => {
+      const rowsFor = spend.filter((entry) => entry.memberId === memberId);
+      const top = rowsFor.sort((a, b) => (b._sum.amountMinor ?? 0) - (a._sum.amountMinor ?? 0))[0];
+      return { amount: top?._sum.amountMinor ?? 0, currency: top?.currency ?? "USD" };
+    };
+    const gatewayOf = (memberId: string) =>
+      latest.find((entry) => entry.memberId === memberId)?.gateway ?? "stripe";
+
     ok(res, {
       members: rows.map((row) => ({
         id: row.id,
@@ -136,12 +160,9 @@ siteRouter.get(
         tier: row.activeTier,
         status: row.status,
         createdAt: row.createdAt.toISOString(),
-        // Zero until the invoices table exists, backend PRD phase B3. Shown as
-        // a real zero rather than omitted, because the plugin's table renders
-        // the column and a missing field would read as a bug.
-        lifetimeSpend: 0,
-        currency: "USD",
-        gateway: "stripe",
+        lifetimeSpend: spendOf(row.id).amount,
+        currency: spendOf(row.id).currency,
+        gateway: gatewayOf(row.id),
         metadata: metadataOf(row.metadata),
       })),
       page: query.page,
@@ -252,6 +273,7 @@ siteRouter.get(
     const tiers = await prisma.tier.findMany({
       where: { siteId: site.id },
       orderBy: { rank: "asc" },
+      include: { extraPrices: { select: { currency: true, interval: true, amountMinor: true } } },
     });
 
     ok(res, {
@@ -266,14 +288,34 @@ siteRouter.get(
         currency: tier.currency,
         rank: tier.rank,
         isActive: tier.isActive,
+        extraPrices: tier.extraPrices,
       })),
     });
   })
 );
 
+/**
+ * A tier key: the four built in ones, or a custom key the plugin derives from
+ * the tier's name. Lowercase, digits, underscore, so it is safe in generated
+ * code, a URL, and a JSON key alike. Conflict C9, resolved.
+ */
+const TIER_KEY_PATTERN = /^[a-z][a-z0-9_]{1,49}$/;
+
+/** FP-16. Prices in currencies other than the tier's own. Replaced wholesale on save. */
+const extraPricesSchema = z
+  .array(
+    z.object({
+      currency: z.enum(["USD", "EUR", "GBP", "INR"]),
+      interval: z.enum(["month", "year", "lifetime"]),
+      amountMinor: z.number().int().min(1).max(100_000_000),
+    })
+  )
+  .max(12)
+  .optional();
+
 const tierBodySchema = z.object({
   siteId: siteIdSchema,
-  key: z.string().trim().min(1).max(50),
+  key: z.string().trim().regex(TIER_KEY_PATTERN, "tier_key_invalid"),
   name: z.string().trim().min(1).max(100),
   monthlyPriceMinor: z.number().int().min(0).nullable().optional().default(null),
   annualPriceMinor: z.number().int().min(0).nullable().optional().default(null),
@@ -281,7 +323,28 @@ const tierBodySchema = z.object({
   currency: z.enum(["USD", "EUR", "GBP", "INR"]).default("USD"),
   rank: z.number().int().min(0).max(1000),
   isActive: z.boolean().default(true),
+  extraPrices: extraPricesSchema,
 });
+
+/**
+ * Replace a tier's extra prices. A price in the tier's own currency is
+ * dropped: that one lives in the tier's columns, and two places for one
+ * price is how they come to disagree.
+ */
+async function replaceExtraPrices(
+  tierId: string,
+  currency: string,
+  prices: z.infer<typeof extraPricesSchema>
+): Promise<void> {
+  if (prices === undefined) return;
+  const kept = prices.filter((price) => price.currency !== currency);
+  await prisma.$transaction([
+    prisma.tierPrice.deleteMany({ where: { tierId } }),
+    ...(kept.length > 0
+      ? [prisma.tierPrice.createMany({ data: kept.map((price) => ({ tierId, ...price })), skipDuplicates: true })]
+      : []),
+  ]);
+}
 
 siteRouter.post(
   "/tiers",
@@ -316,6 +379,7 @@ siteRouter.post(
         isActive: input.isActive,
       },
     });
+    await replaceExtraPrices(tier.id, tier.currency, input.extraPrices);
 
     ok(res, { tier });
   })
@@ -359,6 +423,7 @@ siteRouter.patch(
         isActive: input.isActive,
       },
     });
+    await replaceExtraPrices(tier.id, tier.currency, input.extraPrices);
 
     ok(res, { tier });
   })
@@ -383,7 +448,9 @@ siteRouter.get(
     });
 
     ok(res, {
-      settings: withDefaults(row?.settings),
+      // Never a provider client secret: those live encrypted, and the panel
+      // only needs to know one is stored.
+      settings: withoutSecrets(withDefaults(row?.settings)),
       version: row?.version ?? 1,
       site: {
         siteId: site.id,
@@ -418,6 +485,10 @@ const handleSaveSettings = route(async (req, res) => {
   const input = settingsPutSchema.parse(req.body);
   const site = await requireOwnedSite(creator.userId, input.siteId);
 
+  // Provider secrets leave the patch here and are sealed below, once the
+  // save is known to be valid. Nothing secret reaches the document.
+  const takenSecrets = takePatchSecrets(input.settings);
+
   const problems = validatePatch(input.settings);
   if (problems.length > 0) {
     // 400 with every problem named, not the first. A form that reports one
@@ -435,6 +506,7 @@ const handleSaveSettings = route(async (req, res) => {
   }
 
   const merged = mergeSettings(withDefaults(row?.settings), input.settings);
+  await storePatchSecrets(site.id, takenSecrets, merged);
 
   // Upsert rather than update. A site created before this table existed, or
   // by the seed script, has no row, and a creator should not have to know
@@ -452,7 +524,7 @@ const handleSaveSettings = route(async (req, res) => {
   invalidateSiteSettings(site.id);
 
   ok(res, {
-    settings: withDefaults(saved.settings),
+    settings: withoutSecrets(withDefaults(saved.settings)),
     version: saved.version,
   });
 });

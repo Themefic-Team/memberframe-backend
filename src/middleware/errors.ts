@@ -60,7 +60,8 @@ export const unauthorized = (reason?: string, extra?: Record<string, unknown>): 
   new ApiError(401, reason, undefined, extra);
 
 /** 403. The session is valid and the member is not entitled. */
-export const forbidden = (reason?: string): ApiError => new ApiError(403, reason);
+export const forbidden = (reason?: string, extra?: Record<string, unknown>): ApiError =>
+  new ApiError(403, reason, undefined, extra);
 
 /** 429. Carries the wait, because the client renders it. */
 export const rateLimited = (retryAfterSeconds: number): ApiError =>

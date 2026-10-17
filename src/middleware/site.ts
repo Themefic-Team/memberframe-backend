@@ -323,7 +323,8 @@ async function handlePreflight(req: Request, res: Response): Promise<void> {
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    `Content-Type, Accept, ${SITE_KEY_HEADER}`
+    // The test country header is honoured only in test mode; see gatewayRouter.
+    `Content-Type, Accept, ${SITE_KEY_HEADER}, X-MemberFrame-Test-Country`
   );
   if (req.header("access-control-request-private-network")) {
     res.setHeader("Access-Control-Allow-Private-Network", "true");

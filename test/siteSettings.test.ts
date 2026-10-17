@@ -417,3 +417,52 @@ describe("customFields showWhen", () => {
     expect(read.customFields[1]?.showWhen).toBeUndefined();
   });
 });
+
+// ============================================================================
+// INTEGRATION VALUE KEYS
+// ============================================================================
+// The regression: integration values were filtered with the custom field key
+// rule, lowercase only, so `clientId` and every other camelCase key the plugin
+// sends was dropped on merge while the save answered 200.
+
+describe("integration values", () => {
+  const github = {
+    integrations: {
+      github_oauth: {
+        enabled: true,
+        values: { clientId: "Ov23liABC", clientSecret: "shh", redirect_url: "https://x.test/cb" },
+      },
+    },
+  };
+
+  it("accepts the camelCase keys the plugin's registry uses", () => {
+    expect(validatePatch(github)).toEqual([]);
+  });
+
+  it("stores them and reads them back, which is what the OAuth routes need", () => {
+    const merged = mergeSettings(defaultSettings(), github);
+    const stored = withDefaults(JSON.parse(JSON.stringify(toJsonDocument(merged))) as unknown);
+
+    expect(stored.integrations["github_oauth"]?.values).toEqual({
+      clientId: "Ov23liABC",
+      clientSecret: "shh",
+      redirect_url: "https://x.test/cb",
+    });
+    expect(stored.integrations["github_oauth"]?.enabled).toBe(true);
+  });
+
+  it("refuses a malformed key with the field named, instead of dropping it silently", () => {
+    const problems = validatePatch({
+      integrations: { github_oauth: { enabled: true, values: { "client.id": "x", __proto__x: "y" } } },
+    });
+
+    expect(problems.map((problem) => problem.path)).toContain("integrations.github_oauth.values.client.id");
+  });
+
+  it("still refuses prototype keys", () => {
+    const values = JSON.parse('{"constructor":"x"}') as Record<string, string>;
+    const problems = validatePatch({ integrations: { github_oauth: { enabled: true, values } } });
+
+    expect(problems).toHaveLength(1);
+  });
+});

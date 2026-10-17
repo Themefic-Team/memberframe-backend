@@ -9,6 +9,8 @@
 import { createApp } from "./app.js";
 import { env } from "./config/env.js";
 import { checkDatabase, disconnectDatabase } from "./config/db.js";
+import { sweepExpired } from "./services/payments/apply.js";
+import { migratePlaintextIntegrationSecrets } from "./services/integrationSecrets.js";
 
 async function main(): Promise<void> {
   const status = await checkDatabase();
@@ -33,6 +35,17 @@ async function main(): Promise<void> {
   // service.
   for (const warning of status.warnings) {
     process.stderr.write(`[warn] ${warning}\n`);
+  }
+
+  // Sign in provider secrets saved before encryption existed move into the
+  // encrypted store once, here. A no-op on every later start.
+  try {
+    const moved = await migratePlaintextIntegrationSecrets();
+    if (moved > 0) process.stdout.write(`[secrets] encrypted provider secrets for ${moved} site(s)
+`);
+  } catch (error) {
+    process.stderr.write(`[secrets] could not move provider secrets: ${error instanceof Error ? error.message : String(error)}
+`);
   }
 
   const app = createApp();
@@ -64,6 +77,23 @@ async function main(): Promise<void> {
       );
     }
   });
+
+  // FP-16 section 10. Ends canceled plans past their period and failed
+  // payments past their grace window, a safety net under the gateways' own
+  // events. Unref'd so it never holds the process open on shutdown.
+  const sweep = setInterval(() => {
+    void sweepExpired().then(
+      (ended) => {
+        if (ended > 0) process.stdout.write(`[payments] sweep ended ${ended} subscription(s)
+`);
+      },
+      (error: unknown) => {
+        process.stderr.write(`[payments] sweep failed: ${error instanceof Error ? error.message : String(error)}
+`);
+      }
+    );
+  }, Math.max(30, env.payments.sweepSeconds) * 1000);
+  sweep.unref();
 
   // Shut down in order: stop accepting connections, finish what is in flight,
   // then release the MySQL pool. Exiting without the last leaves connections

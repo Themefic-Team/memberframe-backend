@@ -16,6 +16,20 @@ import { memberRouter } from "./routes/member.js";
 import { connectRouter } from "./routes/connect.js";
 import { siteRouter } from "./routes/site.js";
 import { handleShieldScript } from "./routes/shield.js";
+import {
+  billingRouter,
+  checkoutRouter,
+  handlePayBridge,
+  handleWebhook,
+  paymentsRouter,
+} from "./routes/payments.js";
+import {
+  assetsCreatorRouter,
+  assetsRouter,
+  bookmarksRouter,
+  handleAssetDownload,
+  meterRouter,
+} from "./routes/content.js";
 
 export function createApp(): Express {
   const app = express();
@@ -28,6 +42,15 @@ export function createApp(): Express {
   // development would let any client set its own `X-Forwarded-For` and walk
   // straight past the per-IP rate limit by sending a new value each time.
   if (env.isProduction) app.set("trust proxy", 1);
+
+  // Gateway webhooks, before the JSON parser: the signature is over the exact
+  // bytes the gateway sent, and parsing them first would lose those bytes.
+  // Their own limit, because a gateway event can be a few tens of kilobytes.
+  app.post(
+    "/api/webhooks/:gateway/:siteId/:mode",
+    express.raw({ type: "*/*", limit: "1mb" }),
+    handleWebhook
+  );
 
   // A small body limit. Nothing here accepts more than a few hundred bytes,
   // and the default of 100kb is a free denial-of-service budget.
@@ -104,7 +127,25 @@ export function createApp(): Express {
   // without a resolved tenant and a checked origin. Mounting it per route
   // would be one `router.use` away from a route that forgot.
 
+  // The member's own billing, FP-16, ahead of the general member routes.
+  app.use("/api/member/billing", resolveSite, billingRouter);
+  // Bookmarks and the reading meter, FP-10 and FP-07.
+  app.use("/api/member/bookmarks", resolveSite, bookmarksRouter);
+  app.use("/api/member/meter", resolveSite, meterRouter);
   app.use("/api/member", resolveSite, memberRouter);
+
+  // Pricing and checkout for the published site, FP-16. Same tenant check.
+  app.use("/api/checkout", resolveSite, checkoutRouter);
+
+  // The Razorpay bridge page. A plain navigation, so no origin and no site
+  // header: the checkout id in the path is what scopes it.
+  app.get("/api/pay/razorpay/:checkoutId", handlePayBridge);
+
+  // Protected files, FP-12. The download link is a plain navigation with no
+  // origin and no site header, so it is mounted before the site check and its
+  // signed token is what scopes it. The rest needs a resolved site.
+  app.get("/api/assets/download/:token", handleAssetDownload);
+  app.use("/api/assets", resolveSite, assetsRouter);
 
   // ------------------------------------------------------------------------
   // The plugin panel
@@ -116,18 +157,9 @@ export function createApp(): Express {
   // the member list to anyone who viewed the page source.
 
   app.use("/api/connect", connectRouter);
+  app.use("/api/site/payments", paymentsRouter);
+  app.use("/api/site/assets", assetsCreatorRouter);
   app.use("/api/site", siteRouter);
-
-  // ------------------------------------------------------------------------
-  // Not built yet, and honest about it
-  // ------------------------------------------------------------------------
-
-  app.all("/api/checkout/*", (_req, res) => {
-    res.status(501).json({
-      reason: "not_implemented",
-      detail: "Payments are backend PRD phase B3.",
-    });
-  });
 
   app.use(notFoundHandler);
   app.use(errorHandler);

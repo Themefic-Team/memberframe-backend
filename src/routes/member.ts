@@ -15,12 +15,15 @@
 import { Router, type Request, type Response } from "express";
 import { env } from "../config/env.js";
 import { prisma } from "../config/db.js";
+import { readIntegrationSecret } from "../services/integrationSecrets.js";
 import { badRequest, forbidden, ok, okEmpty, route, unauthorized } from "../middleware/errors.js";
-import { requireSite } from "../middleware/site.js";
+import { originAllowed, requireSite } from "../middleware/site.js";
 import { guardCredentialCheck, guardEmailSend } from "../middleware/rateLimit.js";
 import { clearSessionCookie, sessionLifetimeSeconds, setSessionCookie } from "../lib/cookies.js";
 import {
   registerMember,
+  resendEmailVerification,
+  verifyMemberEmail,
   requestPasswordReset,
   resetPassword,
   sendMemberOtp,
@@ -131,27 +134,26 @@ memberRouter.post(
     const settings = await loadSiteSettings(site.id);
     if (!settings.auth.allowRegistration) throw forbidden("registration_closed");
 
-    // Rate limited as an email-sending action even though it sends none yet:
-    // creating accounts in bulk is the abuse to stop, and a verification email
-    // is a near-term addition.
+    // Rate limited as an email-sending action: it sends the confirmation
+    // code, and creating accounts in bulk is the abuse to stop.
     guardEmailSend(req, "register", input.email);
 
-    const member = await registerMember({
+    const { member, verification } = await registerMember({
       siteId: site.id,
+      siteName: site.siteName,
       email: input.email,
       password: input.password,
       name: input.name,
     });
 
-    const ttl = sessionLifetimeSeconds(false);
-    const session = await issueSession(member.id, site.id, ttl, {
-      userAgent: req.header("user-agent"),
-      ipAddress: req.ip,
+    // No session. The member confirms the address with the emailed code, at
+    // POST /verify-email, and then signs in.
+    ok(res, {
+      verificationRequired: true,
+      email: member.email,
+      resendAfterSeconds: verification.resendAfterSeconds,
+      expiresInSeconds: verification.expiresInSeconds,
     });
-
-    setSessionCookie(res, session.token, { maxAgeSeconds: ttl });
-
-    ok(res, { member: memberPayload(member), tiers: await loadTierLadder(site.id) });
   })
 );
 
@@ -172,6 +174,7 @@ memberRouter.post(
 
     const member = await signInWithPassword({
       siteId: site.id,
+      siteName: site.siteName,
       email: input.email,
       password: input.password,
     });
@@ -309,6 +312,48 @@ memberRouter.post(
     setSessionCookie(res, session.token, { maxAgeSeconds: ttl });
 
     ok(res, { member: memberPayload(member), tiers: await loadTierLadder(site.id) });
+  })
+);
+
+// ============================================================================
+// POST /api/member/verify-email
+// ============================================================================
+// Confirms a new account's address. 200 with no session: the member signs in
+// next, with the password they chose.
+
+memberRouter.post(
+  "/verify-email",
+  route(async (req, res) => {
+    const site = requireSite(req);
+    const input = verifyOtpSchema.parse(req.body);
+
+    guardCredentialCheck(req, "otp");
+
+    await verifyMemberEmail({ siteId: site.id, email: input.email, code: input.code });
+
+    ok(res, { verified: true });
+  })
+);
+
+// ============================================================================
+// POST /api/member/verify-email/resend
+// ============================================================================
+
+memberRouter.post(
+  "/verify-email/resend",
+  route(async (req, res) => {
+    const site = requireSite(req);
+    const input = sendOtpSchema.parse(req.body);
+
+    guardEmailSend(req, "otp", input.email);
+
+    const result = await resendEmailVerification({
+      siteId: site.id,
+      siteName: site.siteName,
+      email: input.email,
+    });
+
+    ok(res, result);
   })
 );
 
@@ -480,26 +525,63 @@ memberRouter.patch(
 // MULTI-PROVIDER OAUTH COMMON HELPERS
 // ============================================================================
 
-function buildOAuthState(siteId: string, origin: string): string {
+function buildOAuthState(siteId: string, origin: string, returnTo = ""): string {
   const statePayload = {
     siteId,
     origin,
+    returnTo,
     nonce: Math.random().toString(36).substring(2),
   };
   return Buffer.from(JSON.stringify(statePayload)).toString("base64url");
 }
 
-function parseOAuthState(stateParam?: string | null): { siteId?: string; origin?: string } {
+function parseOAuthState(stateParam?: string | null): {
+  siteId?: string;
+  origin?: string;
+  returnTo?: string;
+} {
   if (!stateParam) return {};
   try {
     return JSON.parse(Buffer.from(stateParam, "base64url").toString("utf8")) as {
       siteId?: string;
       origin?: string;
+      returnTo?: string;
     };
   } catch {
     return {};
   }
 }
+
+/**
+ * The page the sign-in tab returns to, or "" for the legacy popup flow.
+ *
+ * Why the tab returns to the site at all: the callback runs on this API's own
+ * origin as a top-level page, and a cookie set there lands in a different
+ * partition (Firefox Total Cookie Protection, Chrome CHIPS) from the one the
+ * site's own requests read. So the callback hands the site a one-time code,
+ * and the site's MemberAuth exchanges it from its own page, where the cookie
+ * lands in the right partition.
+ *
+ * Only an http(s) URL whose origin is on the site's allowlist, or this would
+ * be an open redirect that also carries a sign-in code to a stranger.
+ */
+function safeReturnTo(req: Request): string {
+  const raw = typeof req.query["returnTo"] === "string" ? req.query["returnTo"] : "";
+  if (raw === "" || raw.length > 2048) return "";
+
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return "";
+    if (!originAllowed(url.origin, requireSite(req).allowedOrigins)) return "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+/** A short-lived, single-use session that exists only to be exchanged. */
+const OAUTH_HANDOFF_TTL_SECONDS = 120;
 
 function getCallerOrigin(req: Request): string {
   const reqOrigin = req.header("origin");
@@ -532,7 +614,28 @@ function renderOAuthPopupHtml(options: {
   reason?: string;
   providerName: string;
   afterLoginPath?: string;
+  /** Tab flow: the site page to return to. Validated by safeReturnTo. */
+  returnTo?: string;
+  /** Tab flow, success: the one-time code the site exchanges. */
+  handoff?: string;
 }): string {
+  if (options.returnTo) {
+    // The code travels in the fragment: never sent to the site's server and
+    // never in a Referer. It is single use and dies in two minutes anyway.
+    const fragment = options.ok
+      ? `mf_oauth=${encodeURIComponent(options.handoff || "")}`
+      : `mf_oauth_error=${encodeURIComponent(options.reason || "cancelled")}`;
+    const target = JSON.stringify(`${options.returnTo}#${fragment}`).replace(/</g, "\\u003c");
+    return `<!DOCTYPE html>
+<html>
+<head><title>Returning to the site</title></head>
+<body>
+  <script>window.location.replace(${target});</script>
+  <p style="font-family: sans-serif; text-align: center; margin-top: 40px;">Returning to the site...</p>
+</body>
+</html>`;
+  }
+
   if (!options.ok) {
     return `<!DOCTYPE html>
 <html>
@@ -623,8 +726,50 @@ async function completeOAuthMemberLogin(
     ipAddress: req.ip,
   });
   setSessionCookie(res, session.token, { maxAgeSeconds: ttl });
-  return member;
+
+  // The tab flow cannot use the cookie above (wrong partition, see
+  // safeReturnTo), so it also gets a code to exchange from the site's page.
+  const handoff = await issueSession(member.id, siteId, OAUTH_HANDOFF_TTL_SECONDS, {
+    userAgent: req.header("user-agent"),
+    ipAddress: req.ip,
+  });
+
+  return { member, handoff: handoff.token };
 }
+
+// ============================================================================
+// POST /api/member/oauth/exchange
+// ============================================================================
+// The site's half of the tab flow. The sign-in tab lands back on the site with
+// a one-time code in its fragment; MemberAuth posts it here from the site's
+// own page, so the session cookie is set in the partition the site's later
+// requests read. The code is a two-minute session row, revoked on first use.
+
+const oauthExchangeSchema = z.object({ code: z.string().min(20).max(200) });
+
+memberRouter.post(
+  "/oauth/exchange",
+  route(async (req, res) => {
+    const site = requireSite(req);
+    const input = oauthExchangeSchema.parse(req.body);
+    guardCredentialCheck(req, "oauth_exchange");
+
+    const handoff = await loadSession(input.code, site.id);
+    if (!handoff) throw unauthorized("invalid_handoff");
+
+    // Single use: gone before anything else can happen.
+    await revokeSession(input.code);
+
+    const ttl = sessionLifetimeSeconds(true);
+    const session = await issueSession(handoff.member.memberId, site.id, ttl, {
+      userAgent: req.header("user-agent"),
+      ipAddress: req.ip,
+    });
+    setSessionCookie(res, session.token, { maxAgeSeconds: ttl });
+
+    ok(res, { member: handoff.member, tiers: handoff.tiers });
+  })
+);
 
 // ============================================================================
 // GOOGLE OAUTH
@@ -638,6 +783,12 @@ memberRouter.get(
     const google = settings.integrations?.["google_oauth"];
 
     if (!google?.enabled || !google.values?.["clientId"]) {
+      // Tab flow: send the visitor back to the site with a reason, not a JSON page.
+      const back = safeReturnTo(req);
+      if (back) {
+        res.redirect(`${back}#mf_oauth_error=not_configured`);
+        return;
+      }
       throw badRequest("google_oauth_not_configured", {
         message: "Google sign-in is not configured or enabled for this site.",
       });
@@ -645,7 +796,7 @@ memberRouter.get(
 
     const redirectUri =
       google.values["redirect_url"] || `${env.apiBaseUrl}/api/member/oauth/google/callback`;
-    const state = buildOAuthState(site.id, getCallerOrigin(req));
+    const state = buildOAuthState(site.id, getCallerOrigin(req), safeReturnTo(req));
 
     const authUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
     authUrl.searchParams.set("client_id", google.values["clientId"]);
@@ -674,6 +825,7 @@ memberRouter.get(
         renderOAuthPopupHtml({
           ok: false,
           targetOrigin,
+          returnTo: stateObj.returnTo,
           reason: errorParam || "no_code",
           providerName: "Google",
         })
@@ -690,7 +842,8 @@ memberRouter.get(
     const settings = await loadSiteSettings(site.id);
     const google = settings.integrations?.["google_oauth"];
 
-    if (!google?.values?.["clientId"] || !google.values?.["clientSecret"]) {
+    const googleSecret = google ? await readIntegrationSecret(site.id, "google_oauth", "clientSecret", google.values) : "";
+    if (!google?.values?.["clientId"] || !googleSecret) {
       throw badRequest("google_oauth_credentials_missing");
     }
 
@@ -703,7 +856,7 @@ memberRouter.get(
       body: new URLSearchParams({
         code,
         client_id: google.values["clientId"],
-        client_secret: google.values["clientSecret"],
+        client_secret: googleSecret,
         redirect_uri: redirectUri,
         grant_type: "authorization_code",
       }),
@@ -714,6 +867,7 @@ memberRouter.get(
         renderOAuthPopupHtml({
           ok: false,
           targetOrigin,
+          returnTo: stateObj.returnTo,
           reason: "token_exchange_failed",
           providerName: "Google",
         })
@@ -739,7 +893,7 @@ memberRouter.get(
 
     if (!profile.email) throw badRequest("google_profile_missing_email");
 
-    await completeOAuthMemberLogin(res, req, site.id, {
+    const login = await completeOAuthMemberLogin(res, req, site.id, {
       email: profile.email,
       name: profile.name,
       avatarUrl: profile.picture,
@@ -749,7 +903,9 @@ memberRouter.get(
     res.type("html").send(
       renderOAuthPopupHtml({
         ok: true,
+        handoff: login.handoff,
         targetOrigin,
+        returnTo: stateObj.returnTo,
         providerName: "Google",
         afterLoginPath: settings.auth?.afterLoginPath,
       })
@@ -769,6 +925,12 @@ memberRouter.get(
     const github = settings.integrations?.["github_oauth"];
 
     if (!github?.enabled || !github.values?.["clientId"]) {
+      // Tab flow: send the visitor back to the site with a reason, not a JSON page.
+      const back = safeReturnTo(req);
+      if (back) {
+        res.redirect(`${back}#mf_oauth_error=not_configured`);
+        return;
+      }
       throw badRequest("github_oauth_not_configured", {
         message: "GitHub sign-in is not configured or enabled for this site.",
       });
@@ -776,7 +938,7 @@ memberRouter.get(
 
     const redirectUri =
       github.values["redirect_url"] || `${env.apiBaseUrl}/api/member/oauth/github/callback`;
-    const state = buildOAuthState(site.id, getCallerOrigin(req));
+    const state = buildOAuthState(site.id, getCallerOrigin(req), safeReturnTo(req));
 
     const authUrl = new URL("https://github.com/login/oauth/authorize");
     authUrl.searchParams.set("client_id", github.values["clientId"]);
@@ -803,6 +965,7 @@ memberRouter.get(
         renderOAuthPopupHtml({
           ok: false,
           targetOrigin,
+          returnTo: stateObj.returnTo,
           reason: errorParam || "no_code",
           providerName: "GitHub",
         })
@@ -819,7 +982,8 @@ memberRouter.get(
     const settings = await loadSiteSettings(site.id);
     const github = settings.integrations?.["github_oauth"];
 
-    if (!github?.values?.["clientId"] || !github.values?.["clientSecret"]) {
+    const githubSecret = github ? await readIntegrationSecret(site.id, "github_oauth", "clientSecret", github.values) : "";
+    if (!github?.values?.["clientId"] || !githubSecret) {
       throw badRequest("github_oauth_credentials_missing");
     }
 
@@ -834,7 +998,7 @@ memberRouter.get(
       },
       body: new URLSearchParams({
         client_id: github.values["clientId"],
-        client_secret: github.values["clientSecret"],
+        client_secret: githubSecret,
         code,
         redirect_uri: redirectUri,
       }),
@@ -845,6 +1009,7 @@ memberRouter.get(
         renderOAuthPopupHtml({
           ok: false,
           targetOrigin,
+          returnTo: stateObj.returnTo,
           reason: "token_exchange_failed",
           providerName: "GitHub",
         })
@@ -858,6 +1023,7 @@ memberRouter.get(
         renderOAuthPopupHtml({
           ok: false,
           targetOrigin,
+          returnTo: stateObj.returnTo,
           reason: tokenData.error || "invalid_token_response",
           providerName: "GitHub",
         })
@@ -903,7 +1069,7 @@ memberRouter.get(
 
     if (!resolvedEmail) throw badRequest("github_profile_missing_email");
 
-    await completeOAuthMemberLogin(res, req, site.id, {
+    const login = await completeOAuthMemberLogin(res, req, site.id, {
       email: resolvedEmail,
       name: userProfile.name || userProfile.login,
       avatarUrl: userProfile.avatar_url,
@@ -913,7 +1079,9 @@ memberRouter.get(
     res.type("html").send(
       renderOAuthPopupHtml({
         ok: true,
+        handoff: login.handoff,
         targetOrigin,
+        returnTo: stateObj.returnTo,
         providerName: "GitHub",
         afterLoginPath: settings.auth?.afterLoginPath,
       })
@@ -933,6 +1101,12 @@ memberRouter.get(
     const apple = settings.integrations?.["apple_oauth"];
 
     if (!apple?.enabled || !apple.values?.["clientId"]) {
+      // Tab flow: send the visitor back to the site with a reason, not a JSON page.
+      const back = safeReturnTo(req);
+      if (back) {
+        res.redirect(`${back}#mf_oauth_error=not_configured`);
+        return;
+      }
       throw badRequest("apple_oauth_not_configured", {
         message: "Apple sign-in is not configured or enabled for this site.",
       });
@@ -940,7 +1114,7 @@ memberRouter.get(
 
     const redirectUri =
       apple.values["redirect_url"] || `${env.apiBaseUrl}/api/member/oauth/apple/callback`;
-    const state = buildOAuthState(site.id, getCallerOrigin(req));
+    const state = buildOAuthState(site.id, getCallerOrigin(req), safeReturnTo(req));
 
     const authUrl = new URL("https://appleid.apple.com/auth/authorize");
     authUrl.searchParams.set("client_id", apple.values["clientId"]);
@@ -968,6 +1142,7 @@ const handleAppleCallback = route(async (req, res) => {
       renderOAuthPopupHtml({
         ok: false,
         targetOrigin,
+        returnTo: stateObj.returnTo,
         reason: errorParam || "no_code_or_token",
         providerName: "Apple",
       })
@@ -1005,14 +1180,15 @@ const handleAppleCallback = route(async (req, res) => {
   if (!email && code) {
     // If id_token wasn't returned in form_post directly, exchange code with Apple token endpoint
     const apple = settings.integrations?.["apple_oauth"];
-    if (apple?.values?.["clientSecret"]) {
+    const appleSecret = apple ? await readIntegrationSecret(site.id, "apple_oauth", "clientSecret", apple.values) : "";
+    if (apple && appleSecret) {
       const redirectUri = apple.values["redirect_url"] || `${env.apiBaseUrl}/api/member/oauth/apple/callback`;
       const tokenRes = await fetch("https://appleid.apple.com/auth/token", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
           client_id: apple.values["clientId"] || "",
-          client_secret: apple.values["clientSecret"],
+          client_secret: appleSecret,
           code,
           grant_type: "authorization_code",
           redirect_uri: redirectUri,
@@ -1033,6 +1209,7 @@ const handleAppleCallback = route(async (req, res) => {
       renderOAuthPopupHtml({
         ok: false,
         targetOrigin,
+        returnTo: stateObj.returnTo,
         reason: "apple_profile_missing_email",
         providerName: "Apple",
       })
@@ -1040,7 +1217,7 @@ const handleAppleCallback = route(async (req, res) => {
     return;
   }
 
-  await completeOAuthMemberLogin(res, req, site.id, {
+  const login = await completeOAuthMemberLogin(res, req, site.id, {
     email,
     name: appleName,
     avatarUrl: null,
@@ -1050,7 +1227,9 @@ const handleAppleCallback = route(async (req, res) => {
   res.type("html").send(
     renderOAuthPopupHtml({
       ok: true,
+      handoff: login.handoff,
       targetOrigin,
+      returnTo: stateObj.returnTo,
       providerName: "Apple",
       afterLoginPath: settings.auth?.afterLoginPath,
     })
@@ -1072,6 +1251,12 @@ memberRouter.get(
     const discord = settings.integrations?.["discord_oauth"];
 
     if (!discord?.enabled || !discord.values?.["clientId"]) {
+      // Tab flow: send the visitor back to the site with a reason, not a JSON page.
+      const back = safeReturnTo(req);
+      if (back) {
+        res.redirect(`${back}#mf_oauth_error=not_configured`);
+        return;
+      }
       throw badRequest("discord_oauth_not_configured", {
         message: "Discord sign-in is not configured or enabled for this site.",
       });
@@ -1079,7 +1264,7 @@ memberRouter.get(
 
     const redirectUri =
       discord.values["redirect_url"] || `${env.apiBaseUrl}/api/member/oauth/discord/callback`;
-    const state = buildOAuthState(site.id, getCallerOrigin(req));
+    const state = buildOAuthState(site.id, getCallerOrigin(req), safeReturnTo(req));
 
     const authUrl = new URL("https://discord.com/oauth2/authorize");
     authUrl.searchParams.set("client_id", discord.values["clientId"]);
@@ -1108,6 +1293,7 @@ memberRouter.get(
         renderOAuthPopupHtml({
           ok: false,
           targetOrigin,
+          returnTo: stateObj.returnTo,
           reason: errorParam || "no_code",
           providerName: "Discord",
         })
@@ -1124,7 +1310,8 @@ memberRouter.get(
     const settings = await loadSiteSettings(site.id);
     const discord = settings.integrations?.["discord_oauth"];
 
-    if (!discord?.values?.["clientId"] || !discord.values?.["clientSecret"]) {
+    const discordSecret = discord ? await readIntegrationSecret(site.id, "discord_oauth", "clientSecret", discord.values) : "";
+    if (!discord?.values?.["clientId"] || !discordSecret) {
       throw badRequest("discord_oauth_credentials_missing");
     }
 
@@ -1136,7 +1323,7 @@ memberRouter.get(
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         client_id: discord.values["clientId"],
-        client_secret: discord.values["clientSecret"],
+        client_secret: discordSecret,
         grant_type: "authorization_code",
         code,
         redirect_uri: redirectUri,
@@ -1148,6 +1335,7 @@ memberRouter.get(
         renderOAuthPopupHtml({
           ok: false,
           targetOrigin,
+          returnTo: stateObj.returnTo,
           reason: "token_exchange_failed",
           providerName: "Discord",
         })
@@ -1179,7 +1367,7 @@ memberRouter.get(
       ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png`
       : null;
 
-    await completeOAuthMemberLogin(res, req, site.id, {
+    const login = await completeOAuthMemberLogin(res, req, site.id, {
       email: user.email,
       name: user.global_name || user.username,
       avatarUrl,
@@ -1189,7 +1377,9 @@ memberRouter.get(
     res.type("html").send(
       renderOAuthPopupHtml({
         ok: true,
+        handoff: login.handoff,
         targetOrigin,
+        returnTo: stateObj.returnTo,
         providerName: "Discord",
         afterLoginPath: settings.auth?.afterLoginPath,
       })

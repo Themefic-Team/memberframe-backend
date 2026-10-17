@@ -119,6 +119,22 @@ export async function loadSession(
 
   const tiers = await loadTierLadder(siteId);
 
+  // The subscription behind the member's tier, if a purchase put them there.
+  // Its dates are what let `isEntitled` keep a canceled member in until the
+  // period they paid for ends, and a past_due one in through the grace window.
+  const billing = await prisma.subscription.findFirst({
+    where: {
+      siteId,
+      memberId: member.id,
+      tierKey: member.activeTier,
+      status: { in: ["active", "past_due", "canceling"] },
+    },
+    orderBy: { createdAt: "desc" },
+    select: { currentPeriodEnd: true, gracePeriodEndsAt: true, interval: true },
+  });
+
+  const unix = (date: Date | null | undefined) => (date ? Math.floor(date.getTime() / 1000) : 0);
+
   return {
     sessionId: session.id,
     member: {
@@ -127,13 +143,11 @@ export async function loadSession(
       name: member.name,
       activeTier: member.activeTier,
       status: toMemberStatus(member.status),
-      // Both are zero until the subscriptions table exists, which is backend
-      // PRD phase B3. `isEntitled` only reads them for `past_due` and
-      // `canceled`, and an `active` member never reaches that branch, so a
-      // zero here cannot wrongly grant access. It can only wrongly deny, which
-      // is the correct direction to be wrong in.
-      currentPeriodEnd: 0,
-      gracePeriodEndsAt: 0,
+      // Zero when no subscription explains the tier: a free member, a tier
+      // granted by hand, or a lifetime purchase. `isEntitled` reads these
+      // only for `past_due` and `canceled`, so a zero can only deny.
+      currentPeriodEnd: unix(billing?.currentPeriodEnd),
+      gracePeriodEndsAt: unix(billing?.gracePeriodEndsAt),
       siteId: member.siteId,
     },
     tiers,
