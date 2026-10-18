@@ -10,7 +10,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { generateShieldJs, shieldGuestPaths } from "../src/routes/shield.js";
-import type { GatedPageRule } from "../src/lib/siteSettings.js";
+import type { GatedPageRule, SectionLockRule } from "../src/lib/siteSettings.js";
 
 const ORIGIN = "https://site.test";
 const SITE_KEY = "mf_site_test";
@@ -55,6 +55,9 @@ function boot(
     hash?: string;
     afterLoginPath?: string;
     rules?: GatedPageRule[];
+    sectionRules?: SectionLockRule[];
+    /** History methods on a History.prototype, the way a real browser has them. */
+    prototypeHistory?: boolean;
   } = {}
 ) {
   const answers = [...(options.answers ?? [])];
@@ -82,18 +85,31 @@ function boot(
       return `${ORIGIN}${this.pathname}${this.hash}`;
     },
     replace: vi.fn(),
+    reload: vi.fn(),
   };
 
   const go = (url: string) => {
     location.pathname = new URL(url, ORIGIN).pathname;
   };
 
+  class FakeHistory {
+    pushState(_state: unknown, _title: string, url: string) {
+      go(url);
+    }
+    replaceState(_state: unknown, _title: string, url: string) {
+      go(url);
+    }
+  }
+
   const window = {
     location,
-    history: {
-      pushState: (_state: unknown, _title: string, url: string) => go(url),
-      replaceState: (_state: unknown, _title: string, url: string) => go(url),
-    },
+    History: options.prototypeHistory ? FakeHistory : undefined,
+    history: options.prototypeHistory
+      ? (new FakeHistory() as unknown as Record<string, (...args: unknown[]) => void>)
+      : {
+          pushState: (_state: unknown, _title: string, url: string) => go(url),
+          replaceState: (_state: unknown, _title: string, url: string) => go(url),
+        },
     localStorage: memoryStorage(options.local),
     sessionStorage: memoryStorage(options.session),
     addEventListener: (type: string, fn: (event: unknown) => void) => {
@@ -133,6 +149,7 @@ function boot(
     afterLoginPath: options.afterLoginPath ?? "/dashboard",
     guestPaths: ["/login", "/signup"],
     rules: options.rules ?? RULES,
+    sectionRules: options.sectionRules ?? [],
     tiers: TIERS,
   });
 
@@ -150,15 +167,24 @@ function boot(
     location,
     fetch,
     hidden: () => head.children.some((child) => child.id === "memberframe-shield-veil"),
+    /** The section lock stylesheet's current text. */
+    sectionCss: () =>
+      String((head.children.find((child) => child.id === "memberframe-section-locks") as { textContent?: string } | undefined)?.textContent ?? ""),
     fireTimers: () => {
       for (const fn of timers.splice(0)) fn?.();
     },
+    /**
+     * A link click. Delivered to window listeners only: on a published Framer
+     * site, listeners the head script put on document did not survive the
+     * page booting, so a hook that relies on them must fail this test.
+     */
     click: (href: string) => {
       const anchor = { nodeName: "A", href, target: "", hasAttribute: () => false, parentNode: null };
-      for (const fn of docListeners["click"] ?? []) {
+      for (const fn of winListeners["click"] ?? []) {
         fn({ defaultPrevented: false, button: 0, target: anchor });
       }
     },
+    docListeners,
     emit: (type: string, event: unknown) => {
       for (const fn of winListeners[type] ?? []) fn(event);
     },
@@ -196,6 +222,46 @@ describe("a locked page, loaded directly", () => {
     expect(shield.location.replace).toHaveBeenCalledWith("/pricing");
   });
 
+  const GOLD_TO_LOGIN: GatedPageRule[] = [
+    ...RULES,
+    { path: "/experiments", enabled: true, requiredTier: "vip", fallbackAction: "redirect", redirectPath: "/login" },
+  ];
+
+  it("sends a signed-in member without the plan to the dashboard, not to the sign in page", async () => {
+    const shield = boot("/experiments", { answers: [signedIn()], rules: GOLD_TO_LOGIN });
+    await flush();
+
+    expect(shield.location.replace).toHaveBeenCalledTimes(1);
+    expect(shield.location.replace).toHaveBeenCalledWith("/dashboard");
+  });
+
+  it("still sends a signed-out visitor to the sign in page", async () => {
+    const shield = boot("/experiments", { answers: [signedOut], rules: GOLD_TO_LOGIN });
+    await flush();
+
+    expect(shield.location.replace).toHaveBeenCalledWith("/login");
+  });
+
+  it("falls back to the home page when the dashboard is locked to the member too", async () => {
+    const rules: GatedPageRule[] = [
+      { path: "/dashboard", enabled: true, requiredTier: "vip", fallbackAction: "redirect", redirectPath: "/login" },
+      { path: "/experiments", enabled: true, requiredTier: "vip", fallbackAction: "redirect", redirectPath: "/login" },
+    ];
+    const shield = boot("/experiments", { answers: [signedIn()], rules });
+    await flush();
+
+    expect(shield.location.replace).toHaveBeenCalledWith("/");
+  });
+
+  it("does the same on a menu click, from the cached session", () => {
+    const cached = JSON.stringify({ ts: Date.now(), session: FREE_MEMBER, tiers: TIERS });
+    const shield = boot("/", { session: { [CACHE_KEY]: cached }, rules: GOLD_TO_LOGIN });
+
+    shield.window.history.pushState(null, "", "/experiments");
+    expect(shield.location.replace).toHaveBeenCalledWith("/dashboard");
+    expect(shield.fetch).not.toHaveBeenCalled();
+  });
+
   it("never reveals the page when the check is slow: it redirects instead", () => {
     const shield = boot("/dashboard", { answers: ["pending"] });
     shield.fireTimers();
@@ -219,12 +285,102 @@ describe("a locked page, loaded directly", () => {
   });
 });
 
+describe("a CMS page rule, /blog/:slug", () => {
+  const POSTS: GatedPageRule[] = [
+    { path: "/blog/:slug", enabled: true, requiredTier: "signed_in", fallbackAction: "redirect", redirectPath: "/login" },
+  ];
+
+  it("locks every post", async () => {
+    const shield = boot("/blog/how-e-commerce-is-redefining-global-shopping-trends", { answers: [signedOut], rules: POSTS });
+    expect(shield.hidden()).toBe(true);
+
+    await flush();
+    expect(shield.location.replace).toHaveBeenCalledWith("/login");
+  });
+
+  it("leaves the list page open", () => {
+    const shield = boot("/blog", { rules: POSTS });
+
+    expect(shield.hidden()).toBe(false);
+    expect(shield.fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not match a different section with the same depth", () => {
+    const shield = boot("/podcast/episode-1", { rules: POSTS });
+
+    expect(shield.hidden()).toBe(false);
+  });
+});
+
 describe("a public page", () => {
   it("is left alone, with no request", () => {
     const shield = boot("/about");
 
     expect(shield.hidden()).toBe(false);
     expect(shield.fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("in-site navigation on a real Framer site", () => {
+  // Reproduced in Chrome against a published site: a direct visit to a locked
+  // page redirected, a click on the same page's menu link opened it. Framer
+  // replaced history.pushState with its own function that calls the built-in
+  // one, and the head script's document listeners were gone after boot.
+
+  it("guards a router that installs its own pushState over the built-in one", async () => {
+    const shield = boot("/", { answers: [signedOut], prototypeHistory: true });
+
+    // What Framer does once it boots: its own pushState on the history object,
+    // calling the method it finds on History.prototype.
+    const builtIn = (shield.window.History as unknown as { prototype: { pushState: (...args: unknown[]) => void } })
+      .prototype.pushState;
+    shield.window.history.pushState = function (this: unknown, ...args: unknown[]) {
+      builtIn.apply(this, args);
+    };
+
+    shield.window.history.pushState(null, "", "/dashboard");
+    expect(shield.hidden()).toBe(true);
+
+    await flush();
+    expect(shield.location.replace).toHaveBeenCalledWith("/login");
+  });
+
+  it("keeps the locked page hidden and reloads when the redirect lands as an in-page navigation", async () => {
+    const shield = boot("/", { answers: [signedOut] });
+    // Framer's router, mid-transition, turns location.replace into an in-page
+    // navigation: the URL changes and the locked page stays rendered.
+    shield.location.replace.mockImplementation((url: string) => {
+      shield.location.pathname = url;
+    });
+
+    shield.window.history.pushState(null, "", "/dashboard");
+    await flush();
+    expect(shield.location.replace).toHaveBeenCalledWith("/login");
+
+    // The hooks now see /login, a sign in page. The page must stay hidden.
+    shield.fireTimers();
+    expect(shield.hidden()).toBe(true);
+    expect(shield.location.reload).toHaveBeenCalled();
+  });
+
+  it("hooks the click on window, not on document", () => {
+    const shield = boot("/", { answers: ["pending"] });
+    expect(shield.docListeners["click"] ?? []).toHaveLength(0);
+
+    shield.click(`${ORIGIN}/dashboard`);
+    expect(shield.hidden()).toBe(true);
+  });
+
+  it("catches a path change no hook saw, on the next poll", async () => {
+    const shield = boot("/", { answers: [signedOut] });
+
+    // A router this script knows nothing about.
+    shield.location.pathname = "/dashboard";
+    shield.fireTimers();
+    expect(shield.hidden()).toBe(true);
+
+    await flush();
+    expect(shield.location.replace).toHaveBeenCalledWith("/login");
   });
 });
 
@@ -373,7 +529,8 @@ describe("billing states, PRD 11.3", () => {
 
     const lapsed = boot("/dashboard", { answers: [signedIn({ ...FREE_MEMBER, status: "past_due", gracePeriodEndsAt: past } as never)] });
     await flush();
-    expect(lapsed.location.replace).toHaveBeenCalledWith("/login");
+    // Still signed in, so not the sign in form; the dashboard is the locked page itself.
+    expect(lapsed.location.replace).toHaveBeenCalledWith("/");
   });
 
   it("keeps a canceled member in until the period they paid for ends", async () => {
@@ -383,6 +540,97 @@ describe("billing states, PRD 11.3", () => {
 
     const over = boot("/dashboard", { answers: [signedIn({ ...FREE_MEMBER, status: "canceled", currentPeriodEnd: past } as never)] });
     await flush();
-    expect(over.location.replace).toHaveBeenCalledWith("/login");
+    expect(over.location.replace).toHaveBeenCalledWith("/");
+  });
+});
+
+describe("section locks", () => {
+  const SECTIONS: SectionLockRule[] = [
+    { name: "VIP article", enabled: true, audience: "members", requiredTier: "vip", lockedAction: "hide" },
+    { name: "Upgrade teaser", enabled: true, audience: "others", requiredTier: "vip", lockedAction: "hide" },
+    { name: "Member preview", enabled: true, audience: "members", requiredTier: "signed_in", lockedAction: "blur" },
+  ];
+
+  /** Every way a layer can be tagged with a rule: name, override attribute, override class. */
+  const sel = (name: string, slug: string) =>
+    `[data-framer-name="Lock: ${name}" i],[data-framer-name="Lock:${name}" i],[data-mf-lock="${name}" i],.mf-lock-${slug}`;
+  const VIP = sel("VIP article", "vip-article");
+  const TEASER = sel("Upgrade teaser", "upgrade-teaser");
+  const PREVIEW = sel("Member preview", "member-preview");
+
+  const BASE = ['[data-framer-name^="Lock:" i]', "[data-mf-lock]", '[class*="mf-lock-"]'];
+  /** The exempt list inside the hide rule: the layers that are shown or blurred. */
+  const exempt = (css: string) => css.slice(css.indexOf(":not(") + 5, css.indexOf(")" + "," + BASE[1]));
+
+  it("hides every tagged layer, however it was tagged, before the session is known", () => {
+    const shield = boot("/about", { answers: ["pending"], sectionRules: SECTIONS });
+    expect(shield.sectionCss()).toBe(`${BASE.join(",")}{display:none !important}`);
+  });
+
+  it("shows each layer only to the people its own rule names", async () => {
+    const shield = boot("/about", { answers: [signedIn()], sectionRules: SECTIONS });
+    await flush();
+    const shown = exempt(shield.sectionCss());
+
+    // A Free member: no VIP article, the upgrade teaser instead, the preview unblurred.
+    expect(shown).not.toContain(VIP);
+    expect(shown).toContain(TEASER);
+    expect(shown).toContain(PREVIEW);
+    expect(shield.sectionCss()).not.toContain("blur(");
+  });
+
+  it("reverses for a member with the plan", async () => {
+    const shield = boot("/about", { answers: [signedIn({ ...FREE_MEMBER, activeTier: "vip" })], sectionRules: SECTIONS });
+    await flush();
+    const shown = exempt(shield.sectionCss());
+
+    expect(shown).toContain(VIP);
+    expect(shown).not.toContain(TEASER);
+  });
+
+  it("blurs instead of hiding when the rule says blur", async () => {
+    const shield = boot("/about", { answers: [signedOut], sectionRules: SECTIONS });
+    await flush();
+    const css = shield.sectionCss();
+
+    expect(exempt(css)).toContain(PREVIEW);
+    expect(css).toContain(`${PREVIEW}{filter:blur(10px)`);
+  });
+
+  it("keeps members' layers hidden and shows the way in when the API is down", async () => {
+    const shield = boot("/about", { answers: ["network_error"], sectionRules: SECTIONS });
+    await flush();
+    const shown = exempt(shield.sectionCss());
+
+    expect(shown).not.toContain(VIP);
+    expect(shown).toContain(TEASER);
+  });
+
+  it("uses a cached session with no request", () => {
+    const cached = JSON.stringify({ ts: Date.now(), session: { ...FREE_MEMBER, activeTier: "vip" }, tiers: TIERS });
+    const shield = boot("/about", { session: { [CACHE_KEY]: cached }, sectionRules: SECTIONS });
+
+    expect(shield.fetch).not.toHaveBeenCalled();
+    expect(exempt(shield.sectionCss())).toContain(VIP);
+  });
+
+  it("re-checks when a component signs the member in or out", async () => {
+    const shield = boot("/about", {
+      answers: [signedOut, signedIn({ ...FREE_MEMBER, activeTier: "vip" })],
+      sectionRules: SECTIONS,
+    });
+    await flush();
+    expect(exempt(shield.sectionCss())).not.toContain(VIP);
+
+    shield.emit("memberframe:session-updated", { detail: { signedIn: true } });
+    await flush();
+    expect(exempt(shield.sectionCss())).toContain(VIP);
+  });
+
+  it("treats a switched-off rule as a lock that is off: its layers show, with no request", () => {
+    const shield = boot("/about", { answers: ["pending"], sectionRules: [{ ...SECTIONS[0]!, enabled: false }] });
+
+    expect(shield.fetch).not.toHaveBeenCalled();
+    expect(exempt(shield.sectionCss())).toContain(VIP);
   });
 });

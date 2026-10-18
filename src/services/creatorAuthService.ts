@@ -35,6 +35,7 @@
  */
 
 import { prisma } from "../config/db.js";
+import { FREE_TIER_RANK, NEW_FREE_TIER_KEY } from "../lib/tiers.js";
 import { env } from "../config/env.js";
 import { badRequest, forbidden, notFound, unauthorized } from "../middleware/errors.js";
 import { creatorCodeMail, sendMail } from "../lib/mailer.js";
@@ -286,17 +287,14 @@ async function createSite(
       select: { id: true, siteKey: true, siteName: true, allowedOrigins: true },
     });
 
-    // The same four keys `types/member.ts` declares as DEFAULT_SITE_TIERS, and
-    // the same ranks. The plugin's property control offers exactly these four
-    // (conflict C9), so a site seeded with anything else would have gates
-    // pointing at tiers that do not exist.
-    await tx.tier.createMany({
-      data: [
-        { siteId: site.id, key: "free_member", name: "Free", rank: 0 },
-        { siteId: site.id, key: "tier_1", name: "Silver", rank: 1 },
-        { siteId: site.id, key: "tier_2", name: "Gold", rank: 2 },
-        { siteId: site.id, key: "vip", name: "VIP", rank: 3 },
-      ],
+    // Free only. Every member starts on it and it is the tier a member falls
+    // back to, so a site cannot be without it. Any paid tier is one the creator
+    // creates in the Manage tab: seeding Silver, Gold, and VIP filled every new
+    // site with tiers the creator never made. The plugin's gate and paywall
+    // controls are written from the site's real tiers (conflict C9), so a gate
+    // never points at a tier that does not exist.
+    await tx.tier.create({
+      data: { siteId: site.id, key: NEW_FREE_TIER_KEY, name: "Free", rank: FREE_TIER_RANK },
     });
 
     await tx.siteSettings.create({

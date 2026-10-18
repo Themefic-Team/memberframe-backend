@@ -283,7 +283,11 @@ describe("currencies, FP-16 section 6.2", () => {
     expect(preferredCurrency("IN")).toBe("INR");
     expect(preferredCurrency("DE")).toBe("EUR");
     expect(preferredCurrency("GB")).toBe("GBP");
-    expect(preferredCurrency("BD")).toBeNull();
+    expect(preferredCurrency("BD")).toBe("BDT");
+    expect(preferredCurrency("JP")).toBe("JPY");
+    expect(preferredCurrency("BG")).toBe("EUR");
+    expect(preferredCurrency("ZZ")).toBeNull();
+    expect(preferredCurrency(null)).toBeNull();
   });
 
   it("shows a buyer their currency only when the creator priced the tier in it", () => {

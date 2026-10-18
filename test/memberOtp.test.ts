@@ -20,6 +20,8 @@ vi.mock("../src/config/db.js", () => ({
       create: vi.fn(),
       update: vi.fn(),
     },
+    // The site's Free tier, the tier at rank 0, where a new member starts.
+    tier: { findFirst: vi.fn(async () => ({ key: "free_member" })) },
   },
 }));
 

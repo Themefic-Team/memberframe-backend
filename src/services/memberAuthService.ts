@@ -25,6 +25,7 @@
  */
 
 import { prisma } from "../config/db.js";
+import { freeTierKey } from "../lib/tiers.js";
 import { env } from "../config/env.js";
 import {
   hashPassword,
@@ -42,6 +43,8 @@ import {
   sendMail,
   verifyEmailMail,
 } from "../lib/mailer.js";
+import { passwordResetUrl } from "../lib/siteLinks.js";
+import { emitMemberEvent } from "./webhookService.js";
 import { revokeAllSessionsForMember } from "./sessionService.js";
 import { loadSiteSettings } from "./settingsService.js";
 
@@ -120,7 +123,7 @@ export async function registerMember(input: {
         passwordUpdatedAt: new Date(),
         // Set by `verifyMemberEmail`. Sign in waits on it.
         emailVerifiedAt: null,
-        activeTier: "free_member",
+        activeTier: await freeTierKey(input.siteId),
         status: "active",
       },
       select: SAFE_MEMBER_FIELDS,
@@ -312,6 +315,8 @@ export async function requestPasswordReset(input: {
   siteId: string;
   siteName: string;
   email: string;
+  /** Where the emailed link opens: the published site and its reset page. */
+  resetLink?: { origin: string | null; resetPath: string };
 }): Promise<void> {
   const email = normalizeEmail(input.email);
 
@@ -343,7 +348,8 @@ export async function requestPasswordReset(input: {
     },
   });
 
-  await sendMail(passwordResetMail(member.email, token, input.siteName, input.siteId));
+  const url = passwordResetUrl(token, input.resetLink ?? { origin: null, resetPath: "/reset-password" });
+  await sendMail(passwordResetMail(member.email, url, input.siteName, input.siteId));
 }
 
 // ============================================================================
@@ -367,6 +373,8 @@ export interface ResetResult {
  */
 export async function resetPassword(input: {
   siteId: string;
+  /** For the "password changed" email. Optional so a caller without it still works. */
+  siteName?: string;
   token: string;
   newPassword: string;
 }): Promise<ResetResult> {
@@ -422,7 +430,7 @@ export async function resetPassword(input: {
 
   // Sent after the change, to the address that was changed. If this reset was
   // not the owner's doing, this message is the only signal they get.
-  await sendMail(passwordChangedMail(email, "your account", input.siteId));
+  await sendMail(passwordChangedMail(email, input.siteName ?? "", input.siteId));
 
   return {
     memberId: record.member.id,
@@ -575,12 +583,14 @@ export async function verifyMemberOtp(input: VerifyMemberOtpInput): Promise<Auth
         siteId: input.siteId,
         email,
         emailVerifiedAt: now,
-        activeTier: "free_member",
+        activeTier: await freeTierKey(input.siteId),
         status: "active",
         lastLoginAt: now,
       },
       select: SAFE_MEMBER_FIELDS,
     });
+    // An email code proves the address, so a new account is confirmed at once.
+    void emitMemberEvent("member.created", { id: member.id, siteId: input.siteId });
   } else {
     member = await prisma.member.update({
       where: { id: existing.id },
@@ -626,6 +636,10 @@ export async function verifyMemberEmail(input: VerifyMemberOtpInput): Promise<vo
     where: { id: member.id },
     data: { emailVerifiedAt: now },
   });
+
+  // The account is real now, so this is when a CRM hears about it. An
+  // unconfirmed sign up never reaches a webhook.
+  void emitMemberEvent("member.created", { id: member.id, siteId: input.siteId });
 }
 
 /**

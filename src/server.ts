@@ -11,9 +11,21 @@ import { env } from "./config/env.js";
 import { checkDatabase, disconnectDatabase } from "./config/db.js";
 import { sweepExpired } from "./services/payments/apply.js";
 import { migratePlaintextIntegrationSecrets } from "./services/integrationSecrets.js";
+import { deliverDue } from "./services/webhookService.js";
 
 async function main(): Promise<void> {
-  const status = await checkDatabase();
+  let status = await checkDatabase();
+
+  if (!status.connected && !env.isProduction) {
+    const maxRetries = 4;
+    for (let attempt = 1; attempt <= maxRetries && !status.connected; attempt++) {
+      process.stdout.write(
+        `[db] MySQL is not reachable yet, retrying in 2s... (attempt ${attempt}/${maxRetries})\n`
+      );
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      status = await checkDatabase();
+    }
+  }
 
   if (!status.connected) {
     process.stderr.write(
@@ -94,6 +106,12 @@ async function main(): Promise<void> {
     );
   }, Math.max(30, env.payments.sweepSeconds) * 1000);
   sweep.unref();
+
+  // Webhooks: deliver queued member events, and retry the ones that failed.
+  // An event also starts a run at once; this catches retries and restarts.
+  const webhookWorker = setInterval(() => void deliverDue(), 15_000);
+  webhookWorker.unref();
+  void deliverDue();
 
   // Shut down in order: stop accepting connections, finish what is in flight,
   // then release the MySQL pool. Exiting without the last leaves connections

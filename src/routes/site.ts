@@ -18,6 +18,8 @@ import { z } from "zod";
 import { prisma } from "../config/db.js";
 import { badRequest, ok, route } from "../middleware/errors.js";
 import { creatorAuth, requireCreator } from "../middleware/creator.js";
+import { webhookRouter } from "./siteWebhooks.js";
+import { MEMBER_SNAPSHOT_SELECT, emitMemberEvent } from "../services/webhookService.js";
 import {
   mergeOrigins,
   normalizeOrigins,
@@ -25,6 +27,9 @@ import {
 } from "../services/creatorAuthService.js";
 import { invalidateSiteSettings, loadSiteSettings } from "../services/settingsService.js";
 import { applyMetadata } from "../lib/memberMetadata.js";
+import { currencySchema } from "../lib/currencies.js";
+import { FREE_TIER_RANK, tierPriceProblem, type TierPriceInput } from "../lib/tiers.js";
+import { loadPaymentSettings } from "../services/payments/gatewayStore.js";
 import { storePatchSecrets, takePatchSecrets, withoutSecrets } from "../services/integrationSecrets.js";
 import {
   mergeSettings,
@@ -36,6 +41,9 @@ import {
 export const siteRouter = Router();
 
 siteRouter.use(creatorAuth);
+
+// Webhooks: member events posted to the creator's own URLs.
+siteRouter.use("/webhooks", webhookRouter);
 
 /** PRD section 10.3 paginates members at 25. The plugin's `MEMBER_PAGE_SIZE`. */
 const PAGE_SIZE = 25;
@@ -131,7 +139,7 @@ siteRouter.get(
     // FP-16. Lifetime spend from paid charges, and the gateway of each
     // member's latest purchase. Two grouped reads for the page, not one per row.
     const memberIds = rows.map((row) => row.id);
-    const [spend, latest] = await Promise.all([
+    const [spend, latest, payments] = await Promise.all([
       prisma.payment.groupBy({
         by: ["memberId", "currency"],
         where: { siteId: site.id, memberId: { in: memberIds }, status: "paid" },
@@ -142,11 +150,14 @@ siteRouter.get(
         orderBy: { createdAt: "desc" },
         select: { memberId: true, gateway: true },
       }),
+      loadPaymentSettings(site.id),
     ]);
+    // A member who has paid nothing shows 0 in the site currency, not USD:
+    // one currency per site (23-dynamic-tiers.md).
     const spendOf = (memberId: string) => {
       const rowsFor = spend.filter((entry) => entry.memberId === memberId);
       const top = rowsFor.sort((a, b) => (b._sum.amountMinor ?? 0) - (a._sum.amountMinor ?? 0))[0];
-      return { amount: top?._sum.amountMinor ?? 0, currency: top?.currency ?? "USD" };
+      return { amount: top?._sum.amountMinor ?? 0, currency: top?.currency ?? payments.defaultCurrency };
     };
     const gatewayOf = (memberId: string) =>
       latest.find((entry) => entry.memberId === memberId)?.gateway ?? "stripe";
@@ -204,7 +215,7 @@ siteRouter.patch(
     // found.
     const member = await prisma.member.findFirst({
       where: { id: memberId, siteId: site.id, deletedAt: null },
-      select: { id: true },
+      select: { id: true, activeTier: true, status: true },
     });
 
     if (!member) throw badRequest("member_not_found");
@@ -238,6 +249,12 @@ siteRouter.patch(
       },
     });
 
+    if (input.tier !== undefined && input.tier !== member.activeTier) {
+      void emitMemberEvent("member.tier_changed", { id: member.id, siteId: site.id }, { previousTier: member.activeTier });
+    } else if (input.status !== undefined && input.status !== member.status) {
+      void emitMemberEvent("member.updated", { id: member.id, siteId: site.id });
+    }
+
     // Returned so the panel can replace its row wholesale after a tier change
     // without the flyout losing the member's profile values.
     const settings = await loadSiteSettings(site.id);
@@ -252,11 +269,56 @@ siteRouter.patch(
         status: updated.status,
         createdAt: updated.createdAt.toISOString(),
         lifetimeSpend: 0,
-        currency: "USD",
+        currency: (await loadPaymentSettings(site.id)).defaultCurrency,
         gateway: "stripe",
         metadata: applyMetadata(settings.customFields, updated.metadata, {}).metadata,
       },
     });
+  })
+);
+
+// ============================================================================
+// DELETE /api/site/members/:id
+// ============================================================================
+// Removes a member for good, at the creator's request, from the Manage tab.
+//
+// A hard delete, not `deletedAt`: the creator asked for the member to be gone,
+// and a soft-deleted row still holds the address, so the person could never
+// sign up to this site again. Sessions, password resets, subscriptions,
+// bookmarks, and meter cycles go with the row by cascade; pending sign-in
+// codes are keyed by address, not member, so they are cleared explicitly.
+// Payments and checkouts carry no foreign key to the member and are kept on
+// purpose: they are the creator's revenue record, not the member's account.
+//
+// Nothing here cancels a subscription at the payment provider. The plugin's
+// confirmation says so in as many words.
+
+siteRouter.delete(
+  "/members/:id",
+  route(async (req, res) => {
+    const creator = requireCreator(req);
+    const site = await requireOwnedSite(creator.userId, siteIdFrom(req.query["siteId"]));
+
+    const memberId = String(req.params["id"] ?? "");
+
+    // Scoped by site id in the same query, for the reason the PATCH above gives.
+    const member = await prisma.member.findFirst({
+      where: { id: memberId, siteId: site.id },
+      select: MEMBER_SNAPSHOT_SELECT,
+    });
+
+    if (!member) throw badRequest("member_not_found");
+
+    // Queued from the member as it is now: after the delete there is nothing
+    // left to describe.
+    await emitMemberEvent("member.deleted", member);
+
+    await prisma.$transaction([
+      prisma.memberOtp.deleteMany({ where: { siteId: site.id, email: member.email } }),
+      prisma.member.delete({ where: { id: member.id } }),
+    ]);
+
+    ok(res, { deleted: true, id: member.id });
   })
 );
 
@@ -270,11 +332,7 @@ siteRouter.get(
     const creator = requireCreator(req);
     const site = await requireOwnedSite(creator.userId, siteIdFrom(req.query["siteId"]));
 
-    const tiers = await prisma.tier.findMany({
-      where: { siteId: site.id },
-      orderBy: { rank: "asc" },
-      include: { extraPrices: { select: { currency: true, interval: true, amountMinor: true } } },
-    });
+    const tiers = await prisma.tier.findMany({ where: { siteId: site.id }, orderBy: { rank: "asc" } });
 
     ok(res, {
       tiers: tiers.map((tier) => ({
@@ -288,62 +346,39 @@ siteRouter.get(
         currency: tier.currency,
         rank: tier.rank,
         isActive: tier.isActive,
-        extraPrices: tier.extraPrices,
       })),
     });
   })
 );
 
 /**
- * A tier key: the four built in ones, or a custom key the plugin derives from
- * the tier's name. Lowercase, digits, underscore, so it is safe in generated
- * code, a URL, and a JSON key alike. Conflict C9, resolved.
+ * A tier key: the ID the plugin makes from the tier's name when it is created
+ * ("Gold Plus" becomes `gold_plus`), or a key an older tier already has.
+ * Lowercase, digits, underscore, so it is safe in generated code, a URL, and a
+ * JSON key alike. Development doc: 23-dynamic-tiers.md.
  */
 const TIER_KEY_PATTERN = /^[a-z][a-z0-9_]{1,49}$/;
 
-/** FP-16. Prices in currencies other than the tier's own. Replaced wholesale on save. */
-const extraPricesSchema = z
-  .array(
-    z.object({
-      currency: z.enum(["USD", "EUR", "GBP", "INR"]),
-      interval: z.enum(["month", "year", "lifetime"]),
-      amountMinor: z.number().int().min(1).max(100_000_000),
-    })
-  )
-  .max(12)
-  .optional();
+/** A price is above zero or absent. Zero is not a price: it read "$0.00 monthly" and sold nothing. */
+const priceSchema = z.number().int().min(1).max(1_000_000_000).nullable().optional().default(null);
 
 const tierBodySchema = z.object({
   siteId: siteIdSchema,
   key: z.string().trim().regex(TIER_KEY_PATTERN, "tier_key_invalid"),
   name: z.string().trim().min(1).max(100),
-  monthlyPriceMinor: z.number().int().min(0).nullable().optional().default(null),
-  annualPriceMinor: z.number().int().min(0).nullable().optional().default(null),
-  lifetimePriceMinor: z.number().int().min(0).nullable().optional().default(null),
-  currency: z.enum(["USD", "EUR", "GBP", "INR"]).default("USD"),
-  rank: z.number().int().min(0).max(1000),
+  monthlyPriceMinor: priceSchema,
+  annualPriceMinor: priceSchema,
+  lifetimePriceMinor: priceSchema,
+  // Accepted and ignored: every tier is priced in the site currency.
+  currency: z.string().optional(),
+  rank: z.number().int().min(FREE_TIER_RANK).max(1000),
   isActive: z.boolean().default(true),
-  extraPrices: extraPricesSchema,
 });
 
-/**
- * Replace a tier's extra prices. A price in the tier's own currency is
- * dropped: that one lives in the tier's columns, and two places for one
- * price is how they come to disagree.
- */
-async function replaceExtraPrices(
-  tierId: string,
-  currency: string,
-  prices: z.infer<typeof extraPricesSchema>
-): Promise<void> {
-  if (prices === undefined) return;
-  const kept = prices.filter((price) => price.currency !== currency);
-  await prisma.$transaction([
-    prisma.tierPrice.deleteMany({ where: { tierId } }),
-    ...(kept.length > 0
-      ? [prisma.tierPrice.createMany({ data: kept.map((price) => ({ tierId, ...price })), skipDuplicates: true })]
-      : []),
-  ]);
+/** The Free and paid tier price rules, in lib/tiers.ts. A problem is a 400 with its reason. */
+function checkTierPrices(rank: number, prices: TierPriceInput): void {
+  const problem = tierPriceProblem(rank, prices);
+  if (problem) throw badRequest(problem);
 }
 
 siteRouter.post(
@@ -352,20 +387,24 @@ siteRouter.post(
     const creator = requireCreator(req);
     const input = tierBodySchema.parse(req.body);
     const site = await requireOwnedSite(creator.userId, input.siteId);
+    checkTierPrices(input.rank, input);
 
     // The unique keys on (site, key) and (site, rank) are the real enforcement;
     // this check exists so the creator gets a readable answer rather than a
     // driver error. Two tiers sharing a rank makes Gold and Silver identical to
-    // every gate on the site, with nothing raised anywhere.
+    // every gate on the site, with nothing raised anywhere. Rank 0 taken means
+    // the site already has its one Free tier.
     const clash = await prisma.tier.findFirst({
       where: { siteId: site.id, OR: [{ key: input.key }, { rank: input.rank }] },
       select: { key: true, rank: true },
     });
 
     if (clash) {
-      throw badRequest(clash.key === input.key ? "tier_key_taken" : "tier_rank_taken");
+      if (clash.key === input.key) throw badRequest("tier_key_taken");
+      throw badRequest(input.rank === FREE_TIER_RANK ? "free_tier_exists" : "tier_rank_taken");
     }
 
+    const { defaultCurrency } = await loadPaymentSettings(site.id);
     const tier = await prisma.tier.create({
       data: {
         siteId: site.id,
@@ -374,12 +413,11 @@ siteRouter.post(
         monthlyPriceMinor: input.monthlyPriceMinor,
         annualPriceMinor: input.annualPriceMinor,
         lifetimePriceMinor: input.lifetimePriceMinor,
-        currency: input.currency,
+        currency: defaultCurrency,
         rank: input.rank,
         isActive: input.isActive,
       },
     });
-    await replaceExtraPrices(tier.id, tier.currency, input.extraPrices);
 
     ok(res, { tier });
   })
@@ -399,10 +437,18 @@ siteRouter.patch(
 
     const existing = await prisma.tier.findFirst({
       where: { id: tierId, siteId: site.id },
-      select: { id: true },
+      select: { id: true, rank: true },
     });
 
     if (!existing) throw badRequest("tier_not_found");
+
+    // The Free tier stays the Free tier, and a paid tier stays paid: members
+    // start on and fall back to rank 0, so moving a tier onto or off it would
+    // silently change where every new member lands.
+    if ((existing.rank === FREE_TIER_RANK) !== (input.rank === FREE_TIER_RANK)) {
+      throw badRequest("free_tier_is_fixed");
+    }
+    checkTierPrices(input.rank, input);
 
     const rankClash = await prisma.tier.findFirst({
       where: { siteId: site.id, rank: input.rank, NOT: { id: existing.id } },
@@ -411,21 +457,57 @@ siteRouter.patch(
 
     if (rankClash) throw badRequest("tier_rank_taken");
 
-    const tier = await prisma.tier.update({
-      where: { id: existing.id },
-      data: {
-        name: input.name,
-        monthlyPriceMinor: input.monthlyPriceMinor,
-        annualPriceMinor: input.annualPriceMinor,
-        lifetimePriceMinor: input.lifetimePriceMinor,
-        currency: input.currency,
-        rank: input.rank,
-        isActive: input.isActive,
-      },
-    });
-    await replaceExtraPrices(tier.id, tier.currency, input.extraPrices);
+    const { defaultCurrency } = await loadPaymentSettings(site.id);
+    const [tier] = await prisma.$transaction([
+      prisma.tier.update({
+        where: { id: existing.id },
+        data: {
+          name: input.name,
+          monthlyPriceMinor: input.monthlyPriceMinor,
+          annualPriceMinor: input.annualPriceMinor,
+          lifetimePriceMinor: input.lifetimePriceMinor,
+          currency: defaultCurrency,
+          rank: input.rank,
+          isActive: input.isActive,
+        },
+      }),
+      // Prices in other currencies are gone (one site currency); drop any left.
+      prisma.tierPrice.deleteMany({ where: { tierId: existing.id } }),
+    ]);
 
     ok(res, { tier });
+  })
+);
+
+/**
+ * Delete a paid tier. The Free tier cannot go: every member starts on it.
+ *
+ * Refused while any member holds the tier, with how many, because deleting it
+ * would leave them on a tier the site no longer has, still paying for it. The
+ * creator moves them, or hides the tier instead (Visible to members off). Its
+ * prices in other currencies go with it (cascade), and so do the gateway price
+ * ids cached for it, which name it by key.
+ */
+siteRouter.delete(
+  "/tiers/:id",
+  route(async (req, res) => {
+    const creator = requireCreator(req);
+    const site = await requireOwnedSite(creator.userId, siteIdFrom(req.query["siteId"]));
+    const tierId = String(req.params["id"] ?? "");
+
+    const tier = await prisma.tier.findFirst({ where: { id: tierId, siteId: site.id }, select: { id: true, key: true, rank: true } });
+    if (!tier) throw badRequest("tier_not_found");
+    if (tier.rank === FREE_TIER_RANK) throw badRequest("free_tier_is_fixed");
+
+    const holders = await prisma.member.count({ where: { siteId: site.id, activeTier: tier.key } });
+    if (holders > 0) throw badRequest("tier_in_use", { members: holders });
+
+    await prisma.$transaction([
+      prisma.gatewayPrice.deleteMany({ where: { siteId: site.id, tierKey: tier.key } }),
+      prisma.tier.delete({ where: { id: tier.id } }),
+    ]);
+
+    ok(res, { deleted: true, id: tier.id });
   })
 );
 
@@ -582,7 +664,7 @@ siteRouter.get(
 
 const siteConfigSchema = z.object({
   siteId: siteIdSchema,
-  defaultCurrency: z.enum(["USD", "EUR", "GBP", "INR"]).optional().default("USD"),
+  defaultCurrency: currencySchema.optional().default("USD"),
   autoDetectGeolocation: z.boolean().optional().default(true),
   stripePublishableKey: z.string().trim().optional(),
   stripeSecretKey: z.string().trim().optional(),

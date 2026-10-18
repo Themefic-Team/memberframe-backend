@@ -37,7 +37,7 @@ import { prisma } from "../config/db.js";
 import { env } from "../config/env.js";
 import { loadSiteSettings } from "../services/settingsService.js";
 import { loadTierLadder } from "../services/sessionService.js";
-import { isSafeSitePath, type GatedPageRule } from "../lib/siteSettings.js";
+import { isSafeSitePath, sectionLockSlug, type GatedPageRule, type SectionLockRule } from "../lib/siteSettings.js";
 import type { TierLadderEntry } from "../lib/entitlement.js";
 
 export interface ShieldScriptConfig {
@@ -50,6 +50,8 @@ export interface ShieldScriptConfig {
   guestPaths?: string[];
   rules: GatedPageRule[];
   tiers: TierLadderEntry[];
+  /** Section locks: layers named "Lock: <rule name>". */
+  sectionRules?: SectionLockRule[];
 }
 
 /**
@@ -74,6 +76,14 @@ export function shieldGuestPaths(paths: ReadonlyArray<string | undefined>): stri
  */
 export function generateShieldJs(config: ShieldScriptConfig): string {
   const activeRules = (config.rules || []).filter((r) => r.enabled);
+  const sectionRules = (config.sectionRules || []).map((r) => ({
+    name: r.name,
+    slug: sectionLockSlug(r.name),
+    enabled: r.enabled,
+    audience: r.audience,
+    requiredTier: r.requiredTier,
+    lockedAction: r.lockedAction,
+  }));
 
   return `/**
  * MemberFrame Global Route Shield
@@ -91,6 +101,7 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
   var GUEST_PATHS = ${JSON.stringify(config.guestPaths || [])};
   var RULES = ${JSON.stringify(activeRules)};
   var TIERS = ${JSON.stringify(config.tiers || [])};
+  var SECTION_RULES = ${JSON.stringify(sectionRules)};
 
   // Shared with the MemberFrame components. Change them together.
   var CACHE_KEY = "__mf_session_" + SITE_KEY;
@@ -102,17 +113,38 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
   var LOCKED_TIMEOUT_MS = 10000;
   var GUEST_TIMEOUT_MS = 4000;
   var CLICK_GRACE_MS = 1500;
+  var REDIRECT_SETTLE_MS = 400;
 
   function norm(path) {
     return (path || "/").replace(/\\/+$/, "") || "/";
+  }
+
+  /*
+    A rule path covers itself and every page under it. A ":name" segment is a
+    Framer CMS page's item slot and matches any one segment, so "/blog/:slug"
+    locks every post and leaves "/blog" itself open. Compared literally it
+    would match nothing, since no real URL contains ":slug".
+  */
+  function pathMatches(path, rulePath) {
+    if (rulePath === "/") return path === "/";
+    var want = rulePath.split("/");
+    var have = path.split("/");
+    if (have.length < want.length) return false;
+    for (var i = 0; i < want.length; i++) {
+      if (want[i].charAt(0) === ":") {
+        if (!have[i]) return false;
+      } else if (want[i] !== have[i]) {
+        return false;
+      }
+    }
+    return true;
   }
 
   function ruleFor(path) {
     for (var i = 0; i < RULES.length; i++) {
       var r = RULES[i];
       if (!r || !r.enabled) continue;
-      var rulePath = norm((r.path || "").trim());
-      if (path === rulePath || (rulePath !== "/" && path.indexOf(rulePath + "/") === 0)) return r;
+      if (pathMatches(path, norm((r.path || "").trim()))) return r;
     }
     return null;
   }
@@ -172,6 +204,8 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
   /* ---- The veil ---- */
 
   var veil = null;
+  /** Set once the shield sends the visitor away. Nothing shows the page after that. */
+  var redirecting = false;
 
   function hide() {
     if (veil) return;
@@ -182,6 +216,7 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
   }
 
   function show() {
+    if (redirecting) return;
     if (veil && veil.parentNode) veil.parentNode.removeChild(veil);
     veil = null;
   }
@@ -256,8 +291,55 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
 
   /* ---- Outcomes ---- */
 
-  function deny(rule, path, member) {
+  /**
+   * Leave this page for dest with a real page load, the page hidden throughout.
+   *
+   * location.replace alone is not enough on a Framer site. Fired while
+   * Framer's router is still moving to the locked page, the browser hands it to
+   * the router as an in-page navigation: the address bar says dest and the
+   * locked page stays rendered. Reproduced in Chrome against a published site.
+   * So the veil stays up for good, and if this document is still here once the
+   * URL reads dest, it is reloaded, which the router does not take over.
+   */
+  function hardRedirect(dest) {
+    redirecting = true;
+    hide();
+    window.location.replace(dest);
+    setTimeout(function() {
+      if (norm(window.location.pathname) === norm(dest)) window.location.reload();
+    }, REDIRECT_SETTLE_MS);
+  }
+
+  /**
+   * Where a turned-away visitor goes.
+   *
+   * Signed out: the rule's Redirect to, usually the sign in page.
+   *
+   * Signed in without the plan: never a sign in page. Sending them there only
+   * for the sign in page to send them on to the dashboard is two redirects and
+   * a flash of a form they cannot use. They go to the After sign in page, or
+   * the home page if that is locked to them too. A rule that redirects to any
+   * other page, a pricing page say, is followed as written: that is where the
+   * creator wants a member without the plan to land.
+   */
+  function denyDestination(rule, path, member, ladder) {
     var dest = norm(rule.redirectPath || LOGIN_PATH || "/");
+    if (!member) return dest;
+    if (!isGuestPath(dest) && dest !== norm(LOGIN_PATH)) return dest;
+
+    var candidates = [AFTER_LOGIN_PATH || "/", "/"];
+    for (var i = 0; i < candidates.length; i++) {
+      var candidate = norm(candidates[i]);
+      if (candidate === path || isGuestPath(candidate)) continue;
+      var candidateRule = ruleFor(candidate);
+      if (candidateRule && !checkEntitled(member, candidateRule.requiredTier, ladder || TIERS)) continue;
+      return candidate;
+    }
+    return dest;
+  }
+
+  function deny(rule, path, member, ladder) {
+    var dest = denyDestination(rule, path, member, ladder);
     if (dest === path) {
       // A rule that redirects to itself is a misconfiguration, and hiding the
       // page forever would be worse than showing it.
@@ -265,7 +347,7 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
       return;
     }
     if (member) markDenied(path);
-    window.location.replace(dest);
+    hardRedirect(dest);
   }
 
   /**
@@ -278,7 +360,7 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
     var destRule = ruleFor(dest);
     if (destRule && !checkEntitled(member, destRule.requiredTier, ladder)) return false;
     if (recentlyDenied(dest)) return false;
-    window.location.replace(dest);
+    hardRedirect(dest);
     return true;
   }
 
@@ -298,12 +380,103 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
     return isGuestPath(path) && (hasHint() || readCache() !== null);
   }
 
+  /* ---- Section locks ----
+   *
+   * A layer opts in through the code override the plugin writes into the
+   * creator's project, MemberLocks, one per rule: it adds data-mf-lock and a
+   * mf-lock-<slug> class to the layer. A layer named "Lock: <rule name>" opts
+   * in the same way, through the data-framer-name Framer publishes. Every
+   * tagged layer is hidden from the first paint by a stylesheet this script
+   * writes before the body is parsed.
+   * Once the session is known each rule shows, blurs, or keeps hiding its
+   * layers. A style rule, not a DOM change, so it holds across Framer's page
+   * changes and re-renders with nothing to re-apply.
+   *
+   * Rule names are limited to letters, digits, spaces, and - _ . by the
+   * settings validator, so they sit in a quoted selector with no escaping.
+   * A tagged layer whose rule does not exist stays hidden: fail closed. A
+   * rule that is switched off is a lock that is off: its layers show.
+   */
+
+  var SECTION_TAGS = ['[data-framer-name^="Lock:" i]', "[data-mf-lock]", '[class*="mf-lock-"]'];
+  var sectionStyle = null;
+
+  function sectionSelector(rule) {
+    return (
+      '[data-framer-name="Lock: ' + rule.name + '" i],[data-framer-name="Lock:' + rule.name + '" i],' +
+      '[data-mf-lock="' + rule.name + '" i],.mf-lock-' + rule.slug
+    );
+  }
+
+  /** result: null while checking, "unavailable" when the API failed, else { member, ladder }. */
+  function sectionCss(result) {
+    var shown = [];
+    var blurred = [];
+    for (var i = 0; i < SECTION_RULES.length; i++) {
+      var r = SECTION_RULES[i];
+      var visible;
+      if (!r.enabled) visible = true;
+      else if (result === null) visible = false;
+      else if (result === "unavailable") visible = r.audience === "others";
+      else {
+        var entitled = checkEntitled(result.member, r.requiredTier, result.ladder || TIERS);
+        visible = r.audience === "members" ? entitled : !entitled;
+      }
+      if (visible) shown.push(sectionSelector(r));
+      else if (result !== null && r.lockedAction === "blur") blurred.push(sectionSelector(r));
+    }
+
+    var exempt = shown.concat(blurred);
+    var not = exempt.length ? ":not(" + exempt.join(",") + ")" : "";
+    var hide = [];
+    for (var t = 0; t < SECTION_TAGS.length; t++) hide.push(SECTION_TAGS[t] + not);
+    var css = hide.join(",") + "{display:none !important}";
+    if (blurred.length) {
+      css += blurred.join(",") + "{filter:blur(10px) !important;pointer-events:none !important;user-select:none !important}";
+    }
+    return css;
+  }
+
+  function applySections(result) {
+    if (!sectionStyle) {
+      sectionStyle = document.createElement("style");
+      sectionStyle.id = "memberframe-section-locks";
+      (document.head || document.documentElement).appendChild(sectionStyle);
+    }
+    sectionStyle.textContent = sectionCss(result);
+  }
+
+  function resolveSections() {
+    var anyEnabled = false;
+    for (var i = 0; i < SECTION_RULES.length; i++) if (SECTION_RULES[i].enabled) anyEnabled = true;
+    if (!anyEnabled) {
+      // No session needed: show what the switched-off rules cover, hide the rest.
+      if (SECTION_RULES.length) applySections("unavailable");
+      return;
+    }
+    var cached = readCache();
+    if (cached) {
+      applySections(cached);
+      return;
+    }
+    fetchSession().then(function(result) {
+      applySections(result);
+    }, function() {
+      applySections("unavailable");
+    });
+  }
+
+  // Before anything else, so no tagged layer is ever painted unchecked.
+  applySections(null);
+  resolveSections();
+
   /* ---- The guard ---- */
 
   var seq = 0;
   var guardedPath = null;
 
   function guard(rawPath) {
+    if (redirecting) return;
     var path = norm(rawPath);
     if (path === guardedPath && veil) return;
     guardedPath = path;
@@ -315,7 +488,7 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
       var cached = readCache();
       if (cached) {
         if (checkEntitled(cached.member, rule.requiredTier, cached.ladder)) show();
-        else deny(rule, path, cached.member);
+        else deny(rule, path, cached.member, cached.ladder);
         return;
       }
 
@@ -328,7 +501,7 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
         clearTimeout(lockedTimer);
         if (id !== seq) return;
         if (checkEntitled(result.member, rule.requiredTier, result.ladder)) show();
-        else deny(rule, path, result.member);
+        else deny(rule, path, result.member, result.ladder);
       }, function() {
         clearTimeout(lockedTimer);
         if (id === seq) deny(rule, path, null);
@@ -366,42 +539,67 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
     show();
   }
 
+  var lastPath = norm(window.location.pathname);
+
   function recheck() {
+    lastPath = norm(window.location.pathname);
     guardedPath = null;
     guard(window.location.pathname);
   }
 
+  /** Re-guard only when the path actually moved. Every hook below funnels here. */
+  function onPathMaybeChanged() {
+    if (norm(window.location.pathname) !== lastPath) recheck();
+  }
+
   guard(window.location.pathname);
 
-  /* ---- In-site navigation ---- */
+  /* ---- In-site navigation ----
+   *
+   * Four hooks, because a published Framer site defeated the first two
+   * versions of this on its own:
+   *
+   *   - Framer installs its own history.pushState that calls the BUILT-IN
+   *     method, not whatever was on history.pushState before it. A wrapper on
+   *     the history object is skipped; one on History.prototype is not.
+   *   - Listeners on document set from the head did not survive Framer's
+   *     startup, while listeners on window did. So the click hook is on window.
+   *   - The Navigation API sees every same-document navigation in browsers
+   *     that have it, however the router started it.
+   *   - A path check every 250ms is the backstop for any router this does not
+   *     know about. A string compare, so it costs nothing.
+   */
 
   function wrapHistory(name) {
-    var original = window.history && window.history[name];
-    if (typeof original !== "function") return;
-    window.history[name] = function() {
-      var before = window.location.pathname;
-      var result = original.apply(this, arguments);
-      if (window.location.pathname !== before) recheck();
-      return result;
-    };
+    var proto = window.History && window.History.prototype;
+    var targets = [];
+    if (proto && typeof proto[name] === "function") targets.push(proto);
+    // An own property shadows the prototype, so wrap it too when there is one.
+    if (window.history && (!proto || Object.prototype.hasOwnProperty.call(window.history, name))) {
+      targets.push(window.history);
+    }
+
+    for (var i = 0; i < targets.length; i++) {
+      (function(target) {
+        var original = target[name];
+        if (typeof original !== "function") return;
+        target[name] = function() {
+          var result = original.apply(this, arguments);
+          onPathMaybeChanged();
+          return result;
+        };
+      })(targets[i]);
+    }
   }
 
   wrapHistory("pushState");
   wrapHistory("replaceState");
-  window.addEventListener("popstate", recheck);
+  window.addEventListener("popstate", onPathMaybeChanged);
 
-  // Capture phase, so this runs before Framer's router renders the next page.
-  document.addEventListener("click", function(event) {
-    if (event.defaultPrevented || event.button !== 0) return;
-    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-
-    var el = event.target;
-    while (el && el.nodeName !== "A") el = el.parentNode;
-    if (!el || !el.href || el.hasAttribute("download")) return;
-    if (el.target && el.target !== "_self") return;
-
+  /** Hide before the router renders a guarded page, then settle once the URL moves. */
+  function beforeNavigate(href) {
     var url;
-    try { url = new URL(el.href, window.location.href); } catch (e) { return; }
+    try { url = new URL(href, window.location.href); } catch (e) { return; }
     if (url.origin !== window.location.origin) return;
 
     var path = norm(url.pathname);
@@ -409,17 +607,45 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
 
     hide();
     var clickSeq = seq;
-    // The router normally changes the URL at once and the history hook takes
-    // over. If it never does, settle on the page that is actually showing.
+    // The router normally changes the URL at once and a hook takes over. If it
+    // never does, settle on the page that is actually showing.
     setTimeout(function() {
       if (seq === clickSeq) recheck();
     }, CLICK_GRACE_MS);
+  }
+
+  // Window, capture phase: runs before anything on document, Framer's router
+  // included, and is not lost when the page boots.
+  window.addEventListener("click", function(event) {
+    if (event.defaultPrevented || event.button !== 0) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+
+    var el = event.target;
+    while (el && String(el.nodeName).toUpperCase() !== "A") el = el.parentNode;
+    if (!el || !el.href || el.hasAttribute("download")) return;
+    if (el.target && el.target !== "_self") return;
+
+    beforeNavigate(typeof el.href === "string" ? el.href : String(el.href.baseVal || ""));
   }, true);
+
+  if (window.navigation && typeof window.navigation.addEventListener === "function") {
+    window.navigation.addEventListener("navigate", function(event) {
+      if (event && event.destination && event.destination.url) beforeNavigate(event.destination.url);
+    });
+    window.navigation.addEventListener("navigatesuccess", onPathMaybeChanged);
+  }
+
+  (function poll() {
+    onPathMaybeChanged();
+    setTimeout(poll, 250);
+  })();
 
   // The MemberFrame components announce sign in and sign out on this page.
   window.addEventListener("memberframe:session-updated", function(event) {
     clearCache();
     setHint(!!(event && event.detail && event.detail.signedIn));
+    // Sign in or out on this page: re-check, keeping layers as they are until the answer.
+    resolveSections();
   });
 })();
 `;
@@ -491,6 +717,7 @@ export async function handleShieldScript(req: Request, res: Response): Promise<v
     guestPaths: shieldGuestPaths([settings.auth?.loginPath, settings.auth?.signupPath]),
     rules,
     tiers,
+    sectionRules: settings.sectionLocks || [],
   });
 
   res.send(js);

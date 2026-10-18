@@ -221,8 +221,8 @@ export interface GatewayAdapter {
    * switch through a new checkout plus a refund for the unused time instead.
    */
   changePlan?(credentials: GatewayCredentials, externalId: string, price: KnownPrice, upgrade: boolean): Promise<{ currentPeriodEnd: Date | null }>;
-  /** Refund part of one payment. Used to credit unused time on a switch. */
-  refund?(credentials: GatewayCredentials, paymentExternalId: string, amountMinor: number): Promise<void>;
+  /** Refund part of one payment, in that payment's currency. Used to credit unused time on a switch. */
+  refund?(credentials: GatewayCredentials, paymentExternalId: string, amountMinor: number, currency: string): Promise<void>;
   /**
    * Ask the gateway whether this checkout was paid, and answer in the same
    * events its webhooks would have sent. Empty while it is unpaid.

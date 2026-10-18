@@ -29,6 +29,7 @@ import {
   toJsonDocument,
   validatePatch,
   withDefaults,
+  sectionLockSlug,
 } from "../src/lib/siteSettings.js";
 
 describe("withDefaults is total", () => {
@@ -464,5 +465,54 @@ describe("integration values", () => {
     const problems = validatePatch({ integrations: { github_oauth: { enabled: true, values } } });
 
     expect(problems).toHaveLength(1);
+  });
+});
+
+describe("section locks", () => {
+  it("starts empty", () => {
+    expect(defaultSettings().sectionLocks).toEqual([]);
+    expect(withDefaults({}).sectionLocks).toEqual([]);
+  });
+
+  it("stores rules with tidy names and safe defaults", () => {
+    const next = mergeSettings(defaultSettings(), {
+      sectionLocks: [
+        { name: "  Gold   article ", audience: "members", requiredTier: "tier_gold", lockedAction: "blur" },
+        { name: "Teaser", audience: "others", requiredTier: "BAD TIER", lockedAction: "explode" },
+      ],
+    });
+
+    expect(next.sectionLocks).toEqual([
+      { name: "Gold article", enabled: true, audience: "members", requiredTier: "tier_gold", lockedAction: "blur" },
+      { name: "Teaser", enabled: true, audience: "others", requiredTier: "signed_in", lockedAction: "hide" },
+    ]);
+  });
+
+  it("refuses a name that could reach a selector unescaped, and duplicates", () => {
+    for (const name of ['a"] , body {', `back${String.fromCharCode(92)}slash`, "", "-leading dash"]) {
+      expect(validatePatch({ sectionLocks: [{ name }] }).some((p) => p.path === "sectionLocks.0.name"), name).toBe(true);
+    }
+    const dup = validatePatch({ sectionLocks: [{ name: "Gold" }, { name: "gold" }] });
+    expect(dup.some((p) => p.path === "sectionLocks.1.name")).toBe(true);
+  });
+
+  it("drops invalid rules on read rather than storing them", () => {
+    const doc = withDefaults({ sectionLocks: [{ name: 'x"]{}' }, { name: "Fine" }, { name: "fine" }] });
+    expect(doc.sectionLocks.map((rule) => rule.name)).toEqual(["Fine"]);
+  });
+
+  it("survives the round trip", () => {
+    const next = mergeSettings(defaultSettings(), { sectionLocks: [{ name: "Gold", requiredTier: "tier_gold" }] });
+    const roundTripped = withDefaults(JSON.parse(JSON.stringify(toJsonDocument(next))));
+    expect(roundTripped.sectionLocks).toEqual(next.sectionLocks);
+  });
+});
+
+describe("section lock identity", () => {
+  it("treats names that make the same tag as the same lock", () => {
+    expect(sectionLockSlug("  Gold   Article ")).toBe("gold-article");
+    expect(sectionLockSlug("v2.0 promo")).toBe("v2-0-promo");
+    const dup = validatePatch({ sectionLocks: [{ name: "Gold Article" }, { name: "gold-article" }] });
+    expect(dup.some((p) => p.path === "sectionLocks.1.name")).toBe(true);
   });
 });

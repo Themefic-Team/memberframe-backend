@@ -14,7 +14,9 @@
  */
 
 import { prisma } from "../../config/db.js";
+import { freeTierKey } from "../../lib/tiers.js";
 import { loadTierLadder } from "../sessionService.js";
+import { emitMemberEvent } from "../webhookService.js";
 import { ADAPTERS, loadCredentials, loadPaymentSettings } from "./gatewayStore.js";
 import type { GatewayCredentials, GatewayId, PaymentEvent, PaymentMode } from "./types.js";
 
@@ -73,6 +75,11 @@ export async function recomputeMember(siteId: string, memberId: string): Promise
     if (member.activeTier !== governing.tierKey || member.status !== status) {
       await prisma.member.update({ where: { id: member.id }, data: { activeTier: governing.tierKey, status } });
       log(`member ${member.id} now ${governing.tierKey} (${status})`);
+      void emitMemberEvent(
+        member.activeTier !== governing.tierKey ? "member.tier_changed" : "member.updated",
+        { id: member.id, siteId },
+        member.activeTier !== governing.tierKey ? { previousTier: member.activeTier } : {}
+      );
     }
     return;
   }
@@ -84,9 +91,15 @@ export async function recomputeMember(siteId: string, memberId: string): Promise
     select: { id: true },
   });
 
-  if (bought && (member.activeTier !== "free_member" || member.status !== "active")) {
-    await prisma.member.update({ where: { id: member.id }, data: { activeTier: "free_member", status: "active" } });
-    log(`member ${member.id} back to free_member`);
+  const freeKey = bought ? await freeTierKey(siteId) : "";
+  if (bought && (member.activeTier !== freeKey || member.status !== "active")) {
+    await prisma.member.update({ where: { id: member.id }, data: { activeTier: freeKey, status: "active" } });
+    log(`member ${member.id} back to ${freeKey}`);
+    void emitMemberEvent(
+      member.activeTier !== freeKey ? "member.tier_changed" : "member.updated",
+      { id: member.id, siteId },
+      member.activeTier !== freeKey ? { previousTier: member.activeTier } : {}
+    );
   }
 }
 
@@ -265,7 +278,7 @@ async function activate(
       const credit = lastPaid ? unusedCredit(lastPaid.amountMinor, other.interval, other.currentPeriodEnd) : 0;
       if (lastPaid && credit >= MIN_CREDIT_MINOR && otherAdapter.refund) {
         try {
-          await otherAdapter.refund(otherCredentials, lastPaid.externalId, credit);
+          await otherAdapter.refund(otherCredentials, lastPaid.externalId, credit, lastPaid.currency);
           log(`credited ${credit} ${lastPaid.currency} for unused time on ${other.tierKey}`);
         } catch (error) {
           log(`could not credit unused time on ${other.id}: ${error instanceof Error ? error.message : String(error)}`);

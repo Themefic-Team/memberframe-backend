@@ -125,6 +125,7 @@ model Site {
   subscriptions   Subscription[]
   /// FP-12
   assets          Asset[]
+  outboundWebhooks OutboundWebhook[]
 
   @@index([userId])
   @@map("sites")
@@ -808,4 +809,56 @@ model Asset {
 
   @@index([siteId])
   @@map("assets")
+}
+
+/// A creator's webhook: member events posted to a third-party URL.
+/// Development doc: memberframe/docs/development-docs/20-webhooks.md
+model OutboundWebhook {
+  id     String @id @default(uuid(7)) @db.Char(36)
+  siteId String @map("site_id") @db.Char(36)
+  name   String @db.VarChar(100)
+  url    String @db.VarChar(1000)
+  /// Event types this webhook receives, a JSON array of strings.
+  events Json
+  /// Tier keys this webhook is limited to. Empty means every plan.
+  tiers  Json
+  enabled Boolean @default(true)
+  /// Custom body: [{ source, key }]. Null sends the standard payload.
+  fieldMap Json? @map("field_map")
+  /// HMAC signing secret. Stored as is: it can only sign requests to the
+  /// creator's own endpoint.
+  secret String @db.VarChar(100)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  site       Site               @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  deliveries OutboundDelivery[]
+
+  @@index([siteId])
+  @@map("outbound_webhooks")
+}
+
+/// One event for one webhook, sent by the worker and retried on failure.
+model OutboundDelivery {
+  id        String @id @default(uuid(7)) @db.Char(36)
+  webhookId String @map("webhook_id") @db.Char(36)
+  siteId    String @map("site_id") @db.Char(36)
+  event     String @db.VarChar(40)
+  payload   Json
+  /// pending, delivered, or failed.
+  status    String @default("pending") @db.VarChar(12)
+  attempts  Int    @default(0)
+  nextAttemptAt DateTime? @map("next_attempt_at") @db.DateTime(3)
+  lastStatus    Int?      @map("last_status")
+  lastError     String?   @map("last_error") @db.VarChar(500)
+
+  createdAt   DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+  deliveredAt DateTime? @map("delivered_at") @db.DateTime(3)
+
+  webhook OutboundWebhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt])
+  @@index([webhookId, createdAt])
+  @@map("outbound_deliveries")
 }

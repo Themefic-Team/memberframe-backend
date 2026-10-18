@@ -48,7 +48,7 @@ const SOURCES = {
     credentials: path.join(ROOT, "src", "utils", "credentials.ts"),
   },
   canvas: {
-    gate: path.join(ROOT, "src", "canvas-components", "MemberGate.tsx"),
+    paywall: path.join(ROOT, "src", "canvas-components", "MeteredPaywall.tsx"),
     auth: path.join(ROOT, "src", "canvas-components", "MemberAuth.tsx"),
   },
   backend: {
@@ -130,7 +130,7 @@ function normalize(body: string): string {
 
 describe("isEntitled is identical in all three copies", () => {
   const plugin = normalize(extractFunction(read(SOURCES.plugin.entitlement), "isEntitled"));
-  const canvas = normalize(extractFunction(read(SOURCES.canvas.gate), "isEntitled"));
+  const canvas = normalize(extractFunction(read(SOURCES.canvas.paywall), "isEntitled"));
   const backend = normalize(extractFunction(read(SOURCES.backend.entitlement), "isEntitled"));
 
   it("the backend copy matches the plugin copy", () => {

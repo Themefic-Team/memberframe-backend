@@ -107,9 +107,10 @@ export const meterRouter = Router();
 
 const meterSchema = z.object({
   slug: z.string().trim().min(1).max(191),
-  limit: z.number().int().min(1).max(10),
+  // The plugin's FREE_ARTICLES_MAX and the component's METER_MAX_QUOTA.
+  limit: z.number().int().min(1).max(100),
   period: z.enum(["weekly", "monthly"]),
-  deviceReads: z.array(z.string().trim().min(1).max(191)).max(10).default([]),
+  deviceReads: z.array(z.string().trim().min(1).max(191)).max(100).default([]),
 });
 
 meterRouter.post(

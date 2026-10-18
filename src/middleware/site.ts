@@ -324,7 +324,8 @@ async function handlePreflight(req: Request, res: Response): Promise<void> {
   res.setHeader(
     "Access-Control-Allow-Headers",
     // The test country header is honoured only in test mode; see gatewayRouter.
-    `Content-Type, Accept, ${SITE_KEY_HEADER}, X-MemberFrame-Test-Country`
+    // ngrok-skip-browser-warning: see `middleware/creator.ts`.
+    `Content-Type, Accept, ${SITE_KEY_HEADER}, X-MemberFrame-Test-Country, ngrok-skip-browser-warning`
   );
   if (req.header("access-control-request-private-network")) {
     res.setHeader("Access-Control-Allow-Private-Network", "true");

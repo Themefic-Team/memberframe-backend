@@ -12,20 +12,11 @@
  */
 
 import type { BillingInterval } from "./types.js";
+import { countryCurrency } from "../../lib/currencies.js";
 
-const EUROZONE = new Set([
-  "AT", "BE", "HR", "CY", "EE", "FI", "FR", "DE", "GR", "IE", "IT", "LV", "LT", "LU", "MT",
-  "NL", "PT", "SK", "SI", "ES",
-]);
-
-/** The currency a buyer from this country would expect, when it is one MemberFrame sells in. */
+/** The currency a buyer from this country would expect, or null when the country is unknown. */
 export function preferredCurrency(country: string | null): string | null {
-  if (!country) return null;
-  if (country === "IN") return "INR";
-  if (country === "GB") return "GBP";
-  if (country === "US") return "USD";
-  if (EUROZONE.has(country)) return "EUR";
-  return null;
+  return country ? countryCurrency(country) : null;
 }
 
 export interface PricedTier {

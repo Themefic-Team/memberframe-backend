@@ -22,6 +22,7 @@ import path from "node:path";
 import nodemailer, { type Transporter } from "nodemailer";
 import { env } from "../config/env.js";
 import { prisma } from "../config/db.js";
+import { renderEmail } from "./emailLayout.js";
 
 export interface Mail {
   to: string;
@@ -122,6 +123,8 @@ async function sendViaLog(mail: Mail): Promise<MailResult> {
   try {
     await mkdir(MAIL_DIR, { recursive: true });
     await writeFile(file, body, "utf-8");
+    // The HTML beside it, so the designed message can be opened in a browser.
+    if (mail.html) await writeFile(file.replace(/.txt$/, ".html"), mail.html, "utf-8");
 
     // Printed as well as written. During the cookie spike the developer is
     // watching the terminal, not a directory.
@@ -177,15 +180,26 @@ async function recordAttempt(mail: Mail, result: MailResult): Promise<void> {
 // Plain text, with HTML as a nicety. Text first because a password reset that
 // renders as a blank page in a text-only client is a member who cannot get in,
 // and because every HTML email client strips something different.
+//
+// Every HTML body comes from `renderEmail` in `emailLayout.ts`, which owns the
+// look and escapes every string, the creator-typed site name included. A
+// template here only says what to say.
+
+/** The name a member's email is signed with. A blank site name falls back to the product. */
+function brandOf(siteName: string): string {
+  const trimmed = siteName.trim();
+  return trimmed === "" ? "MemberFrame" : trimmed;
+}
 
 export function otpMail(to: string, code: string, siteName: string, siteId: string): Mail {
   const minutes = Math.round(env.otp.ttlSeconds / 60);
+  const brand = brandOf(siteName);
 
   return {
     to,
     siteId,
     template: "member_otp",
-    subject: `Your ${siteName} sign-in code`,
+    subject: `Your ${brand} sign-in code`,
     text: [
       `Your sign-in code is ${code}`,
       "",
@@ -194,25 +208,28 @@ export function otpMail(to: string, code: string, siteName: string, siteId: stri
       "If you did not ask for this code, you can ignore this message. Nobody",
       "can sign in without it.",
     ].join("\n"),
-    html: [
-      `<p>Your sign-in code is</p>`,
-      `<p style="font-size:28px;font-weight:700;letter-spacing:6px">${code}</p>`,
-      `<p>It works for ${minutes} minutes and can be used once.</p>`,
-      `<p style="color:#5b6472;font-size:13px">If you did not ask for this code,`,
-      `you can ignore this message. Nobody can sign in without it.</p>`,
-    ].join(""),
+    html: renderEmail({
+      brand,
+      preheader: `Your sign-in code is ${code}`,
+      heading: "Your sign-in code",
+      intro: [`Enter this code to sign in to ${brand}.`],
+      code,
+      details: [`It works for ${minutes} minutes and can be used once.`],
+      safety: "If you did not ask for this code, you can ignore this message. Nobody can sign in without it.",
+    }),
   };
 }
 
 /** The code that confirms a new account's address. Same code store as sign in. */
 export function verifyEmailMail(to: string, code: string, siteName: string, siteId: string): Mail {
   const minutes = Math.round(env.otp.ttlSeconds / 60);
+  const brand = brandOf(siteName);
 
   return {
     to,
     siteId,
     template: "member_verify_email",
-    subject: `Confirm your email for ${siteName}`,
+    subject: `Confirm your email for ${brand}`,
     text: [
       `Your confirmation code is ${code}`,
       "",
@@ -221,31 +238,36 @@ export function verifyEmailMail(to: string, code: string, siteName: string, site
       "",
       "If you did not create an account, you can ignore this message.",
     ].join("\n"),
-    html: [
-      `<p>Your confirmation code is</p>`,
-      `<p style="font-size:28px;font-weight:700;letter-spacing:6px">${code}</p>`,
-      `<p>Enter it on the sign up page to finish creating your account.`,
-      ` It works for ${minutes} minutes and can be used once.</p>`,
-      `<p style="color:#5b6472;font-size:13px">If you did not create an account,`,
-      ` you can ignore this message.</p>`,
-    ].join(""),
+    html: renderEmail({
+      brand,
+      preheader: `Your confirmation code is ${code}`,
+      heading: "Confirm your email",
+      intro: [`Welcome to ${brand}. Enter this code on the sign up page to finish creating your account.`],
+      code,
+      details: [`It works for ${minutes} minutes and can be used once.`],
+      safety: "If you did not create an account, you can ignore this message.",
+    }),
   };
 }
 
+/**
+ * `url` is the finished link, built by `passwordResetUrl` from the site's own
+ * origin and reset page. The template only presents it.
+ */
 export function passwordResetMail(
   to: string,
-  token: string,
+  url: string,
   siteName: string,
   siteId: string
 ): Mail {
-  const url = env.passwordReset.urlTemplate.replace("{token}", encodeURIComponent(token));
   const minutes = Math.round(env.passwordReset.ttlSeconds / 60);
+  const brand = brandOf(siteName);
 
   return {
     to,
     siteId,
     template: "member_password_reset",
-    subject: `Reset your ${siteName} password`,
+    subject: `Reset your ${brand} password`,
     text: [
       "Someone asked to reset the password for this address.",
       "",
@@ -257,14 +279,16 @@ export function passwordResetMail(
       "If this was not you, ignore this message. Your password has not changed",
       "and nobody can change it without this link.",
     ].join("\n"),
-    html: [
-      `<p>Someone asked to reset the password for this address.</p>`,
-      `<p><a href="${url}">Choose a new password</a></p>`,
-      `<p>The link works for ${minutes} minutes and can be used once.</p>`,
-      `<p style="color:#5b6472;font-size:13px">If this was not you, ignore this`,
-      ` message. Your password has not changed and nobody can change it without`,
-      ` this link.</p>`,
-    ].join(""),
+    html: renderEmail({
+      brand,
+      preheader: `Choose a new password for ${brand}.`,
+      heading: "Reset your password",
+      intro: ["Someone asked to reset the password for this address. Use the button below to choose a new one."],
+      action: { label: "Choose a new password", url },
+      details: [`The link works for ${minutes} minutes and can be used once.`],
+      safety:
+        "If this was not you, ignore this message. Your password has not changed and nobody can change it without this link.",
+    }),
   };
 }
 
@@ -277,11 +301,13 @@ export function passwordResetMail(
  * helped anyway.
  */
 export function passwordChangedMail(to: string, siteName: string, siteId: string): Mail {
+  const brand = brandOf(siteName);
+
   return {
     to,
     siteId,
     template: "member_password_changed",
-    subject: `Your ${siteName} password was changed`,
+    subject: `Your ${brand} password was changed`,
     text: [
       "The password for this address was just changed, and every other signed-in",
       "session was ended.",
@@ -290,6 +316,16 @@ export function passwordChangedMail(to: string, siteName: string, siteId: string
       "",
       "If it was not, reset the password again now and contact the site owner.",
     ].join("\n"),
+    html: renderEmail({
+      brand,
+      preheader: `Your ${brand} password was just changed.`,
+      heading: "Your password was changed",
+      intro: [
+        "The password for this address was just changed, and every other signed-in session was ended.",
+        "If that was you, there is nothing to do.",
+      ],
+      safety: "If it was not you, reset the password again now and contact the site owner.",
+    }),
   };
 }
 
@@ -322,13 +358,14 @@ export function creatorCodeMail(to: string, code: string): Mail {
       "If you did not ask for this code, you can ignore this message. Nobody",
       "can connect your project without it.",
     ].join("\n"),
-    html: [
-      `<p>Your connect code is</p>`,
-      `<p style="font-size:28px;font-weight:700;letter-spacing:6px">${code}</p>`,
-      `<p>It works for ${minutes} minutes and can be used once.</p>`,
-      `<p>Enter it in the MemberFrame plugin to connect this Framer project.</p>`,
-      `<p style="color:#5b6472;font-size:13px">If you did not ask for this code,`,
-      `you can ignore this message. Nobody can connect your project without it.</p>`,
-    ].join(""),
+    html: renderEmail({
+      brand: "MemberFrame",
+      preheader: `Your connect code is ${code}`,
+      heading: "Connect your Framer project",
+      intro: ["Enter this code in the MemberFrame plugin to connect this Framer project."],
+      code,
+      details: [`It works for ${minutes} minutes and can be used once.`],
+      safety: "If you did not ask for this code, you can ignore this message. Nobody can connect your project without it.",
+    }),
   };
 }

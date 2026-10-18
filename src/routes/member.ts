@@ -15,6 +15,7 @@
 import { Router, type Request, type Response } from "express";
 import { env } from "../config/env.js";
 import { prisma } from "../config/db.js";
+import { freeTierKey } from "../lib/tiers.js";
 import { readIntegrationSecret } from "../services/integrationSecrets.js";
 import { badRequest, forbidden, ok, okEmpty, route, unauthorized } from "../middleware/errors.js";
 import { originAllowed, requireSite } from "../middleware/site.js";
@@ -39,6 +40,8 @@ import {
   touchSession,
 } from "../services/sessionService.js";
 import { loadSiteSettings } from "../services/settingsService.js";
+import { pickSiteOrigin } from "../lib/siteLinks.js";
+import { emitMemberEvent } from "../services/webhookService.js";
 import { applyMetadata, publicFieldDefinitions } from "../lib/memberMetadata.js";
 import type { Prisma } from "@prisma/client";
 import { z } from "zod";
@@ -207,10 +210,18 @@ memberRouter.post(
 
     guardEmailSend(req, "forgot", input.email);
 
+    // The link opens the site this member is on, at the creator's reset page,
+    // rather than a placeholder host from the server's config.
+    const settings = await loadSiteSettings(site.id);
+
     await requestPasswordReset({
       siteId: site.id,
       siteName: site.siteName,
       email: input.email,
+      resetLink: {
+        origin: pickSiteOrigin(req.header("origin"), site.allowedOrigins),
+        resetPath: settings.auth.resetPath,
+      },
     });
 
     okEmpty(res);
@@ -231,6 +242,7 @@ memberRouter.post(
 
     const result = await resetPassword({
       siteId: site.id,
+      siteName: site.siteName,
       token: input.token,
       newPassword: input.newPassword,
     });
@@ -513,6 +525,8 @@ memberRouter.patch(
       },
     });
 
+    void emitMemberEvent("member.updated", { id: member.id, siteId: site.id });
+
     ok(res, {
       member: memberPayload(member),
       fields: publicFieldDefinitions(settings.customFields),
@@ -704,10 +718,11 @@ async function completeOAuthMemberLogin(
         name: profile.name || null,
         avatarUrl: profile.avatarUrl || null,
         emailVerifiedAt: profile.emailVerified ? new Date() : null,
-        activeTier: "free_member",
+        activeTier: await freeTierKey(siteId),
         status: "active",
       },
     });
+    void emitMemberEvent("member.created", { id: member.id, siteId });
   } else {
     await prisma.member.update({
       where: { id: member.id },

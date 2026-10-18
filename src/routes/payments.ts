@@ -25,7 +25,9 @@ import { rateLimited } from "../middleware/errors.js";
 import { loadSession } from "../services/sessionService.js";
 import { secretsAvailable } from "../lib/secretBox.js";
 import { isSafeSitePath } from "../lib/siteSettings.js";
+import { switchTierCurrency } from "../lib/tiers.js";
 import { publicApiBase } from "../lib/publicApiBase.js";
+import { currencySchema } from "../lib/currencies.js";
 import {
   ADAPTERS,
   connectGateway,
@@ -111,7 +113,7 @@ const settingsSchema = z.object({
   mode: z.enum(["test", "live"]).optional(),
   defaultGateway: z.enum(["", "stripe", "lemonsqueezy", "razorpay"]).optional(),
   autoDetectGeolocation: z.boolean().optional(),
-  defaultCurrency: z.enum(["USD", "EUR", "GBP", "INR"]).optional(),
+  defaultCurrency: currencySchema.optional(),
   graceDays: z.number().int().min(0).max(30).optional(),
   afterPurchasePath: z.string().trim().max(255).optional(),
   pricingPath: z.string().trim().max(255).optional(),
@@ -135,6 +137,11 @@ paymentsRouter.put(
     }
 
     const next = await savePaymentSettings(site.id, patch);
+
+    // One site currency (23-dynamic-tiers.md): every tier follows it.
+    if (next.defaultCurrency !== before.defaultCurrency) {
+      await switchTierCurrency(site.id, next.defaultCurrency);
+    }
 
     // Test buyers lose what they bought with a test card the moment the site
     // goes live. FP-16 section 11.

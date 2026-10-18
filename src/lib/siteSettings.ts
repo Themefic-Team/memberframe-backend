@@ -266,6 +266,50 @@ export const DEFAULT_GATED_PAGES: GatedPageRule[] = [
   },
 ];
 
+/**
+ * A section lock: a rule a layer opts into by its name, "Lock: <name>".
+ * Development doc: memberframe/docs/development-docs/19-section-locks.md
+ *
+ * The Route Shield matches published layers by the data-framer-name Framer
+ * writes, and hides or blurs them for anyone the rule does not show them to.
+ */
+export interface SectionLockRule {
+  /** Unique per site, ignoring case. Letters, digits, spaces, and - _ . only. */
+  name: string;
+  enabled: boolean;
+  /** "members": shown to those with access. "others": shown to everyone without it. */
+  audience: "members" | "others";
+  /** "signed_in" or a tier key, the same as a page lock. */
+  requiredTier: string;
+  /** What the people the rule does not show the layer to get instead. */
+  lockedAction: "hide" | "blur";
+}
+
+/** At most this many per site. */
+export const MAX_SECTION_LOCKS = 50;
+
+
+/**
+ * A rule name. It ends up inside a CSS attribute selector in the Shield, so
+ * the character set is what keeps a quote or a backslash from ever getting
+ * there, not escaping alone.
+ */
+export const SECTION_LOCK_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 _.-]{0,59}$/;
+
+/** Trim and collapse spaces, the form names are compared and stored in. */
+export function normalizeSectionLockName(value: string): string {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+/**
+ * A rule's identity: lowercase, every run of other characters one dash.
+ * "Gold Article" and "gold-article" are the same lock. The override the plugin
+ * writes tags a layer with a class built from it, so two rules may not share it.
+ */
+export function sectionLockSlug(name: string): string {
+  return normalizeSectionLockName(name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
 export interface SiteSettingsDocument {
   version: number;
   auth: AuthSettings;
@@ -276,6 +320,7 @@ export interface SiteSettingsDocument {
   /** FP-09. Ordered by `order`, and the order is what the form renders in. */
   customFields: CustomFieldDefinition[];
   gatedPages: GatedPageRule[];
+  sectionLocks: SectionLockRule[];
 }
 
 /** At most this many per site. A form longer than this is a survey, not a profile. */
@@ -358,6 +403,7 @@ export function defaultSettings(): SiteSettingsDocument {
     customFields: [],
     integrations: {},
     gatedPages: [...DEFAULT_GATED_PAGES],
+    sectionLocks: [],
   };
 }
 
@@ -525,6 +571,33 @@ function readCustomFields(value: unknown): CustomFieldDefinition[] {
   });
 }
 
+function readSectionLocks(value: unknown): SectionLockRule[] {
+  if (!Array.isArray(value)) return [];
+
+  const rules: SectionLockRule[] = [];
+  const seen = new Set<string>();
+
+  for (const entry of value) {
+    if (rules.length >= MAX_SECTION_LOCKS) break;
+    if (!isRecord(entry) || typeof entry["name"] !== "string") continue;
+
+    const name = normalizeSectionLockName(entry["name"]);
+    if (!SECTION_LOCK_NAME_PATTERN.test(name) || seen.has(sectionLockSlug(name))) continue;
+
+    const rawTier = entry["requiredTier"];
+    seen.add(sectionLockSlug(name));
+    rules.push({
+      name,
+      enabled: entry["enabled"] !== false,
+      audience: entry["audience"] === "others" ? "others" : "members",
+      requiredTier: typeof rawTier === "string" && GATED_TIER_PATTERN.test(rawTier) ? rawTier : "signed_in",
+      lockedAction: entry["lockedAction"] === "blur" ? "blur" : "hide",
+    });
+  }
+
+  return rules;
+}
+
 function readGatedPages(value: unknown): GatedPageRule[] {
   if (!Array.isArray(value)) return [...DEFAULT_GATED_PAGES];
 
@@ -647,6 +720,7 @@ export function withDefaults(stored: unknown): SiteSettingsDocument {
     customFields: readCustomFields(upgraded["customFields"]),
     integrations: readIntegrations(upgraded["integrations"]),
     gatedPages: readGatedPages(upgraded["gatedPages"]),
+    sectionLocks: readSectionLocks(upgraded["sectionLocks"]),
   };
 }
 
@@ -910,6 +984,28 @@ export function validatePatch(patch: unknown): SettingsProblem[] {
     }
   }
 
+  if (patch["sectionLocks"] !== undefined) {
+    if (!Array.isArray(patch["sectionLocks"])) {
+      problems.push({ path: "sectionLocks", message: "Section locks must be a list." });
+    } else if (patch["sectionLocks"].length > MAX_SECTION_LOCKS) {
+      problems.push({ path: "sectionLocks", message: `At most ${MAX_SECTION_LOCKS} section locks.` });
+    } else {
+      const names = new Set<string>();
+      patch["sectionLocks"].forEach((entry, index) => {
+        const name = isRecord(entry) && typeof entry["name"] === "string" ? normalizeSectionLockName(entry["name"]) : "";
+        if (!SECTION_LOCK_NAME_PATTERN.test(name)) {
+          problems.push({
+            path: `sectionLocks.${index}.name`,
+            message: "Name each lock with letters, digits, spaces, dots, dashes, or underscores.",
+          });
+        } else if (names.has(sectionLockSlug(name))) {
+          problems.push({ path: `sectionLocks.${index}.name`, message: "Two locks share this name." });
+        }
+        names.add(sectionLockSlug(name));
+      });
+    }
+  }
+
   return problems;
 }
 
@@ -938,6 +1034,7 @@ export function mergeSettings(
     canvas: { ...current.canvas, deployedComponents: [...current.canvas.deployedComponents] },
     customFields: current.customFields.map((field) => ({ ...field, options: [...field.options] })),
     gatedPages: current.gatedPages ? current.gatedPages.map((rule) => ({ ...rule })) : [...DEFAULT_GATED_PAGES],
+    sectionLocks: (current.sectionLocks ?? []).map((rule) => ({ ...rule })),
     integrations: Object.fromEntries(
       Object.entries(current.integrations).map(([id, entry]) => [
         id,
@@ -1012,6 +1109,10 @@ export function mergeSettings(
 
   if (Array.isArray(patch["gatedPages"])) {
     next.gatedPages = readGatedPages(patch["gatedPages"]);
+  }
+
+  if (Array.isArray(patch["sectionLocks"])) {
+    next.sectionLocks = readSectionLocks(patch["sectionLocks"]);
   }
 
   if (isRecord(patch["canvas"])) {
@@ -1092,6 +1193,13 @@ export function toJsonDocument(document: SiteSettingsDocument): Prisma.InputJson
       requiredTier: rule.requiredTier,
       fallbackAction: rule.fallbackAction,
       ...(rule.redirectPath !== undefined ? { redirectPath: rule.redirectPath } : {}),
+    })),
+    sectionLocks: (document.sectionLocks ?? []).map((rule) => ({
+      name: rule.name,
+      enabled: rule.enabled,
+      audience: rule.audience,
+      requiredTier: rule.requiredTier,
+      lockedAction: rule.lockedAction,
     })),
     integrations: Object.fromEntries(
       Object.entries(document.integrations).map(([id, entry]) => [

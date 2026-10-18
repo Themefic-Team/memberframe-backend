@@ -30,7 +30,8 @@
 // TYPES, MIRRORED FROM src/types/member.ts
 // ============================================================================
 
-export type TierKey = "free_member" | "tier_1" | "tier_2" | "vip";
+/** Any tier's key. The site's tiers are the creator's own (23-dynamic-tiers.md). */
+export type TierKey = string;
 
 export type RequiredTier = "anyone" | "signed_in" | TierKey;
 

@@ -11,6 +11,7 @@
 
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { maskedSuffix } from "../../lib/secretBox.js";
+import { fromStripeAmount, toStripeAmount } from "../../lib/currencies.js";
 import {
   GatewayError,
   asNumber,
@@ -203,6 +204,7 @@ export function parseStripeEvent(event: Record<string, unknown>): PaymentEvent[]
       const externalId = isSubscription
         ? asString(object["subscription"])
         : asString(object["payment_intent"]) ?? asString(object["id"]);
+      const currency = (asString(object["currency"]) ?? "usd").toUpperCase();
 
       return [
         paymentEvent("activate", type, {
@@ -216,8 +218,8 @@ export function parseStripeEvent(event: Record<string, unknown>): PaymentEvent[]
             ? null
             : {
                 externalId: externalId ?? asString(object["id"]) ?? "",
-                amountMinor: asNumber(object["amount_total"]) ?? 0,
-                currency: (asString(object["currency"]) ?? "usd").toUpperCase(),
+                amountMinor: fromStripeAmount(asNumber(object["amount_total"]) ?? 0, currency),
+                currency,
                 receiptUrl: null,
                 paidAt: fromUnix(object["created"]) ?? new Date(),
               },
@@ -229,6 +231,7 @@ export function parseStripeEvent(event: Record<string, unknown>): PaymentEvent[]
       const subscriptionId = invoiceSubscription(object);
       if (!subscriptionId) return [];
       const amount = asNumber(object["amount_paid"]) ?? 0;
+      const currency = (asString(object["currency"]) ?? "usd").toUpperCase();
       return [
         paymentEvent("renewed", type, {
           externalId: subscriptionId,
@@ -239,8 +242,8 @@ export function parseStripeEvent(event: Record<string, unknown>): PaymentEvent[]
             amount > 0
               ? {
                   externalId: asString(object["id"]) ?? "",
-                  amountMinor: amount,
-                  currency: (asString(object["currency"]) ?? "usd").toUpperCase(),
+                  amountMinor: fromStripeAmount(amount, currency),
+                  currency,
                   receiptUrl: asString(object["hosted_invoice_url"]),
                   paidAt: fromUnix(asRecord(object["status_transitions"])["paid_at"]) ?? new Date(),
                 }
@@ -386,7 +389,7 @@ export const stripeAdapter: GatewayAdapter = {
 
     const price = await stripe(secretKey, "POST", "/prices", {
       product: productId,
-      unit_amount: spec.amountMinor,
+      unit_amount: toStripeAmount(spec.amountMinor, spec.currency),
       currency: spec.currency.toLowerCase(),
       ...(spec.interval === "lifetime" ? {} : { recurring: { interval: spec.interval } }),
       metadata: { mf_site_id: spec.siteId, mf_tier_key: spec.tierKey, mf_interval: spec.interval },
@@ -496,7 +499,7 @@ export const stripeAdapter: GatewayAdapter = {
   },
 
   /** A partial refund of an invoice (subscription) or a payment intent (one-time). */
-  async refund(credentials, paymentExternalId, amountMinor) {
+  async refund(credentials, paymentExternalId, amountMinor, currency) {
     const secretKey = secretKeyOf(credentials);
     let paymentIntent = paymentExternalId;
     if (paymentExternalId.startsWith("in_")) {
@@ -507,7 +510,7 @@ export const stripeAdapter: GatewayAdapter = {
         return;
       }
     }
-    await stripe(secretKey, "POST", "/refunds", { payment_intent: paymentIntent, amount: amountMinor });
+    await stripe(secretKey, "POST", "/refunds", { payment_intent: paymentIntent, amount: toStripeAmount(amountMinor, currency) });
   },
 
   /**

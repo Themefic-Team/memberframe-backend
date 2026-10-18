@@ -25,7 +25,7 @@ import { isSafeSitePath } from "../../lib/siteSettings.js";
 import { ADAPTERS, connectedGateways, loadCredentials, loadPaymentSettings } from "./gatewayStore.js";
 import { chooseGateway } from "./gatewayRouter.js";
 import { RUNNING, applyPaymentEvent, governingSubscription, recomputeMember } from "./apply.js";
-import { currencyFor, preferredCurrency, tierAmount, type PricedTier } from "./prices.js";
+import { tierAmount, type PricedTier } from "./prices.js";
 import {
   GatewayError,
   INTERVALS,
@@ -77,14 +77,16 @@ export async function publicPricing(siteId: string, country: string | null): Pro
     prisma.tier.findMany({ where: { siteId, isActive: true }, orderBy: { rank: "asc" }, include: TIER_WITH_PRICES }),
     connectedGateways(siteId, settings.mode),
   ]);
-  const preferred = preferredCurrency(country);
+  // One site currency (23-dynamic-tiers.md): every buyer sees the tier's own
+  // price, wherever they are. `country` still routes the gateway.
+  void country;
 
   return {
     mode: settings.mode,
     pricingPath: settings.pricingPath,
     afterPurchasePath: settings.afterPurchasePath,
     tiers: tiers.map((tier) => {
-      const currency = currencyFor(tier, preferred);
+      const currency = tier.currency;
       const prices = {} as Record<BillingInterval, number | null>;
       const purchasable = {} as Record<BillingInterval, boolean>;
       for (const interval of INTERVALS) {
@@ -243,7 +245,7 @@ export async function createCheckout(input: CheckoutRequest): Promise<CheckoutOu
   });
   if (!tier) throw notFound("tier_not_found");
 
-  const currency = currencyFor(tier, preferredCurrency(input.country));
+  const currency = tier.currency;
   const amountMinor = tierAmount(tier, input.interval, currency);
   if (amountMinor === null) throw badRequest("price_not_available");
 

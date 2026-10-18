@@ -119,7 +119,9 @@ async function authenticate(req: Request): Promise<void> {
 export const pluginCors: RequestHandler = (req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization");
+  // `ngrok-skip-browser-warning` lets the panel reach a dev API behind a free
+  // ngrok tunnel; without it the preflight refuses the header.
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization, ngrok-skip-browser-warning");
   res.setHeader("Access-Control-Allow-Private-Network", "true");
   res.setHeader("Access-Control-Max-Age", "600");
 

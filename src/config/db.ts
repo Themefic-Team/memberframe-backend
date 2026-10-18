@@ -150,10 +150,14 @@ export async function checkDatabase(): Promise<DatabaseStatus> {
 export function explainConnectionError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
 
-  if (message.includes("ECONNREFUSED")) {
+  if (
+    message.includes("ECONNREFUSED") ||
+    message.includes("Can't reach database server") ||
+    message.includes("P1001")
+  ) {
     return [
-      "MySQL refused the connection.",
-      "  Is the server running? On Laragon, start it from the tray.",
+      "MySQL refused the connection or is unreachable.",
+      "  Is the server running? On Laragon, start it from the tray (Start All).",
       "  Is DATABASE_URL pointing at 127.0.0.1 rather than localhost? On Windows,",
       "  localhost can resolve to IPv6 ::1 while MySQL listens only on IPv4.",
     ].join("\n");

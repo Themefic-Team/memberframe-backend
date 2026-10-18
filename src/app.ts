@@ -15,6 +15,8 @@ import { pluginCors } from "./middleware/creator.js";
 import { memberRouter } from "./routes/member.js";
 import { connectRouter } from "./routes/connect.js";
 import { siteRouter } from "./routes/site.js";
+import { previewRouter } from "./routes/preview.js";
+import { reportsRouter } from "./routes/reports.js";
 import { handleShieldScript } from "./routes/shield.js";
 import {
   billingRouter,
@@ -72,6 +74,10 @@ export function createApp(): Express {
 
   app.use("/api/connect", pluginCors);
   app.use("/api/site", pluginCors);
+  // The canvas preview: public, read-only, no cookie, and asked for from a
+  // Framer canvas origin no site allowlists. Mounted whole, ahead of the
+  // site check. Reasoning in routes/preview.ts.
+  app.use("/api/preview", pluginCors, previewRouter);
 
   // Preflight for the member half, which needs a site, because an OPTIONS
   // request carries neither a cookie nor the custom header.
@@ -158,6 +164,8 @@ export function createApp(): Express {
 
   app.use("/api/connect", connectRouter);
   app.use("/api/site/payments", paymentsRouter);
+  // Reports, read only (24-reports.md).
+  app.use("/api/site/reports", reportsRouter);
   app.use("/api/site/assets", assetsCreatorRouter);
   app.use("/api/site", siteRouter);
 
