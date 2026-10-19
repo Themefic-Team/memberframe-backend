@@ -392,6 +392,38 @@ export function passwordResetMail(
 }
 
 /**
+ * A one-click sign in, sent by the creator from Manage (doc 26). The link
+ * holds a single-use code in its fragment, which `<MemberAuth>` exchanges.
+ */
+export function magicLinkMail(to: string, url: string, minutes: number, siteName: string, siteId: string): Mail {
+  const brand = brandOf(siteName);
+
+  return {
+    to,
+    siteId,
+    template: "member_magic_link",
+    subject: `Sign in to ${brand}`,
+    text: [
+      `Here is your link to sign in to ${brand}:`,
+      url,
+      "",
+      `The link works for ${minutes} minutes and can be used once.`,
+      "",
+      "If you did not expect this message, you can ignore it.",
+    ].join("\n"),
+    html: renderEmail({
+      brand,
+      preheader: `Your sign in link for ${brand}.`,
+      heading: `Sign in to ${brand}`,
+      intro: ["Use the button below to sign in. No password or code needed."],
+      action: { label: "Sign in", url },
+      details: [`The link works for ${minutes} minutes and can be used once.`],
+      safety: "If you did not expect this message, you can ignore it. Nobody can sign in without this link.",
+    }),
+  };
+}
+
+/**
  * Sent after a successful reset, to the address that was reset.
  *
  * Not a courtesy. If an attacker completed a reset, this is the only signal the

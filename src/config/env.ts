@@ -47,6 +47,11 @@ function loadDotEnv(): void {
       (value.startsWith("'") && value.endsWith("'") && value.length > 1)
     ) {
       value = value.slice(1, -1);
+    } else {
+      // An unquoted value ends at " #", as dotenv reads it, so
+      // `TRIAL_DURATION_MINUTES=10 # testing` is 10, not a refused integer.
+      const comment = value.search(/\s#/);
+      if (comment !== -1) value = value.slice(0, comment).trimEnd();
     }
 
     // A real environment variable wins over the file, so a container override
@@ -107,6 +112,34 @@ function oneOf<T extends string>(key: string, allowed: readonly T[], fallback: T
 
   invalid.push(`${key} must be one of ${allowed.join(", ")}, got "${raw}"`);
   return fallback;
+}
+
+/**
+ * A value copied from an example file and never filled in: "your-google-client-id...",
+ * "whsec_your_webhook_signing_secret", "price_monthly_id_here". Read as unset, so a
+ * half-filled .env turns a feature off instead of calling Stripe or Google with junk.
+ */
+function isPlaceholder(value: string): boolean {
+  return /your[-_]/i.test(value) || /_here$/i.test(value);
+}
+
+/**
+ * The first of several names that holds a real value. F19 billing reads
+ * MemberFrame's own names first and the BEAF backend's after them, so one .env
+ * layout works for every Framefic plugin (the company billing standard).
+ */
+function firstOf(...keys: string[]): string {
+  for (const key of keys) {
+    const value = process.env[key]?.trim();
+    if (value && !isPlaceholder(value)) return value;
+  }
+  return "";
+}
+
+/** `int` over the first of several names that is set. */
+function intOf(keys: string[], fallback: number): number {
+  const key = keys.find((name) => (process.env[name] ?? "").trim() !== "");
+  return key ? int(key, fallback) : fallback;
 }
 
 // ============================================================================
@@ -233,17 +266,18 @@ export const env = {
    * `payments` above, which take their members' money.
    */
   billing: {
-    stripeSecretKey: process.env["PLATFORM_STRIPE_SECRET_KEY"] ?? "",
-    stripePublishableKey: process.env["PLATFORM_STRIPE_PUBLISHABLE_KEY"] ?? "",
-    stripeWebhookSecret: process.env["PLATFORM_STRIPE_WEBHOOK_SECRET"] ?? "",
+    // Each also reads BEAF's name (STRIPE_SECRET_KEY, ...). See `firstOf`.
+    stripeSecretKey: firstOf("PLATFORM_STRIPE_SECRET_KEY", "STRIPE_SECRET_KEY"),
+    stripePublishableKey: firstOf("PLATFORM_STRIPE_PUBLISHABLE_KEY", "STRIPE_PUBLISHABLE_KEY"),
+    stripeWebhookSecret: firstOf("PLATFORM_STRIPE_WEBHOOK_SECRET", "STRIPE_WEBHOOK_SECRET"),
     /** Stripe price ids. The amounts shown in the panel are read from Stripe. */
     prices: {
-      monthly: process.env["PLATFORM_PRICE_MONTHLY"] ?? "",
-      yearly: process.env["PLATFORM_PRICE_YEARLY"] ?? "",
-      lifetime: process.env["PLATFORM_PRICE_LIFETIME"] ?? "",
+      monthly: firstOf("PLATFORM_PRICE_MONTHLY", "STRIPE_PRICE_MONTHLY"),
+      yearly: firstOf("PLATFORM_PRICE_YEARLY", "STRIPE_PRICE_YEARLY"),
+      lifetime: firstOf("PLATFORM_PRICE_LIFETIME", "STRIPE_PRICE_LIFETIME"),
     },
     /** How many lifetime plans are sold before the offer closes. BEAF: 20. */
-    lifetimeMax: int("LIFETIME_MAX", 20),
+    lifetimeMax: intOf(["LIFETIME_MAX", "LIFETIME_DEAL_MAX_USERS"], 20),
     trialDays: int("TRIAL_DURATION_DAYS", 7),
     /** Testing only: a trial this many minutes long instead. 0 means use days. */
     trialMinutes: int("TRIAL_DURATION_MINUTES", 0),
@@ -263,8 +297,16 @@ export const env = {
      * Google sign in on the hosted account page (F19). MemberFrame's own OAuth
      * client, not a site's. Empty hides the Google button.
      */
-    googleClientId: process.env["CREATOR_GOOGLE_CLIENT_ID"] ?? "",
-    googleClientSecret: process.env["CREATOR_GOOGLE_CLIENT_SECRET"] ?? "",
+    /**
+     * Signs the seal the Builder puts on every component it inserts, so a
+     * copied and pasted component can be told apart (27-instance-seal.md).
+     * Required in production; development uses a fixed value so seals survive
+     * a restart.
+     */
+    instanceSealSecret:
+      process.env["INSTANCE_SEAL_SECRET"]?.trim() || (nodeEnv === "production" ? "" : "memberframe-development-instance-seal"),
+    googleClientId: firstOf("CREATOR_GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_ID"),
+    googleClientSecret: firstOf("CREATOR_GOOGLE_CLIENT_SECRET", "GOOGLE_CLIENT_SECRET"),
   },
 
   rateLimit: {
@@ -319,11 +361,14 @@ function crossChecks(): void {
     const billing = env.billing;
     if (!billing.stripeSecretKey || !billing.stripePublishableKey || !billing.stripeWebhookSecret) {
       invalid.push(
-        "PLATFORM_STRIPE_SECRET_KEY, PLATFORM_STRIPE_PUBLISHABLE_KEY and PLATFORM_STRIPE_WEBHOOK_SECRET are required in production: without them no creator can subscribe."
+        "PLATFORM_STRIPE_SECRET_KEY, PLATFORM_STRIPE_PUBLISHABLE_KEY and PLATFORM_STRIPE_WEBHOOK_SECRET (or BEAF's STRIPE_SECRET_KEY, STRIPE_PUBLISHABLE_KEY, STRIPE_WEBHOOK_SECRET) are required in production: without them no creator can subscribe."
       );
     }
     if (!billing.prices.monthly || !billing.prices.yearly || !billing.prices.lifetime) {
-      invalid.push("PLATFORM_PRICE_MONTHLY, PLATFORM_PRICE_YEARLY and PLATFORM_PRICE_LIFETIME are required in production.");
+      invalid.push("PLATFORM_PRICE_MONTHLY, PLATFORM_PRICE_YEARLY and PLATFORM_PRICE_LIFETIME (or STRIPE_PRICE_*) are required in production. Create them with: npm run stripe:prices");
+    }
+    if (!billing.instanceSealSecret) {
+      invalid.push("INSTANCE_SEAL_SECRET is required in production. Generate one with: openssl rand -base64 32");
     }
     if (billing.trialMinutes > 0) {
       invalid.push("TRIAL_DURATION_MINUTES is for testing. Remove it in production.");

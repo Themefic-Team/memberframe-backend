@@ -18,6 +18,8 @@ import { z } from "zod";
 import { prisma } from "../config/db.js";
 import { badRequest, ok, route } from "../middleware/errors.js";
 import { creatorAuth, requireCreator } from "../middleware/creator.js";
+import { guardEmailSend } from "../middleware/rateLimit.js";
+import { issueMagicLink, restoreMemberAccess, revokeMemberAccess } from "../services/memberAccessService.js";
 import { webhookRouter } from "./siteWebhooks.js";
 import { MEMBER_SNAPSHOT_SELECT, emitMemberEvent } from "../services/webhookService.js";
 import {
@@ -274,6 +276,79 @@ siteRouter.patch(
         metadata: applyMetadata(settings.customFields, updated.metadata, {}).metadata,
       },
     });
+  })
+);
+
+// ============================================================================
+// POST /api/site/members/:id/revoke, /restore, /magic-link
+// ============================================================================
+// Development doc 26-magic-link-and-revoke.md. Revoke ends the member's
+// subscriptions at the gateway too, so it is its own route rather than the
+// PATCH's `status: canceled`, which only changes this record.
+
+const memberActionSchema = z.object({ siteId: siteIdSchema });
+
+/** The member as the PATCH above answers it, so the panel can replace its row. */
+async function memberRecord(siteId: string, memberId: string) {
+  const member = await prisma.member.findFirstOrThrow({
+    where: { id: memberId, siteId },
+    select: { id: true, email: true, name: true, avatarUrl: true, activeTier: true, status: true, createdAt: true, metadata: true },
+  });
+  const settings = await loadSiteSettings(siteId);
+  return {
+    id: member.id,
+    email: member.email,
+    name: member.name,
+    avatarUrl: member.avatarUrl,
+    tier: member.activeTier,
+    status: member.status,
+    createdAt: member.createdAt.toISOString(),
+    lifetimeSpend: 0,
+    currency: (await loadPaymentSettings(siteId)).defaultCurrency,
+    gateway: "stripe",
+    metadata: applyMetadata(settings.customFields, member.metadata, {}).metadata,
+  };
+}
+
+siteRouter.post(
+  "/members/:id/revoke",
+  route(async (req, res) => {
+    const creator = requireCreator(req);
+    const input = memberActionSchema.parse(req.body);
+    const site = await requireOwnedSite(creator.userId, input.siteId);
+    const memberId = String(req.params["id"] ?? "");
+
+    const result = await revokeMemberAccess(site.id, memberId);
+    ok(res, { member: await memberRecord(site.id, memberId), ...result });
+  })
+);
+
+siteRouter.post(
+  "/members/:id/restore",
+  route(async (req, res) => {
+    const creator = requireCreator(req);
+    const input = memberActionSchema.parse(req.body);
+    const site = await requireOwnedSite(creator.userId, input.siteId);
+    const memberId = String(req.params["id"] ?? "");
+
+    await restoreMemberAccess(site.id, memberId);
+    ok(res, { member: await memberRecord(site.id, memberId) });
+  })
+);
+
+siteRouter.post(
+  "/members/:id/magic-link",
+  route(async (req, res) => {
+    const creator = requireCreator(req);
+    const input = memberActionSchema.parse(req.body);
+    const site = await requireOwnedSite(creator.userId, input.siteId);
+    const memberId = String(req.params["id"] ?? "");
+
+    const target = await prisma.member.findFirst({ where: { id: memberId, siteId: site.id }, select: { email: true } });
+    if (target) guardEmailSend(req, "magic_link", target.email);
+
+    const link = await issueMagicLink(site, memberId, { userAgent: "magic-link", ipAddress: req.ip });
+    ok(res, { sent: true, expiresInMinutes: link.minutes });
   })
 );
 

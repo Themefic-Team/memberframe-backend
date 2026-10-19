@@ -12,7 +12,7 @@ import { env } from "../config/env.js";
 import { isSafeSitePath } from "./siteSettings.js";
 
 /** Hosts that are the Framer editor, never a published site. */
-function isEditorHost(hostname: string): boolean {
+export function isEditorHost(hostname: string): boolean {
   return (
     hostname === "framer.com" ||
     hostname.endsWith(".framer.com") ||

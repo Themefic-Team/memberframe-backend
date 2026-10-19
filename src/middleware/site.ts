@@ -63,7 +63,7 @@ export function requireSite(req: Request): ResolvedSite {
  * so the compiler cannot promise it is an array of strings. A row edited by
  * hand in `prisma studio` is exactly how it stops being one.
  */
-function parseAllowedOrigins(value: unknown): string[] {
+export function parseAllowedOrigins(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
 
   return value

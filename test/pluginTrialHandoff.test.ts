@@ -6,6 +6,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Prisma } from "@prisma/client";
 
+// The default trial, whatever a developer's .env sets for testing: a real
+// environment variable wins over the file.
+vi.hoisted(() => {
+  process.env["TRIAL_DURATION_MINUTES"] = "0";
+  process.env["TRIAL_DURATION_DAYS"] = "7";
+});
+
 const db = vi.hoisted(() => ({
   pluginTrial: { findFirst: vi.fn(), create: vi.fn(), updateMany: vi.fn() },
   creatorAuthHandoff: { findUnique: vi.fn(), updateMany: vi.fn(), upsert: vi.fn() },

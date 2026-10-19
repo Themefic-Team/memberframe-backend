@@ -238,6 +238,20 @@ describe("after buying", () => {
     expect(member()).toMatchObject({ activeTier: "free_member" });
   });
 
+  it("keeps a revoked member revoked when the gateway's late events arrive (doc 26)", async () => {
+    // What revokeMemberAccess leaves behind: the plan ended, the member on Free and canceled.
+    Object.assign(tables["subscription"]![0]!, { status: "ended", endedAt: new Date() });
+    Object.assign(member(), { activeTier: "free_member", status: "canceled" });
+
+    await applyPaymentEvent(SITE, stripe, paymentEvent("ended", "customer.subscription.deleted", { externalId: "sub_1" }));
+    await applyPaymentEvent(SITE, stripe, paymentEvent("renewed", "invoice.paid", { externalId: "sub_1" }));
+    await applyPaymentEvent(SITE, stripe, paymentEvent("cancel_scheduled", "customer.subscription.updated", { externalId: "sub_1" }));
+    await sweepExpired();
+
+    expect(member()).toMatchObject({ activeTier: "free_member", status: "canceled" });
+    expect(tables["subscription"]![0]).toMatchObject({ status: "ended" });
+  });
+
   it("leaves a tier granted by hand alone", async () => {
     await applyPaymentEvent(SITE, stripe, paymentEvent("ended", "customer.subscription.deleted", { externalId: "sub_1" }));
     Object.assign(member(), { activeTier: "vip" }); // the creator granted VIP in the Manage tab

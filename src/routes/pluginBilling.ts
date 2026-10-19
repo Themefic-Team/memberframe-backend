@@ -14,6 +14,7 @@ import { hit } from "../middleware/rateLimit.js";
 import { requireOwnedSite } from "../services/creatorAuthService.js";
 import { PlatformBillingError } from "../lib/stripeRest.js";
 import { resolveLicense } from "../services/license/licenseService.js";
+import { issueSeal, verifySeal } from "../lib/instanceSeal.js";
 import {
   applyCoupon,
   billingPortalUrl,
@@ -65,6 +66,35 @@ pluginBillingRouter.get(
     const input = z.object({ siteId }).parse(req.query);
     const { project } = await ownedProject(req, input.siteId);
     ok(res, { license: await resolveLicense(project.siteId) });
+  })
+);
+
+/**
+ * A seal for the next component the Builder inserts (27-instance-seal.md).
+ * Only the site's owner gets one, and only for their own site.
+ */
+pluginBillingRouter.post(
+  "/instance-seal",
+  route(async (req, res) => {
+    const input = z.object({ siteId }).parse(req.body);
+    const { project } = await ownedProject(req, input.siteId);
+    const decision = hit(`instance-seal:${requireCreator(req).userId}`, 120, 60);
+    if (!decision.allowed) throw rateLimited(decision.retryAfterSeconds);
+    ok(res, { seal: issueSeal(project.siteId) });
+  })
+);
+
+/**
+ * Which of these seals were issued for this site. The plugin asks about a seal
+ * it has no record of: valid ones are adopted, the rest belong to another
+ * project and are cleared, which locks the pasted copy.
+ */
+pluginBillingRouter.post(
+  "/instance-seal/verify",
+  route(async (req, res) => {
+    const input = z.object({ siteId, seals: z.array(z.string().max(200)).max(200) }).parse(req.body);
+    const { project } = await ownedProject(req, input.siteId);
+    ok(res, { valid: input.seals.filter((seal) => verifySeal(project.siteId, seal)) });
   })
 );
 

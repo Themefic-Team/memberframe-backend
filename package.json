@@ -16,7 +16,9 @@
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:studio": "prisma studio",
-    "db:seed": "tsx scripts/seed.ts"
+    "db:seed": "tsx scripts/seed.ts",
+    "stripe:prices": "tsx scripts/stripePrices.ts",
+    "trial:reset": "tsx scripts/resetTrial.ts"
   },
   "prisma": {
     "seed": "tsx scripts/seed.ts"

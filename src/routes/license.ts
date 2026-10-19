@@ -7,6 +7,11 @@
  * one word that a visitor can see on the page anyway. A creator who strips the
  * lock out of the code file gains nothing: the member API refuses an
  * unlicensed site on its own (`middleware/license.ts`).
+ *
+ * Since 27-instance-seal.md it also says whether this copy of the component
+ * may run at all: `copied` when its seal is missing or was not signed for this
+ * site (pasted, not inserted from the Builder), `foreign` when the page is on
+ * a domain that is neither the Framer editor nor one of the site's own.
  */
 
 import { Router, type Request } from "express";
@@ -14,6 +19,9 @@ import { prisma } from "../config/db.js";
 import { notFound, ok, rateLimited, route } from "../middleware/errors.js";
 import { clientIp, hit } from "../middleware/rateLimit.js";
 import { siteLicense } from "../services/license/licenseService.js";
+import { verifySeal } from "../lib/instanceSeal.js";
+import { isEditorHost } from "../lib/siteLinks.js";
+import { originAllowed, parseAllowedOrigins } from "../middleware/site.js";
 
 export const licenseRouter = Router();
 
@@ -24,9 +32,43 @@ function limit(req: Request): void {
   if (!decision.allowed) throw rateLimited(decision.retryAfterSeconds);
 }
 
-/** The three states a component draws. Everything that is not licensed is locked. */
+/** The three license states a component draws. Everything that is not licensed is locked. */
 export function publicLicenseState(state: string): "trial" | "active" | "expired" {
   return state === "active" ? "active" : state === "trial" ? "trial" : "expired";
+}
+
+export type ComponentState = "trial" | "active" | "expired" | "copied" | "foreign";
+
+/**
+ * Whether the page asking may run this site's components: no Origin (not a
+ * browser page), an opaque one (a sandboxed canvas frame), a Framer editor
+ * host, or one of the site's own domains.
+ */
+export function originBelongs(origin: string | undefined, allowedOrigins: unknown): boolean {
+  if (origin === undefined || origin === "" || origin === "null") return true;
+  try {
+    if (isEditorHost(new URL(origin).hostname)) return true;
+  } catch {
+    return false;
+  }
+  return originAllowed(origin, parseAllowedOrigins(allowedOrigins));
+}
+
+/**
+ * What one component instance draws. A copy is refused before the license is
+ * read: "insert it from the plugin" is the message that applies, whatever the
+ * plan. `seal` is undefined for a component built before seals existed, which
+ * sends none; it is held to the license alone until the plugin seals it.
+ */
+export function componentState(input: {
+  license: string;
+  seal: string | undefined;
+  sealValid: boolean;
+  originOk: boolean;
+}): ComponentState {
+  if (!input.originOk) return "foreign";
+  if (input.seal !== undefined && !input.sealValid) return "copied";
+  return publicLicenseState(input.license);
 }
 
 licenseRouter.get(
@@ -34,11 +76,23 @@ licenseRouter.get(
   route(async (req, res) => {
     limit(req);
     const siteKey = typeof req.query["site"] === "string" ? req.query["site"].trim() : "";
-    const site = siteKey ? await prisma.site.findUnique({ where: { siteKey }, select: { id: true } }) : null;
+    const site = siteKey
+      ? await prisma.site.findUnique({ where: { siteKey }, select: { id: true, allowedOrigins: true } })
+      : null;
     if (!site) throw notFound("site_not_found");
 
+    const seal = typeof req.query["seal"] === "string" ? req.query["seal"].trim() : undefined;
     const license = await siteLicense(site.id);
+    // The answer depends on the page's origin, so a shared cache must key on it.
     res.setHeader("Cache-Control", "public, max-age=60");
-    ok(res, { state: publicLicenseState(license.state) });
+    res.setHeader("Vary", "Origin");
+    ok(res, {
+      state: componentState({
+        license: license.state,
+        seal,
+        sealValid: seal !== undefined && verifySeal(site.id, seal),
+        originOk: originBelongs(req.header("origin"), site.allowedOrigins),
+      }),
+    });
   })
 );
