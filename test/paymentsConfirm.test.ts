@@ -218,3 +218,50 @@ describe("publicApiBase, for webhook URLs while developing", () => {
     expect(publicApiBase(request({ host: "evil.example/path?x=", "x-forwarded-proto": "https" }))).toBe(env.apiBaseUrl);
   });
 });
+
+describe("connecting", () => {
+  it("proves Razorpay keys with orders and keeps going when Subscriptions is off", async () => {
+    // Orders answer, plans do not: the keys are good, the account cannot make plans.
+    const calls = stubFetch({ "/orders?count=1": { items: [] } });
+    const result = await razorpayAdapter.connect({
+      mode: "test",
+      values: { keyId: "rzp_test_abc", keySecret: "secret", webhookSecret: "hook" },
+      webhookUrl: "https://api.example.com/api/webhooks/razorpay/site/test",
+    });
+
+    expect(calls.some((url) => url.includes("/orders?count=1"))).toBe(true);
+    expect(result.options).toEqual({ subscriptionsOff: "1" });
+    expect(result.notice).toMatch(/Subscriptions is not enabled/);
+    expect(razorpayAdapter.canSell({ ...credentials("razorpay"), options: result.options }, "month", "INR")).toBe(false);
+    expect(razorpayAdapter.canSell({ ...credentials("razorpay"), options: result.options }, "lifetime", "INR")).toBe(true);
+  });
+
+  it("refuses Razorpay keys the orders call rejects", async () => {
+    vi.stubGlobal("fetch", async () => new Response(JSON.stringify({ error: { description: "bad key" } }), { status: 401 }));
+    await expect(
+      razorpayAdapter.connect({ mode: "test", values: { keyId: "rzp_test_abc", keySecret: "wrong" }, webhookUrl: "https://x/y" })
+    ).rejects.toThrow("Razorpay did not accept that Key ID and Secret.");
+  });
+
+  it("gives Lemon Squeezy a webhook secret it accepts, 40 characters at most", async () => {
+    let secret = "";
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      if (url.includes("/webhooks")) {
+        secret = JSON.parse(String(init?.body)).data.attributes.secret;
+        return new Response(JSON.stringify({ data: { id: "wh_1" } }), { status: 201 });
+      }
+      return new Response(JSON.stringify({ meta: { test_mode: true }, data: { attributes: { name: "Store", currency: "USD" } } }), { status: 200 });
+    });
+
+    const result = await lemonSqueezyAdapter.connect({
+      mode: "test",
+      values: { apiKey: "key", storeId: "1" },
+      webhookUrl: "https://api.example.com/api/webhooks/lemonsqueezy/site/test",
+    });
+
+    expect(secret.length).toBeGreaterThanOrEqual(32);
+    expect(secret.length).toBeLessThanOrEqual(40);
+    expect(result.webhookSecret).toBe(secret);
+    expect(result.webhookEndpointId).toBe("wh_1");
+  });
+});

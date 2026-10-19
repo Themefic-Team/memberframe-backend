@@ -54,6 +54,9 @@ export const RAZORPAY_EVENTS = [
  */
 const TOTAL_COUNT = { month: 120, year: 10 } as const;
 
+/** Set in a connection's options when the account cannot make plans. */
+const SUBSCRIPTIONS_OFF = "subscriptionsOff";
+
 async function razorpay(
   credentials: { keyId: string; keySecret: string },
   method: "GET" | "POST",
@@ -211,13 +214,29 @@ export const razorpayAdapter: GatewayAdapter = {
     }
     if (!keySecret) throw new GatewayError("razorpay", 400, "Paste the Key Secret.");
 
+    // Orders exist on every account, so they prove the keys. Plans belong to
+    // the Subscriptions product, which many accounts have not turned on: a
+    // refusal there says nothing about the keys.
     try {
-      await razorpay({ keyId, keySecret }, "GET", "/plans?count=1");
+      await razorpay({ keyId, keySecret }, "GET", "/orders?count=1");
     } catch (error) {
       if (error instanceof GatewayError && error.status === 401) {
         throw new GatewayError("razorpay", 400, "Razorpay did not accept that Key ID and Secret.");
       }
       throw error;
+    }
+
+    const subscriptions = await razorpay({ keyId, keySecret }, "GET", "/plans?count=1").then(
+      () => true,
+      () => false
+    );
+
+    const notices: string[] = [];
+    if (!webhookSecret) {
+      notices.push("Connected. Add the webhook in your Razorpay dashboard and paste its secret, or purchases will not unlock access.");
+    }
+    if (!subscriptions) {
+      notices.push("Subscriptions is not enabled on this Razorpay account, so only lifetime prices can be sold. Enable it in the Razorpay dashboard, then click Update keys.");
     }
 
     return {
@@ -227,10 +246,8 @@ export const razorpayAdapter: GatewayAdapter = {
       webhookEndpointId: null,
       accountName: null,
       maskedSuffix: maskedSuffix(keyId),
-      options: {},
-      notice: webhookSecret
-        ? null
-        : "Connected. Add the webhook in your Razorpay dashboard and paste its secret, or purchases will not unlock access.",
+      options: subscriptions ? {} : { [SUBSCRIPTIONS_OFF]: "1" },
+      notice: notices.length > 0 ? notices.join(" ") : null,
     };
   },
 
@@ -256,7 +273,10 @@ export const razorpayAdapter: GatewayAdapter = {
     return { externalId: planId, externalProductId: null };
   },
 
-  canSell(_credentials, _interval, currency) {
+  canSell(credentials, interval, currency) {
+    // An account without Subscriptions cannot make plans, so a monthly or
+    // yearly checkout goes to another gateway rather than failing at Razorpay.
+    if (interval !== "lifetime" && credentials.options[SUBSCRIPTIONS_OFF] === "1") return false;
     // UPI and Indian net banking are rupees only. A creator who wants other
     // currencies on Razorpay needs international payments enabled on their
     // account; until that is a setting here, INR is what Razorpay sells.

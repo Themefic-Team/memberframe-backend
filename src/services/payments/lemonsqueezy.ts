@@ -249,7 +249,9 @@ export const lemonSqueezyAdapter: GatewayAdapter = {
       options[VARIANT_OPTION[interval]] = variantId;
     }
 
-    const webhookSecret = randomBytes(24).toString("hex");
+    // Lemon Squeezy refuses a signing secret longer than 40 characters:
+    // 20 random bytes is exactly 40 hex characters, 160 bits.
+    const webhookSecret = randomBytes(20).toString("hex");
     let webhookEndpointId: string | null = null;
     let notice: string | null = null;
 
