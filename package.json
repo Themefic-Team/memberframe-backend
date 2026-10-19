@@ -15,6 +15,8 @@
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
+    "migrate": "node dist/migrate.js",
+    "start:deploy": "node dist/migrate.js && node dist/server.js",
     "db:studio": "prisma studio",
     "db:seed": "tsx scripts/seed.ts",
     "stripe:prices": "tsx scripts/stripePrices.ts",
@@ -24,13 +26,15 @@
     "seed": "tsx scripts/seed.ts"
   },
   "dependencies": {
-    "@prisma/client": "^5.22.0",
+    "@prisma/adapter-mariadb": "^6.19.3",
+    "@prisma/client": "^6.19.3",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "geoip-country": "^5.0.202610140208",
+    "mariadb": "^3.4.5",
     "nodemailer": "^10.1.0",
-    "prisma": "^5.22.0",
+    "prisma": "^6.19.3",
     "zod": "^3.24.1"
   },
   "devDependencies": {

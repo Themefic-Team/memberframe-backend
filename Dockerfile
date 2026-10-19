@@ -42,4 +42,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 
 # Apply pending migrations, then replace the shell with node so it receives
 # SIGTERM directly and the graceful shutdown in server.ts runs.
-CMD ["sh", "-c", "./node_modules/.bin/prisma migrate deploy && exec node dist/server.js"]
+# Migrations first. dist/migrate.js runs `prisma migrate deploy`, or with
+# DATABASE_DRIVER=mariadb applies them itself (for MySQL users on sha256_password).
+CMD ["sh", "-c", "node dist/migrate.js && exec node dist/server.js"]

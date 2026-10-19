@@ -12,7 +12,9 @@
  */
 
 import { PrismaClient } from "@prisma/client";
+import { PrismaMariaDb } from "@prisma/adapter-mariadb";
 import { env } from "./env.js";
+import { mysqlSettingsFromUrl } from "../lib/mysqlUrl.js";
 
 declare global {
   // eslint-disable-next-line no-var
@@ -20,16 +22,27 @@ declare global {
 }
 
 function createClient(): PrismaClient {
-  return new PrismaClient({
-    // Queries at debug level only. A query log in production writes every
-    // email address this API touches into a log file nobody is guarding.
-    log: env.isProduction
-      ? [{ emit: "stdout", level: "error" }]
-      : [
-          { emit: "stdout", level: "error" },
-          { emit: "stdout", level: "warn" },
-        ],
+  // Queries at debug level only. A query log in production writes every
+  // email address this API touches into a log file nobody is guarding.
+  const log = env.isProduction
+    ? [{ emit: "stdout" as const, level: "error" as const }]
+    : [
+        { emit: "stdout" as const, level: "error" as const },
+        { emit: "stdout" as const, level: "warn" as const },
+      ];
 
+  // DATABASE_DRIVER=mariadb: sign in through the MariaDB JavaScript driver,
+  // which supports MySQL users on sha256_password. Prisma's own engine
+  // refuses them with "Unknown authentication plugin". See env.ts.
+  if (env.database.driver === "mariadb") {
+    return new PrismaClient({
+      log,
+      adapter: new PrismaMariaDb(mysqlSettingsFromUrl(env.database.url, env.database.connectionLimit)),
+    });
+  }
+
+  return new PrismaClient({
+    log,
     datasources: {
       db: { url: databaseUrl() },
     },

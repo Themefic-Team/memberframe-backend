@@ -36,6 +36,18 @@ async function main(): Promise<void> {
         "",
         status.error ?? "No further detail.",
         "",
+        // Prisma's MySQL driver signs in with caching_sha2_password or
+        // mysql_native_password only. A user created with sha256_password is
+        // refused before any query runs, which looks like "unreachable".
+        ...(/authentication plugin/i.test(status.error ?? "")
+          ? [
+              "The MySQL user signs in with a method Prisma's engine cannot use (sha256_password).",
+              "Either set DATABASE_DRIVER=mariadb, which supports it, or as a MySQL admin run:",
+              "  ALTER USER '<user>'@'%' IDENTIFIED WITH caching_sha2_password BY '<password>';",
+              "  FLUSH PRIVILEGES;",
+              "",
+            ]
+          : []),
         "Check DATABASE_URL in .env, then run: npm run db:check",
         "",
       ].join("\n")

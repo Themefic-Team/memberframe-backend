@@ -168,6 +168,14 @@ export const env = {
         ? (process.env["DATABASE_URL"] ?? "mysql://test:test@127.0.0.1:1/memberframe_test_unused")
         : str("DATABASE_URL"),
     connectionLimit: int("DATABASE_CONNECTION_LIMIT", 0),
+    /**
+     * How the app signs in to MySQL. `prisma` is Prisma's own engine. `mariadb`
+     * goes through the MariaDB JavaScript driver (`@prisma/adapter-mariadb`),
+     * which also supports MySQL users on `sha256_password`, a login method
+     * Prisma's engine refuses ("Unknown authentication plugin"). Migrations
+     * follow the same choice: `node dist/migrate.js`.
+     */
+    driver: oneOf("DATABASE_DRIVER", ["prisma", "mariadb"] as const, "prisma"),
   },
 
   session: {
