@@ -26,10 +26,16 @@ import { ok, okEmpty, route } from "../middleware/errors.js";
 import { bearerToken, creatorAuth, requireCreator } from "../middleware/creator.js";
 import { guardEmailSend } from "../middleware/rateLimit.js";
 import {
+  attachProject,
   revokeCreatorSession,
   startConnect,
   verifyConnect,
 } from "../services/creatorAuthService.js";
+import { claimHandoff, isValidSessionId } from "../services/creatorHandoffService.js";
+import { resolveLicense } from "../services/license/licenseService.js";
+import { startTrialIfEligible } from "../services/license/trialService.js";
+import { trialStartedMail } from "../services/license/licenseMail.js";
+import { sendMail } from "../lib/mailer.js";
 import { withDefaults } from "../lib/siteSettings.js";
 import { withoutSecrets } from "../services/integrationSecrets.js";
 
@@ -126,6 +132,97 @@ connectRouter.post(
       site: result.site,
       settings: withoutSecrets(withDefaults(settings?.settings)),
       settingsVersion: settings?.version ?? 1,
+    });
+  })
+);
+
+// ============================================================================
+// GET /api/connect/handoff  (F19, 19-pro-lock-and-trial.md 2.1)
+// ============================================================================
+// The panel's poll while the creator signs in on the hosted page in a new
+// tab. "pending" until they do; then the session token, once.
+
+connectRouter.get(
+  "/handoff",
+  route(async (req, res) => {
+    const id = req.query["sessionId"];
+    if (!isValidSessionId(id)) {
+      ok(res, { status: "pending" });
+      return;
+    }
+    const claimed = await claimHandoff(id, { userAgent: req.header("user-agent"), ipAddress: req.ip });
+    if (!claimed) {
+      ok(res, { status: "pending" });
+      return;
+    }
+    ok(res, {
+      status: "ready",
+      token: claimed.token,
+      expiresAt: claimed.expiresAt.toISOString(),
+      creator: claimed.creator,
+    });
+  })
+);
+
+// ============================================================================
+// POST /api/connect/attach-project  (F19)
+// ============================================================================
+// After the hand-off: this Framer project, claimed for the signed-in creator
+// (first claim wins, as /verify), its 7-day trial started if they have never
+// had one, and its license.
+
+const attachSchema = z.object({
+  framerProjectId,
+  framerUserId: z.string().trim().max(255).nullish().transform((value) => value || null),
+  projectName: z.string().trim().max(255).default(""),
+  origins: z.array(z.string().max(2048)).max(25).optional().default([]),
+});
+
+connectRouter.post(
+  "/attach-project",
+  creatorAuth,
+  route(async (req, res) => {
+    const creator = requireCreator(req);
+    const input = attachSchema.parse(req.body);
+
+    const site = await attachProject(creator.userId, input);
+
+    if (input.framerUserId) {
+      // Best effort, and only filled once: what Framer reports is a hint for
+      // trial eligibility, never an identity (blocker B7).
+      await prisma.user.updateMany({
+        where: { id: creator.userId, framerUserId: null },
+        data: { framerUserId: input.framerUserId },
+      });
+    }
+
+    let license = await resolveLicense(site.siteId);
+    if (license.state === "none") {
+      const trial = await startTrialIfEligible({
+        userId: creator.userId,
+        email: creator.email,
+        framerUserId: input.framerUserId,
+        framerProjectId: input.framerProjectId,
+        siteId: site.siteId,
+        projectName: site.siteName,
+      });
+      if (trial.started) {
+        void sendMail(trialStartedMail(creator.email, site.siteName, trial.endsAt, creator.name));
+      }
+      license = await resolveLicense(site.siteId);
+    }
+
+    const settings = await prisma.siteSettings.findUnique({
+      where: { siteId: site.siteId },
+      select: { settings: true, version: true },
+    });
+
+    ok(res, {
+      creator: { email: creator.email, name: creator.name },
+      site,
+      settings: withoutSecrets(withDefaults(settings?.settings)),
+      settingsVersion: settings?.version ?? 1,
+      license,
     });
   })
 );

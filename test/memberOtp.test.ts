@@ -28,6 +28,7 @@ vi.mock("../src/config/db.js", () => ({
 vi.mock("../src/lib/mailer.js", () => ({
   sendMail: vi.fn().mockResolvedValue(undefined),
   otpMail: vi.fn().mockReturnValue({ to: "test@example.com", subject: "Code", text: "123456", html: "<p>123456</p>" }),
+  verifyEmailMail: vi.fn().mockReturnValue({ to: "test@example.com", subject: "Confirm", text: "123456", html: "<p>123456</p>" }),
 }));
 
 vi.mock("../src/services/settingsService.js", () => ({
@@ -69,6 +70,7 @@ describe("sendMemberOtp", () => {
   });
 
   it("generates a new OTP and returns cooldown and expiry", async () => {
+    vi.mocked(prisma.member.findFirst).mockResolvedValue({ id: "mem_1" } as any);
     vi.mocked(prisma.memberOtp.findFirst).mockResolvedValue(null);
     vi.mocked(prisma.memberOtp.updateMany).mockResolvedValue({ count: 0 });
     vi.mocked(prisma.memberOtp.create).mockResolvedValue({
@@ -98,7 +100,33 @@ describe("sendMemberOtp", () => {
     });
   });
 
+  it("sends nothing to an address with no account, and answers the same", async () => {
+    // Code sign in is for registered members only (2026-10-18), and the answer
+    // must not tell anyone whether an address has an account.
+    vi.mocked(prisma.member.findFirst).mockResolvedValue(null);
+    const { sendMail } = await import("../src/lib/mailer.js");
+
+    const result = await sendMemberOtp({ siteId: "site_1", siteName: "My Site", email: "stranger@example.com" });
+
+    expect(result).toEqual({ resendAfterSeconds: 60, expiresInSeconds: 600 });
+    expect(prisma.memberOtp.create).not.toHaveBeenCalled();
+    expect(prisma.memberOtp.updateMany).not.toHaveBeenCalled();
+    expect(sendMail).not.toHaveBeenCalled();
+  });
+
+  it("still sends an email confirmation code, which is for a member being created", async () => {
+    vi.mocked(prisma.memberOtp.findFirst).mockResolvedValue(null);
+    vi.mocked(prisma.memberOtp.updateMany).mockResolvedValue({ count: 0 });
+    vi.mocked(prisma.memberOtp.create).mockResolvedValue({} as any);
+
+    await sendMemberOtp({ siteId: "site_1", siteName: "My Site", email: "new@example.com", purpose: "verify" });
+
+    expect(prisma.member.findFirst).not.toHaveBeenCalled();
+    expect(prisma.memberOtp.create).toHaveBeenCalledTimes(1);
+  });
+
   it("enforces resend cooldown if requested too soon", async () => {
+    vi.mocked(prisma.member.findFirst).mockResolvedValue({ id: "mem_1" } as any);
     const now = new Date();
     const futureLock = new Date(now.getTime() + 45_000);
 
@@ -256,12 +284,12 @@ describe("verifyMemberOtp", () => {
     });
   });
 
-  it("verifies correct code and auto-creates member if registration allowed", async () => {
+  it("signs a registered member in with a correct code", async () => {
     const code = "123456";
     vi.mocked(prisma.memberOtp.findFirst).mockResolvedValue({
       id: "otp_1",
       siteId: "site_1",
-      email: "newmember@example.com",
+      email: "member@example.com",
       codeHash: hashToken(code),
       attempts: 0,
       expiresAt: new Date(Date.now() + 500_000),
@@ -269,44 +297,26 @@ describe("verifyMemberOtp", () => {
       consumedAt: null,
       createdAt: new Date(),
     });
-
     vi.mocked(prisma.memberOtp.update).mockResolvedValue({} as any);
+    vi.mocked(prisma.member.findFirst).mockResolvedValue({ id: "mem_1", emailVerifiedAt: null } as any);
+    vi.mocked(prisma.member.update).mockResolvedValue({ id: "mem_1", email: "member@example.com", activeTier: "free_member" } as any);
 
-    // Member does not exist yet
-    vi.mocked(prisma.member.findFirst).mockResolvedValue(null);
+    const member = await verifyMemberOtp({ siteId: "site_1", email: "member@example.com", code });
 
-    // Created member
-    vi.mocked(prisma.member.create).mockResolvedValue({
-      id: "mem_new",
-      siteId: "site_1",
-      email: "newmember@example.com",
-      name: null,
-      activeTier: "free_member",
-      status: "active",
-    } as any);
-
-    const member = await verifyMemberOtp({
-      siteId: "site_1",
-      email: "newmember@example.com",
-      code,
-    });
-
-    expect(member.id).toBe("mem_new");
-    expect(member.email).toBe("newmember@example.com");
-    expect(member.activeTier).toBe("free_member");
-    expect(prisma.member.create).toHaveBeenCalledTimes(1);
-    expect(prisma.memberOtp.update).toHaveBeenCalledWith({
-      where: { id: "otp_1" },
-      data: { consumedAt: expect.any(Date) },
-    });
+    expect(member.id).toBe("mem_1");
+    expect(prisma.member.create).not.toHaveBeenCalled();
+    // The code proves the address, so an unconfirmed member is confirmed.
+    expect(prisma.member.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "mem_1" }, data: expect.objectContaining({ emailVerifiedAt: expect.any(Date) }) })
+    );
   });
 
-  it("blocks auto-creation if allowRegistration is false", async () => {
+  it("never creates an account: an address with no member is refused like a wrong code", async () => {
     const code = "123456";
     vi.mocked(prisma.memberOtp.findFirst).mockResolvedValue({
       id: "otp_1",
       siteId: "site_1",
-      email: "newmember@example.com",
+      email: "stranger@example.com",
       codeHash: hashToken(code),
       attempts: 0,
       expiresAt: new Date(Date.now() + 500_000),
@@ -314,23 +324,13 @@ describe("verifyMemberOtp", () => {
       consumedAt: null,
       createdAt: new Date(),
     });
-
     vi.mocked(prisma.memberOtp.update).mockResolvedValue({} as any);
     vi.mocked(prisma.member.findFirst).mockResolvedValue(null);
 
-    vi.mocked(loadSiteSettings).mockResolvedValueOnce({
-      auth: { allowRegistration: false },
-    } as any);
-
-    await expect(
-      verifyMemberOtp({
-        siteId: "site_1",
-        email: "newmember@example.com",
-        code,
-      })
-    ).rejects.toMatchObject({
-      status: 403,
-      reason: "registration_closed",
+    await expect(verifyMemberOtp({ siteId: "site_1", email: "stranger@example.com", code })).rejects.toMatchObject({
+      status: 401,
+      reason: "invalid_code",
     });
+    expect(prisma.member.create).not.toHaveBeenCalled();
   });
 });

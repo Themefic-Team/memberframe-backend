@@ -32,6 +32,8 @@ export const SECRET_FIELDS: Readonly<Record<string, ReadonlyArray<string>>> = {
   github_oauth: ["clientSecret"],
   apple_oauth: ["clientSecret"],
   discord_oauth: ["clientSecret"],
+  // A site's own SMTP password, 25-custom-smtp.md.
+  custom_smtp: ["password"],
 };
 
 async function readStore(siteId: string, integrationId: string): Promise<Record<string, string>> {

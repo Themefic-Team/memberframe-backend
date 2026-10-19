@@ -64,11 +64,20 @@ model User {
   /// stays best effort until B7 is resolved.
   framerUserId String? @map("framer_user_id") @db.VarChar(255)
 
+  /// From Google sign in on the hosted account page (F19). Shown on Account.
+  avatarUrl String? @map("avatar_url") @db.VarChar(1000)
+  /// Google's stable subject id, so a changed Gmail address still finds the account.
+  googleId  String? @unique @map("google_id") @db.VarChar(255)
+  /// The creator's customer in MemberFrame's own Stripe account (F19), reused
+  /// for every plan they buy, on any of their projects.
+  stripeCustomerId String? @unique @map("stripe_customer_id") @db.VarChar(255)
+
   createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
   updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
 
   sites    Site[]
   sessions CreatorSession[]
+  handoffs CreatorAuthHandoff[]
 
   @@index([framerUserId])
   @@map("users")
@@ -126,6 +135,8 @@ model Site {
   /// FP-12
   assets          Asset[]
   outboundWebhooks OutboundWebhook[]
+  /// F19: what this project pays MemberFrame.
+  pluginSubscriptions PluginSubscription[]
 
   @@index([userId])
   @@map("sites")
@@ -492,8 +503,7 @@ model CreatorSession {
 //   bookmarks                                  FP-10
 //   organizations, seat_invites                F12
 //   metered_sessions                           FP-07
-//   plugin_trials                              F19, and its rows are never
-//                                              deleted, per PRD section 11.2
+//   (plugin_trials arrived with F19, below)
 
 // ============================================================================
 // PAYMENTS. Feature plan FP-16, backend PRD phase B3
@@ -861,4 +871,141 @@ model OutboundDelivery {
   @@index([status, nextAttemptAt])
   @@index([webhookId, createdAt])
   @@map("outbound_deliveries")
+}
+
+
+// ============================================================================
+// PLUGIN BILLING. F19, development doc 19-pro-lock-and-trial.md
+// ============================================================================
+// What a creator pays MemberFrame, as opposed to what members pay creators
+// (Subscription, Payment above). The license belongs to one Framer project;
+// the trial to one creator account and one Framer user, bound to one project.
+
+/// One 7-day trial per creator account, per email, per Framer user, and per
+/// Framer project: a match on any one of them means the trial was used.
+///
+/// No foreign keys and never deleted (PRD section 11.2): deleting an account
+/// or a site must not hand out a second trial, so these rows outlive both.
+model PluginTrial {
+  id              String  @id @default(uuid(7)) @db.Char(36)
+  userId          String  @unique @map("user_id") @db.Char(36)
+  email           String  @unique @db.VarChar(255)
+  framerUserId    String? @unique @map("framer_user_id") @db.VarChar(255)
+  framerProjectId String? @unique @map("framer_project_id") @db.VarChar(255)
+  /// The project the trial is bound to. Not unique by itself: the project id
+  /// above is the stable identity, this is the row it currently points at.
+  siteId          String  @map("site_id") @db.Char(36)
+  projectName     String  @default("") @map("project_name") @db.VarChar(255)
+
+  startedAt DateTime @map("started_at") @db.DateTime(3)
+  endsAt    DateTime @map("ends_at") @db.DateTime(3)
+  /// trialing, expired, converted
+  status    String   @default("trialing") @db.VarChar(16)
+
+  endingNotifiedAt DateTime? @map("ending_notified_at") @db.DateTime(3)
+  endedNotifiedAt  DateTime? @map("ended_notified_at") @db.DateTime(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@index([siteId])
+  @@index([status, endsAt])
+  @@map("plugin_trials")
+}
+
+/// A plan bought for one project. A project may have several rows over time
+/// (monthly, then lifetime); the newest licensed one is the current plan.
+model PluginSubscription {
+  id     String @id @default(uuid(7)) @db.Char(36)
+  siteId String @map("site_id") @db.Char(36)
+  userId String @map("user_id") @db.Char(36)
+
+  /// monthly, yearly, lifetime
+  plan   String @db.VarChar(16)
+  /// incomplete, active, past_due, canceling, canceled, expired, paid (lifetime)
+  status String @db.VarChar(16)
+
+  stripeSubscriptionId  String? @unique @map("stripe_subscription_id") @db.VarChar(255)
+  stripePaymentIntentId String? @unique @map("stripe_payment_intent_id") @db.VarChar(255)
+  stripePriceId         String? @map("stripe_price_id") @db.VarChar(255)
+
+  /// Integer minor units, like every other amount in this schema.
+  amountMinor Int    @map("amount_minor")
+  currency    String @db.VarChar(3)
+
+  startedAt          DateTime? @map("started_at") @db.DateTime(3)
+  currentPeriodStart DateTime? @map("current_period_start") @db.DateTime(3)
+  currentPeriodEnd   DateTime? @map("current_period_end") @db.DateTime(3)
+  cancelAtPeriodEnd  Boolean   @default(false) @map("cancel_at_period_end")
+  canceledAt         DateTime? @map("canceled_at") @db.DateTime(3)
+  cancelReason       String?   @map("cancel_reason") @db.VarChar(500)
+
+  /// The period end a renewal reminder was sent for, so each renewal is
+  /// announced once.
+  renewalNotifiedFor DateTime? @map("renewal_notified_for") @db.DateTime(3)
+  expiredNotifiedAt  DateTime? @map("expired_notified_at") @db.DateTime(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
+
+  site     Site            @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  payments PluginPayment[]
+
+  @@index([siteId, createdAt])
+  @@index([status, currentPeriodEnd])
+  @@map("plugin_subscriptions")
+}
+
+/// Money received for a plan: the first payment, each renewal, an upgrade, or
+/// a lifetime purchase. `creditMinor` is the unused time of the previous plan
+/// taken off an upgrade.
+model PluginPayment {
+  id             String @id @default(uuid(7)) @db.Char(36)
+  subscriptionId String @map("subscription_id") @db.Char(36)
+
+  /// initial, renewal, upgrade, lifetime
+  kind        String @db.VarChar(16)
+  amountMinor Int    @map("amount_minor")
+  creditMinor Int    @default(0) @map("credit_minor")
+  currency    String @db.VarChar(3)
+
+  stripeInvoiceId       String? @unique @map("stripe_invoice_id") @db.VarChar(255)
+  stripePaymentIntentId String? @unique @map("stripe_payment_intent_id") @db.VarChar(255)
+
+  paidAt    DateTime @map("paid_at") @db.DateTime(3)
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  subscription PluginSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([subscriptionId, paidAt])
+  @@map("plugin_payments")
+}
+
+/// Each event from MemberFrame's own Stripe account, recorded once, so a
+/// redelivered event changes nothing.
+model PlatformWebhookEvent {
+  id            String   @id @default(uuid(7)) @db.Char(36)
+  stripeEventId String   @unique @map("stripe_event_id") @db.VarChar(255)
+  type          String   @db.VarChar(80)
+  createdAt     DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@map("platform_webhook_events")
+}
+
+/// The hosted account page's hand-off to the plugin panel. The panel makes a
+/// random session id, opens the page in a new tab with it, and polls; when the
+/// creator signs in, this row is written, and the panel's next poll turns it
+/// into a CreatorSession token, once. Stored, not held in memory as BEAF did,
+/// so a restart or a second server loses nothing.
+model CreatorAuthHandoff {
+  id            String    @id @default(uuid(7)) @db.Char(36)
+  sessionIdHash String    @unique @map("session_id_hash") @db.VarChar(255)
+  userId        String    @map("user_id") @db.Char(36)
+  expiresAt     DateTime  @map("expires_at") @db.DateTime(3)
+  consumedAt    DateTime? @map("consumed_at") @db.DateTime(3)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.DateTime(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@map("creator_auth_handoffs")
 }

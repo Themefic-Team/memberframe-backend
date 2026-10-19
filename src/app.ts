@@ -5,6 +5,7 @@
  * port. `server.ts` is the only file that calls `listen`.
  */
 
+import path from "node:path";
 import express, { type Express } from "express";
 import cookieParser from "cookie-parser";
 import { env } from "./config/env.js";
@@ -17,6 +18,12 @@ import { connectRouter } from "./routes/connect.js";
 import { siteRouter } from "./routes/site.js";
 import { previewRouter } from "./routes/preview.js";
 import { reportsRouter } from "./routes/reports.js";
+import { emailRouter } from "./routes/email.js";
+import { licenseRouter } from "./routes/license.js";
+import { pluginBillingRouter } from "./routes/pluginBilling.js";
+import { accountRouter, authPageRouter } from "./routes/creatorAccount.js";
+import { handlePlatformWebhook } from "./services/license/platformWebhook.js";
+import { requireActiveLicense } from "./middleware/license.js";
 import { handleShieldScript } from "./routes/shield.js";
 import {
   billingRouter,
@@ -48,6 +55,9 @@ export function createApp(): Express {
   // Gateway webhooks, before the JSON parser: the signature is over the exact
   // bytes the gateway sent, and parsing them first would lose those bytes.
   // Their own limit, because a gateway event can be a few tens of kilobytes.
+  // MemberFrame's own Stripe account (F19), same reason: raw bytes first.
+  app.post("/api/webhooks/platform/stripe", express.raw({ type: "*/*", limit: "1mb" }), handlePlatformWebhook);
+
   app.post(
     "/api/webhooks/:gateway/:siteId/:mode",
     express.raw({ type: "*/*", limit: "1mb" }),
@@ -78,6 +88,15 @@ export function createApp(): Express {
   // Framer canvas origin no site allowlists. Mounted whole, ahead of the
   // site check. Reasoning in routes/preview.ts.
   app.use("/api/preview", pluginCors, previewRouter);
+  // What a canvas component reads to draw the trial mark or the lock (F19).
+  // Public and read-only, for the same reasons as the preview.
+  app.use("/api/license", pluginCors, licenseRouter);
+  // The hosted account page the plugin opens in a new tab, and its API (F19).
+  // Same origin as the page, so neither needs CORS.
+  // The account page's icon and the mail images (F19), public and cacheable.
+  app.use("/assets", express.static(path.join(process.cwd(), "assets"), { maxAge: "7d", index: false }));
+  app.use(authPageRouter);
+  app.use("/api/account", accountRouter);
 
   // Preflight for the member half, which needs a site, because an OPTIONS
   // request carries neither a cookie nor the custom header.
@@ -134,14 +153,17 @@ export function createApp(): Express {
   // would be one `router.use` away from a route that forgot.
 
   // The member's own billing, FP-16, ahead of the general member routes.
-  app.use("/api/member/billing", resolveSite, billingRouter);
+  //
+  // `requireActiveLicense` after each: a project whose MemberFrame trial or
+  // plan has ended is refused here too, not only blurred on the page (F19).
+  app.use("/api/member/billing", resolveSite, requireActiveLicense, billingRouter);
   // Bookmarks and the reading meter, FP-10 and FP-07.
-  app.use("/api/member/bookmarks", resolveSite, bookmarksRouter);
-  app.use("/api/member/meter", resolveSite, meterRouter);
-  app.use("/api/member", resolveSite, memberRouter);
+  app.use("/api/member/bookmarks", resolveSite, requireActiveLicense, bookmarksRouter);
+  app.use("/api/member/meter", resolveSite, requireActiveLicense, meterRouter);
+  app.use("/api/member", resolveSite, requireActiveLicense, memberRouter);
 
   // Pricing and checkout for the published site, FP-16. Same tenant check.
-  app.use("/api/checkout", resolveSite, checkoutRouter);
+  app.use("/api/checkout", resolveSite, requireActiveLicense, checkoutRouter);
 
   // The Razorpay bridge page. A plain navigation, so no origin and no site
   // header: the checkout id in the path is what scopes it.
@@ -151,7 +173,7 @@ export function createApp(): Express {
   // origin and no site header, so it is mounted before the site check and its
   // signed token is what scopes it. The rest needs a resolved site.
   app.get("/api/assets/download/:token", handleAssetDownload);
-  app.use("/api/assets", resolveSite, assetsRouter);
+  app.use("/api/assets", resolveSite, requireActiveLicense, assetsRouter);
 
   // ------------------------------------------------------------------------
   // The plugin panel
@@ -163,9 +185,13 @@ export function createApp(): Express {
   // the member list to anyone who viewed the page source.
 
   app.use("/api/connect", connectRouter);
+  // MemberFrame's own plans, F19: license, checkout, upgrade, cancel, portal.
+  app.use("/api/plugin", pluginCors, pluginBillingRouter);
   app.use("/api/site/payments", paymentsRouter);
   // Reports, read only (24-reports.md).
   app.use("/api/site/reports", reportsRouter);
+  // A site's own SMTP: status and test send (25-custom-smtp.md).
+  app.use("/api/site/email", emailRouter);
   app.use("/api/site/assets", assetsCreatorRouter);
   app.use("/api/site", siteRouter);
 

@@ -11,6 +11,11 @@
  *
  * `smtp` sends through nodemailer.
  *
+ * A site may also have its own SMTP server (25-custom-smtp.md). A member email
+ * for that site goes through it first, logged as driver `site_smtp`; if that
+ * send fails, the same email goes out through the platform sender above, so a
+ * member is never locked out by a creator's broken mail settings.
+ *
  * Every attempt is recorded in `email_logs` either way, with the subject and
  * the recipient and NEVER the body. A reset link sitting in a database row is a
  * reset link any operator can use, and the point of a single-use token is that
@@ -23,12 +28,26 @@ import nodemailer, { type Transporter } from "nodemailer";
 import { env } from "../config/env.js";
 import { prisma } from "../config/db.js";
 import { renderEmail } from "./emailLayout.js";
+import { customerMail } from "./frameficMail.js";
+import {
+  SITE_SMTP_ID,
+  fromHeader,
+  readSiteSmtp,
+  resolveMailHost,
+  shortError,
+  transportOptions,
+  type SiteSmtpConfig,
+} from "./siteSmtp.js";
+import { loadSiteSettings } from "../services/settingsService.js";
+import { readIntegrationSecret } from "../services/integrationSecrets.js";
 
 export interface Mail {
   to: string;
   subject: string;
   text: string;
   html?: string;
+  /** Images the HTML references as cid:..., such as the Framefic logo (F19 mail design). */
+  attachments?: ReadonlyArray<{ filename: string; path: string; cid: string }>;
   /** For the log, so a row says what kind of message it was. */
   template: string;
   siteId?: string | null;
@@ -79,10 +98,89 @@ function smtpTransport(): Transporter {
  * So the caller gets a result it can log and ignore.
  */
 export async function sendMail(mail: Mail): Promise<MailResult> {
+  if (mail.siteId) {
+    const sender = await loadSiteSender(mail.siteId);
+    if (sender) {
+      const own = await sendViaSite(mail, sender);
+      await recordAttempt(mail, own, SITE_SMTP_DRIVER);
+      if (own.sent) return own;
+      process.stderr.write(`[mail] site SMTP failed for ${mail.template}, using the platform sender: ${own.error}\n`);
+    }
+  }
+
   const result =
     env.mail.driver === "smtp" ? await sendViaSmtp(mail) : await sendViaLog(mail);
 
-  await recordAttempt(mail, result);
+  await recordAttempt(mail, result, env.mail.driver);
+  return result;
+}
+
+/** How a send through a site's own SMTP is logged in `email_logs.driver`. */
+export const SITE_SMTP_DRIVER = "site_smtp";
+
+interface SiteSender {
+  config: SiteSmtpConfig;
+  password: string;
+}
+
+/**
+ * The site's own SMTP, when it is on and complete. Null otherwise, and null on
+ * any error reading it: a settings problem must cost the member nothing, since
+ * the platform sender is always there to fall back on.
+ */
+export async function loadSiteSender(siteId: string): Promise<SiteSender | null> {
+  try {
+    const settings = await loadSiteSettings(siteId);
+    const entry = settings.integrations[SITE_SMTP_ID];
+    if (!entry || !entry.enabled) return null;
+
+    const config = readSiteSmtp(entry.values, env.mail.siteSmtpAllowPrivate);
+    if (!config) return null;
+
+    const password = await readIntegrationSecret(siteId, SITE_SMTP_ID, "password", entry.values);
+    if (config.username !== "" && password === "") return null;
+    return { config, password };
+  } catch {
+    return null;
+  }
+}
+
+async function sendViaSite(mail: Mail, sender: SiteSender): Promise<MailResult> {
+  try {
+    const address = await resolveMailHost(sender.config.host, env.mail.siteSmtpAllowPrivate);
+    const transport = nodemailer.createTransport(transportOptions(sender.config, sender.password, address));
+    try {
+      const info = await transport.sendMail({
+        from: fromHeader(sender.config),
+        replyTo: sender.config.replyTo !== "" ? sender.config.replyTo : undefined,
+        to: mail.to,
+        subject: mail.subject,
+        text: mail.text,
+        html: mail.html,
+        attachments: mail.attachments ? [...mail.attachments] : undefined,
+      });
+      return { sent: true, messageId: info.messageId ?? null };
+    } finally {
+      transport.close();
+    }
+  } catch (error) {
+    return { sent: false, messageId: null, error: shortError(error) };
+  }
+}
+
+/**
+ * Send through the site's own SMTP only, with no fallback. For the panel's
+ * test button: a test that quietly succeeded through the platform sender would
+ * tell the creator their settings work when they do not.
+ */
+export async function sendWithSiteSmtp(siteId: string, mail: Mail): Promise<MailResult> {
+  const sender = await loadSiteSender(siteId);
+  if (!sender) {
+    return { sent: false, messageId: null, error: "Custom SMTP is off or incomplete. Turn it on and save it first." };
+  }
+
+  const result = await sendViaSite(mail, sender);
+  await recordAttempt({ ...mail, siteId }, result, SITE_SMTP_DRIVER);
   return result;
 }
 
@@ -94,6 +192,7 @@ async function sendViaSmtp(mail: Mail): Promise<MailResult> {
       subject: mail.subject,
       text: mail.text,
       html: mail.html,
+      attachments: mail.attachments ? [...mail.attachments] : undefined,
     });
 
     return { sent: true, messageId: info.messageId ?? null };
@@ -154,7 +253,7 @@ async function sendViaLog(mail: Mail): Promise<MailResult> {
  * Wrapped in its own try/catch: a logging failure must not become the caller's
  * problem. If the mail went out and the row did not, the member is still served.
  */
-async function recordAttempt(mail: Mail, result: MailResult): Promise<void> {
+async function recordAttempt(mail: Mail, result: MailResult, driver: string): Promise<void> {
   try {
     await prisma.emailLog.create({
       data: {
@@ -162,7 +261,7 @@ async function recordAttempt(mail: Mail, result: MailResult): Promise<void> {
         toAddress: mail.to,
         subject: mail.subject,
         template: mail.template,
-        driver: env.mail.driver,
+        driver,
         messageId: result.messageId,
         sentAt: result.sent ? new Date() : null,
         error: result.error ?? null,
@@ -327,6 +426,72 @@ export function passwordChangedMail(to: string, siteName: string, siteId: string
       safety: "If it was not you, reset the password again now and contact the site owner.",
     }),
   };
+}
+
+/** The panel's Send test email, through the site's own SMTP. */
+export function smtpTestMail(to: string, siteName: string, siteId: string): Mail {
+  const brand = brandOf(siteName);
+
+  return {
+    to,
+    siteId,
+    template: "site_smtp_test",
+    subject: `Test email from ${brand}`,
+    text: [
+      `This is a test email from ${brand}, sent through your own SMTP server.`,
+      "",
+      "If you can read this, your members' sign-in codes and reset links will arrive the same way.",
+    ].join("\n"),
+    html: renderEmail({
+      brand,
+      preheader: "Your SMTP settings work.",
+      heading: "Your SMTP settings work",
+      intro: [
+        `This is a test email from ${brand}, sent through your own SMTP server.`,
+        "Your members' sign-in codes and reset links will arrive the same way.",
+      ],
+      safety: "Sent from the MemberFrame plugin's Send test email button. If you did not ask for it, you can ignore it.",
+    }),
+  };
+}
+
+/**
+ * The hosted account page's code (F19), in Framefic's design: BEAF's
+ * `signup-mail.html` for sign up and sign in, `mail.html` for a reset.
+ */
+export type AccountCodePurpose = "signin" | "signup" | "reset";
+
+export function accountCodeMail(to: string, code: string, purpose: AccountCodePurpose = "signin", name = "there"): Mail {
+  const minutes = Math.round(env.otp.ttlSeconds / 60);
+  const expiry = `This code expires in **${minutes} minutes**.`;
+  if (purpose === "reset") {
+    return customerMail(to, "creator_account_reset", "Reset your MemberFrame password", {
+      heading: "Reset your password",
+      subheading: "Verify your identity to continue",
+      greetingName: name,
+      paragraphs: [`Use the code below to reset your **MemberFrame** account password. ${expiry}`],
+      code,
+      footnote: "Didn't request this? You can safely ignore this email - your account remains unchanged.",
+    });
+  }
+  if (purpose === "signup") {
+    return customerMail(to, "creator_account_signup", "Verify your MemberFrame account email", {
+      heading: "Verify your email",
+      subheading: "Confirm your email to complete registration",
+      greetingName: name,
+      paragraphs: [`Use the code below to complete your sign up for your **MemberFrame** account. ${expiry}`],
+      code,
+      footnote: "Didn't request this? You can safely ignore this email - no account will be created.",
+    });
+  }
+  return customerMail(to, "creator_account_code", "Your MemberFrame sign-in code", {
+    heading: "Your sign-in code",
+    subheading: "Sign in to continue in Framer",
+    greetingName: name,
+    paragraphs: [`Use the code below to sign in to your **MemberFrame** account. ${expiry}`],
+    code,
+    footnote: "Didn't request this? You can safely ignore this email.",
+  });
 }
 
 /**

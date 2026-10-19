@@ -457,9 +457,28 @@ export type SendMemberOtpResult = {
   expiresInSeconds: number;
 };
 
+/**
+ * Send a code. For sign in, only to a member who already has an account:
+ * code sign in signs members in, it does not make them (2026-10-18). An
+ * address with no account gets the same answer and no code, and nothing is
+ * written, so the form cannot be used to find out who is a member, the same
+ * rule as the password reset ("if this address has an account").
+ */
 export async function sendMemberOtp(input: SendMemberOtpInput): Promise<SendMemberOtpResult> {
   const email = normalizeEmail(input.email);
   const now = new Date();
+  const silent: SendMemberOtpResult = {
+    resendAfterSeconds: env.otp.resendLockSeconds,
+    expiresInSeconds: env.otp.ttlSeconds,
+  };
+
+  if (input.purpose !== "verify") {
+    const member = await prisma.member.findFirst({
+      where: { siteId: input.siteId, email, deletedAt: null },
+      select: { id: true },
+    });
+    if (!member) return silent;
+  }
 
   const outstanding = await prisma.memberOtp.findFirst({
     where: {
@@ -557,54 +576,36 @@ async function consumeOtp(siteId: string, email: string, code: string, now: Date
   await prisma.memberOtp.update({ where: { id: otp.id }, data: { consumedAt: now } });
 }
 
+/**
+ * Sign a registered member in with their code. Never creates an account
+ * (2026-10-18): an address with no member is refused as `invalid_code`, the
+ * answer a wrong code gets, so this cannot list members either. A code proves
+ * the address, so an unconfirmed member is confirmed by it.
+ */
 export async function verifyMemberOtp(input: VerifyMemberOtpInput): Promise<AuthenticatedMember> {
   const email = normalizeEmail(input.email);
   const now = new Date();
 
   await consumeOtp(input.siteId, email, input.code, now);
 
-  // Find or create member
   // `emailVerifiedAt` is selected here and nowhere it would leave the service,
   // so an existing verification date is kept rather than reset on every login.
   const existing = await prisma.member.findFirst({
     where: { siteId: input.siteId, email, deletedAt: null },
     select: { id: true, emailVerifiedAt: true },
   });
+  if (!existing) throw unauthorized("invalid_code");
 
-  let member;
-  if (!existing) {
-    const settings = await loadSiteSettings(input.siteId);
-    if (!settings.auth.allowRegistration) {
-      throw forbidden("registration_closed");
-    }
-
-    member = await prisma.member.create({
-      data: {
-        siteId: input.siteId,
-        email,
-        emailVerifiedAt: now,
-        activeTier: await freeTierKey(input.siteId),
-        status: "active",
-        lastLoginAt: now,
-      },
-      select: SAFE_MEMBER_FIELDS,
-    });
-    // An email code proves the address, so a new account is confirmed at once.
-    void emitMemberEvent("member.created", { id: member.id, siteId: input.siteId });
-  } else {
-    member = await prisma.member.update({
-      where: { id: existing.id },
-      data: {
-        lastLoginAt: now,
-        emailVerifiedAt: existing.emailVerifiedAt ?? now,
-        failedLoginCount: 0,
-        lockedUntil: null,
-      },
-      select: SAFE_MEMBER_FIELDS,
-    });
-  }
-
-  return member;
+  return prisma.member.update({
+    where: { id: existing.id },
+    data: {
+      lastLoginAt: now,
+      emailVerifiedAt: existing.emailVerifiedAt ?? now,
+      failedLoginCount: 0,
+      lockedUntil: null,
+    },
+    select: SAFE_MEMBER_FIELDS,
+  });
 }
 
 // ============================================================================

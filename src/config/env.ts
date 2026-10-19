@@ -153,6 +153,13 @@ export const env = {
     secure: bool("MAIL_SECURE", false),
     user: process.env["MAIL_USER"] ?? "",
     password: process.env["MAIL_PASSWORD"] ?? "",
+    /**
+     * Whether a site's own SMTP host may be a private address or use any port
+     * (25-custom-smtp.md section 3.1). On outside production, so a developer
+     * can point a site at Mailpit; off in production, where it would let a
+     * creator probe the platform's own network.
+     */
+    siteSmtpAllowPrivate: bool("SITE_SMTP_ALLOW_PRIVATE_HOSTS", nodeEnv !== "production"),
   },
 
   passwordReset: {
@@ -220,6 +227,46 @@ export const env = {
     },
   },
 
+  /**
+   * F19: what creators pay MemberFrame (19-pro-lock-and-trial.md). MemberFrame's
+   * own Stripe account, entirely separate from the creators' gateway keys in
+   * `payments` above, which take their members' money.
+   */
+  billing: {
+    stripeSecretKey: process.env["PLATFORM_STRIPE_SECRET_KEY"] ?? "",
+    stripePublishableKey: process.env["PLATFORM_STRIPE_PUBLISHABLE_KEY"] ?? "",
+    stripeWebhookSecret: process.env["PLATFORM_STRIPE_WEBHOOK_SECRET"] ?? "",
+    /** Stripe price ids. The amounts shown in the panel are read from Stripe. */
+    prices: {
+      monthly: process.env["PLATFORM_PRICE_MONTHLY"] ?? "",
+      yearly: process.env["PLATFORM_PRICE_YEARLY"] ?? "",
+      lifetime: process.env["PLATFORM_PRICE_LIFETIME"] ?? "",
+    },
+    /** How many lifetime plans are sold before the offer closes. BEAF: 20. */
+    lifetimeMax: int("LIFETIME_MAX", 20),
+    trialDays: int("TRIAL_DURATION_DAYS", 7),
+    /** Testing only: a trial this many minutes long instead. 0 means use days. */
+    trialMinutes: int("TRIAL_DURATION_MINUTES", 0),
+    /** Where Stripe's billing portal sends the creator back to. */
+    returnUrl: str("BILLING_RETURN_URL", "https://framer.com/projects"),
+    /** BEAF's team notices. Empty sends none. */
+    teamEmail: process.env["TEAM_NOTIFICATION_EMAIL"] ?? "",
+    /**
+     * Whether an unlicensed site is refused on the member API (402
+     * license_inactive). On everywhere but unit tests, whose member route tests
+     * predate F19 and mock no license.
+     */
+    enforce: bool("LICENSE_ENFORCEMENT", nodeEnv !== "test"),
+    /** How often the trial and renewal job runs, in seconds. */
+    jobSeconds: int("LICENSE_JOB_SECONDS", 3600),
+    /**
+     * Google sign in on the hosted account page (F19). MemberFrame's own OAuth
+     * client, not a site's. Empty hides the Google button.
+     */
+    googleClientId: process.env["CREATOR_GOOGLE_CLIENT_ID"] ?? "",
+    googleClientSecret: process.env["CREATOR_GOOGLE_CLIENT_SECRET"] ?? "",
+  },
+
   rateLimit: {
     windowSeconds: int("RATE_LIMIT_WINDOW_SECONDS", 900),
     maxPerEmail: int("RATE_LIMIT_MAX_PER_EMAIL", 5),
@@ -267,6 +314,19 @@ function crossChecks(): void {
 
     if (env.payments.encryptionKey === "") {
       invalid.push("PAYMENTS_ENCRYPTION_KEY is required in production. Generate one with: openssl rand -base64 32");
+    }
+
+    const billing = env.billing;
+    if (!billing.stripeSecretKey || !billing.stripePublishableKey || !billing.stripeWebhookSecret) {
+      invalid.push(
+        "PLATFORM_STRIPE_SECRET_KEY, PLATFORM_STRIPE_PUBLISHABLE_KEY and PLATFORM_STRIPE_WEBHOOK_SECRET are required in production: without them no creator can subscribe."
+      );
+    }
+    if (!billing.prices.monthly || !billing.prices.yearly || !billing.prices.lifetime) {
+      invalid.push("PLATFORM_PRICE_MONTHLY, PLATFORM_PRICE_YEARLY and PLATFORM_PRICE_LIFETIME are required in production.");
+    }
+    if (billing.trialMinutes > 0) {
+      invalid.push("TRIAL_DURATION_MINUTES is for testing. Remove it in production.");
     }
 
     if (env.session.crossSite && !env.apiBaseUrl.startsWith("https://")) {

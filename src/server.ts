@@ -12,6 +12,7 @@ import { checkDatabase, disconnectDatabase } from "./config/db.js";
 import { sweepExpired } from "./services/payments/apply.js";
 import { migratePlaintextIntegrationSecrets } from "./services/integrationSecrets.js";
 import { deliverDue } from "./services/webhookService.js";
+import { runLicenseJob } from "./services/license/licenseJobs.js";
 
 async function main(): Promise<void> {
   let status = await checkDatabase();
@@ -112,6 +113,25 @@ async function main(): Promise<void> {
   const webhookWorker = setInterval(() => void deliverDue(), 15_000);
   webhookWorker.unref();
   void deliverDue();
+
+  // F19: expire trials, and send the trial and renewal reminders, hourly and
+  // once at start, as BEAF's trial monitor did.
+  const runLicenses = (): void => {
+    void runLicenseJob().then(
+      (done) => {
+        const total = done.trialsEnded + done.trialsWarned + done.renewalsWarned + done.plansExpired;
+        if (total > 0) process.stdout.write(`[license] ${JSON.stringify(done)}
+`);
+      },
+      (error: unknown) => {
+        process.stderr.write(`[license] job failed: ${error instanceof Error ? error.message : String(error)}
+`);
+      }
+    );
+  };
+  const licenseWorker = setInterval(runLicenses, Math.max(60, env.billing.jobSeconds) * 1000);
+  licenseWorker.unref();
+  runLicenses();
 
   // Shut down in order: stop accepting connections, finish what is in flight,
   // then release the MySQL pool. Exiting without the last leaves connections

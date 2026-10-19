@@ -38,7 +38,7 @@ import { prisma } from "../config/db.js";
 import { FREE_TIER_RANK, NEW_FREE_TIER_KEY } from "../lib/tiers.js";
 import { env } from "../config/env.js";
 import { badRequest, forbidden, notFound, unauthorized } from "../middleware/errors.js";
-import { creatorCodeMail, sendMail } from "../lib/mailer.js";
+import { accountCodeMail, creatorCodeMail, sendMail, type AccountCodePurpose } from "../lib/mailer.js";
 import {
   expiryFrom,
   generateGrantSalt,
@@ -57,7 +57,19 @@ export const CREATOR_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 export interface StartConnectInput {
   email: string;
   framerProjectId: string;
+  /**
+   * Which email to send. `connect` is the panel's own code form; `account`
+   * is the hosted account page opened in a browser tab (F19), whose codes are
+   * scoped to `ACCOUNT_CODE_SCOPE` rather than to a project.
+   */
+  purpose?: "connect" | "account";
+  /** For an account page code: which email (sign in, sign up, or reset), and who to greet. */
+  accountPurpose?: AccountCodePurpose;
+  name?: string;
 }
+
+/** The `framerProjectId` a hosted account page code is stored under. */
+export const ACCOUNT_CODE_SCOPE = "account";
 
 /**
  * Send the code. Always succeeds, from the caller's point of view.
@@ -117,7 +129,7 @@ export async function startConnect(input: StartConnectInput): Promise<void> {
   // That is right here. If SMTP is down, telling the creator "we could not
   // send" is useful, but failing the request after the code is already stored
   // would leave a usable code with no way to learn it.
-  await sendMail(creatorCodeMail(email, code));
+  await sendMail(input.purpose === "account" ? accountCodeMail(email, code, input.accountPurpose, input.name || "there") : creatorCodeMail(email, code));
 }
 
 export interface VerifyConnectInput {
@@ -158,8 +170,29 @@ export async function verifyConnect(input: VerifyConnectInput): Promise<VerifyCo
   const email = input.email.trim().toLowerCase();
   const now = new Date();
 
+  await consumeCreatorCode(email, input.code, input.framerProjectId, now);
+
+  // ------------------------------------------------------------------------
+  // The address is proven. Everything below is ordinary bookkeeping.
+  // ------------------------------------------------------------------------
+
+  const user = await findOrCreateCreator(email, input.creatorName, now);
+  const site = await attachProject(user.id, input);
+  const session = await issueCreatorSession(user.id, input, now);
+
+  return { ...session, user, site };
+}
+
+/**
+ * Check a creator's six-digit code and spend it, or throw `invalid_code`.
+ *
+ * The order is deliberate and it is the whole of the authorization story:
+ * nothing below the code check reads or writes a site. A wrong code returns
+ * before `framerProjectId` has been used for anything at all.
+ */
+export async function consumeCreatorCode(email: string, code: string, framerProjectId: string, now: Date = new Date()): Promise<void> {
   const otp = await prisma.creatorOtp.findFirst({
-    where: { email, framerProjectId: input.framerProjectId, consumedAt: null },
+    where: { email, framerProjectId, consumedAt: null },
     orderBy: { createdAt: "desc" },
   });
 
@@ -175,7 +208,7 @@ export async function verifyConnect(input: VerifyConnectInput): Promise<VerifyCo
     throw unauthorized("invalid_code");
   }
 
-  if (!tokensMatch(otp.codeHash, hashToken(input.code.trim()))) {
+  if (!tokensMatch(otp.codeHash, hashToken(code.trim()))) {
     await prisma.creatorOtp.update({
       where: { id: otp.id },
       data: { attempts: { increment: 1 } },
@@ -184,41 +217,56 @@ export async function verifyConnect(input: VerifyConnectInput): Promise<VerifyCo
   }
 
   await prisma.creatorOtp.update({ where: { id: otp.id }, data: { consumedAt: now } });
+}
 
-  // ------------------------------------------------------------------------
-  // The address is proven. Everything below is ordinary bookkeeping.
-  // ------------------------------------------------------------------------
-
-  // Find, then create. Not an upsert with an empty update branch: an existing
-  // creator's name is theirs, and overwriting it with whatever Framer reports
-  // on this machine would silently rename them every reconnect.
+/**
+ * The creator behind a proven address, made if new.
+ *
+ * Find, then create. Not an upsert with an empty update branch: an existing
+ * creator's name is theirs, and overwriting it with whatever Framer reports
+ * on this machine would silently rename them every reconnect.
+ */
+export async function findOrCreateCreator(
+  email: string,
+  name: string | null | undefined,
+  now: Date = new Date(),
+  extra: { passwordHash?: string; googleId?: string; avatarUrl?: string } = {}
+): Promise<{ id: string; email: string; name: string }> {
   const found = await prisma.user.findUnique({
     where: { email },
     select: { id: true, email: true, name: true },
   });
+  if (found) return found;
 
-  const user =
-    found ??
-    (await prisma.user.create({
-      data: {
-        email,
-        name: input.creatorName?.trim() || email.split("@")[0] || "Creator",
-        emailVerifiedAt: now,
-        passwordHash: null,
-      },
-      select: { id: true, email: true, name: true },
-    }));
+  return prisma.user.create({
+    data: {
+      email,
+      name: name?.trim() || email.split("@")[0] || "Creator",
+      emailVerifiedAt: now,
+      passwordHash: extra.passwordHash ?? null,
+      googleId: extra.googleId ?? null,
+      avatarUrl: extra.avatarUrl ?? null,
+    },
+    select: { id: true, email: true, name: true },
+  });
+}
 
+/**
+ * Find or claim this Framer project for a creator.
+ *
+ * First claim wins. See the header note: there is no transfer flow, and
+ * inventing one here would be a product decision made in a service file.
+ */
+export async function attachProject(
+  userId: string,
+  input: { framerProjectId: string; projectName: string; origins: ReadonlyArray<string> }
+): Promise<ConnectedSite> {
   const existing = await prisma.site.findUnique({
     where: { framerSiteId: input.framerProjectId },
     select: { id: true, userId: true, siteKey: true, siteName: true, allowedOrigins: true },
   });
 
-  if (existing && existing.userId !== user.id) {
-    // First claim wins. See the header note: there is no transfer flow, and
-    // inventing one here would be a product decision made in a service file.
-    throw forbidden("project_claimed_by_another_account");
-  }
+  if (existing && existing.userId !== userId) throw forbidden("project_claimed_by_another_account");
 
   const origins = normalizeOrigins(input.origins);
 
@@ -233,32 +281,37 @@ export async function verifyConnect(input: VerifyConnectInput): Promise<VerifyCo
         },
         select: { id: true, siteKey: true, siteName: true, allowedOrigins: true },
       })
-    : await createSite(user.id, input, origins);
+    : await createSite(userId, input, origins);
 
+  return {
+    siteId: site.id,
+    siteKey: site.siteKey,
+    siteName: site.siteName,
+    framerProjectId: input.framerProjectId,
+    allowedOrigins: readOrigins(site.allowedOrigins),
+  };
+}
+
+/** A new bearer token for the panel. Only its hash is stored. */
+export async function issueCreatorSession(
+  userId: string,
+  meta: { userAgent?: string | undefined; ipAddress?: string | undefined },
+  now: Date = new Date()
+): Promise<{ token: string; expiresAt: Date }> {
   const token = generateToken();
+  const expiresAt = expiryFrom(CREATOR_SESSION_TTL_SECONDS, now);
 
   await prisma.creatorSession.create({
     data: {
-      userId: user.id,
+      userId,
       tokenHash: hashToken(token),
-      expiresAt: expiryFrom(CREATOR_SESSION_TTL_SECONDS, now),
-      userAgent: input.userAgent?.slice(0, 512) ?? null,
-      ipAddress: input.ipAddress?.slice(0, 45) ?? null,
+      expiresAt,
+      userAgent: meta.userAgent?.slice(0, 512) ?? null,
+      ipAddress: meta.ipAddress?.slice(0, 45) ?? null,
     },
   });
 
-  return {
-    token,
-    expiresAt: expiryFrom(CREATOR_SESSION_TTL_SECONDS, now),
-    user,
-    site: {
-      siteId: site.id,
-      siteKey: site.siteKey,
-      siteName: site.siteName,
-      framerProjectId: input.framerProjectId,
-      allowedOrigins: readOrigins(site.allowedOrigins),
-    },
-  };
+  return { token, expiresAt };
 }
 
 /**
@@ -271,7 +324,7 @@ export async function verifyConnect(input: VerifyConnectInput): Promise<VerifyCo
  */
 async function createSite(
   userId: string,
-  input: VerifyConnectInput,
+  input: { framerProjectId: string; projectName: string },
   origins: string[]
 ): Promise<{ id: string; siteKey: string; siteName: string; allowedOrigins: unknown }> {
   return prisma.$transaction(async (tx) => {

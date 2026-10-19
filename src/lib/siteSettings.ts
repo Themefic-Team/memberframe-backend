@@ -33,6 +33,8 @@
  */
 
 import type { Prisma } from "@prisma/client";
+import { env } from "../config/env.js";
+import { SITE_SMTP_ID, smtpValueProblems } from "./siteSmtp.js";
 
 // ============================================================================
 // THE SHAPE
@@ -891,6 +893,15 @@ export function validatePatch(patch: unknown): SettingsProblem[] {
                 message: "That is not a valid integration field.",
               });
             }
+          }
+        }
+
+        // A site's own SMTP is checked whenever it is on (25-custom-smtp.md):
+        // saved on with a bad host, every member email would take the slow
+        // path to the fallback.
+        if (id === SITE_SMTP_ID && entry["enabled"] === true && isRecord(entry["values"])) {
+          for (const problem of smtpValueProblems(entry["values"], env.mail.siteSmtpAllowPrivate)) {
+            problems.push({ path: `integrations.${id}.values.${problem.key}`, message: problem.message });
           }
         }
       }
