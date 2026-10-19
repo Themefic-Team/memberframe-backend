@@ -157,7 +157,9 @@ paymentsRouter.put(
 const connectSchema = z.object({
   siteId: siteIdSchema,
   mode: z.enum(["test", "live"]),
-  values: z.record(z.string().trim().max(500)).default({}),
+  // A Lemon Squeezy API key is a JWT of about a thousand characters, so the
+  // cap is generous. It is only there to refuse an absurd body.
+  values: z.record(z.string().trim().max(4096)).default({}),
 });
 
 paymentsRouter.put(
