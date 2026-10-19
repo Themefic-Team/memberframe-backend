@@ -84,6 +84,10 @@ export function createApp(): Express {
 
   app.use("/api/connect", pluginCors);
   app.use("/api/site", pluginCors);
+  // The panel's billing and license routes (F19). Here, ahead of the member
+  // preflight below, which otherwise answers their OPTIONS request with no
+  // Access-Control-Allow-Origin and the browser blocks every call.
+  app.use("/api/plugin", pluginCors);
   // The canvas preview: public, read-only, no cookie, and asked for from a
   // Framer canvas origin no site allowlists. Mounted whole, ahead of the
   // site check. Reasoning in routes/preview.ts.

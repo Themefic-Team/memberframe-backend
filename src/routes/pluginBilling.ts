@@ -13,7 +13,11 @@ import { creatorAuth, requireCreator } from "../middleware/creator.js";
 import { hit } from "../middleware/rateLimit.js";
 import { requireOwnedSite } from "../services/creatorAuthService.js";
 import { PlatformBillingError } from "../lib/stripeRest.js";
-import { resolveLicense } from "../services/license/licenseService.js";
+import { invalidateLicense, resolveLicense } from "../services/license/licenseService.js";
+import { startTrialIfEligible } from "../services/license/trialService.js";
+import { trialStartedMail } from "../services/license/licenseMail.js";
+import { sendMail } from "../lib/mailer.js";
+import { prisma } from "../config/db.js";
 import { issueSeal, verifySeal } from "../lib/instanceSeal.js";
 import {
   applyCoupon,
@@ -66,6 +70,42 @@ pluginBillingRouter.get(
     const input = z.object({ siteId }).parse(req.query);
     const { project } = await ownedProject(req, input.siteId);
     ok(res, { license: await resolveLicense(project.siteId) });
+  })
+);
+
+/**
+ * Profile's "Start Free Trial" (BEAF's button). Attaching a project already
+ * starts the trial when it can; this is the same check, for a project that
+ * was attached without one. One trial per account, email, Framer user, and
+ * project, as always: a refusal answers the license as it stands.
+ */
+pluginBillingRouter.post(
+  "/start-trial",
+  route(async (req, res) => {
+    const input = z.object({ siteId }).parse(req.body);
+    const { owner, project } = await ownedProject(req, input.siteId);
+    const before = await resolveLicense(project.siteId);
+    if (before.state !== "none") {
+      ok(res, { started: false, license: before });
+      return;
+    }
+    const [user, site] = await Promise.all([
+      prisma.user.findUnique({ where: { id: owner.id }, select: { framerUserId: true } }),
+      prisma.site.findUnique({ where: { id: project.siteId }, select: { framerSiteId: true } }),
+    ]);
+    const trial = await startTrialIfEligible({
+      userId: owner.id,
+      email: owner.email,
+      framerUserId: user?.framerUserId ?? null,
+      framerProjectId: site?.framerSiteId ?? project.siteId,
+      siteId: project.siteId,
+      projectName: project.siteName,
+    });
+    if (trial.started) {
+      invalidateLicense(project.siteId);
+      void sendMail(trialStartedMail(owner.email, project.siteName, trial.endsAt, owner.name));
+    }
+    ok(res, { started: trial.started, license: await resolveLicense(project.siteId) });
   })
 );
 
