@@ -22,7 +22,10 @@ export interface AuthPageOptions {
   error: string;
 }
 
-const ICON = "/assets/memberframe-icon.svg";
+import { basePath } from "./publicApiBase.js";
+
+/** The icon, under the API's own path (a reverse proxy may mount it at /memberframe). */
+const icon = (): string => `${basePath()}/assets/memberframe-icon.svg`;
 const PLUGIN = "MemberFrame";
 
 const escapeHtml = (value: string): string =>
@@ -153,8 +156,8 @@ const EYE_HIDE = `<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a1
 export function renderCreatorAuthPage(options: AuthPageOptions): string {
   const register = options.mode === "register";
   const themeClass = options.theme === "light" ? "light-mode" : "dark-mode";
-  const googleHref = `/api/account/google?sessionId=${encodeURIComponent(options.sessionId)}${register ? "&mode=register" : ""}&theme=${options.theme}`;
-  const config = inlineJson({ mode: options.mode, sessionId: options.sessionId, theme: options.theme, error: options.error });
+  const googleHref = `${basePath()}/api/account/google?sessionId=${encodeURIComponent(options.sessionId)}${register ? "&mode=register" : ""}&theme=${options.theme}`;
+  const config = inlineJson({ mode: options.mode, sessionId: options.sessionId, theme: options.theme, error: options.error, base: basePath() });
   const googleBlock = options.googleEnabled
     ? `<div id="auth-divider" class="divider">or continue with</div>
       <a id="google-auth-btn" class="social-btn-google" href="${escapeHtml(googleHref)}">
@@ -170,7 +173,7 @@ export function renderCreatorAuthPage(options: AuthPageOptions): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="robots" content="noindex">
   <title>Authenticate - ${PLUGIN}</title>
-  <link rel="icon" type="image/svg+xml" href="${ICON}">
+  <link rel="icon" type="image/svg+xml" href="${icon()}">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -248,7 +251,7 @@ ${BASE_CSS}
 <body class="${themeClass}">
   <div class="auth-container">
     <div class="plugin-icon">
-      <img src="${ICON}" alt="${PLUGIN}" width="48" height="48" />
+      <img src="${icon()}" alt="${PLUGIN}" width="48" height="48" />
     </div>
 
     <div class="logo">${PLUGIN}</div>
@@ -429,7 +432,7 @@ ${BASE_CSS}
           $("password").setAttribute("autocomplete", "current-password");
         }
         var g = $("google-auth-btn");
-        if (g) g.href = "/api/account/google?sessionId=" + encodeURIComponent(CONFIG.sessionId) + (next === "register" ? "&mode=register" : "") + "&theme=" + CONFIG.theme;
+        if (g) g.href = CONFIG.base + "/api/account/google?sessionId=" + encodeURIComponent(CONFIG.sessionId) + (next === "register" ? "&mode=register" : "") + "&theme=" + CONFIG.theme;
       }
 
       function enterOtpStep(email) {
@@ -458,11 +461,11 @@ ${BASE_CSS}
         if (!passwordless) $("password").focus();
       }
 
-      function done(data) { window.location.href = data.redirect || "/auth/success?theme=" + CONFIG.theme; }
+      function done(data) { window.location.href = data.redirect || CONFIG.base + "/auth/success?theme=" + CONFIG.theme; }
 
       function sendCode(purpose, labelBusy, labelIdle) {
         button(labelBusy, true);
-        return post("/api/account/code", { email: sent.email, purpose: purpose, name: sent.name || undefined })
+        return post(CONFIG.base + "/api/account/code", { email: sent.email, purpose: purpose, name: sent.name || undefined })
           .then(function () { enterOtpStep(sent.email); }, function (err) { button(labelIdle); showError(err.message); throw err; });
       }
 
@@ -487,7 +490,7 @@ ${BASE_CSS}
           if (code.length < 6) return showError("Please enter the complete 6-digit verification code.");
           if (newPassword.length < 6) return showError("New password must be at least 6 characters.");
           button("Resetting password...", true);
-          post("/api/account/verify", { email: sent.email, code: code, purpose: "reset", password: newPassword })
+          post(CONFIG.base + "/api/account/verify", { email: sent.email, code: code, purpose: "reset", password: newPassword })
             .then(done, function (err) { button("Reset Password & Sign In"); showError(err.message); });
           return;
         }
@@ -505,7 +508,7 @@ ${BASE_CSS}
           }
           if (code.length < 6) return showError("Please enter the complete 6-digit verification code.");
           button("Verifying code & creating account...", true);
-          post("/api/account/verify", { email: sent.email, code: code, purpose: "signup", name: sent.name, password: sent.password })
+          post(CONFIG.base + "/api/account/verify", { email: sent.email, code: code, purpose: "signup", name: sent.name, password: sent.password })
             .then(done, function (err) { button("Verify Code & Start 7 Days Free Trial"); showError(err.message); });
           return;
         }
@@ -513,7 +516,7 @@ ${BASE_CSS}
         if (!passwordless) {
           if (!email || !password) return showError("Please enter your email and password.");
           button("Signing in...", true);
-          post("/api/account/login", { email: email, password: password })
+          post(CONFIG.base + "/api/account/login", { email: email, password: password })
             .then(done, function (err) { button("Sign In"); showError(err.message); });
           return;
         }
@@ -528,14 +531,14 @@ ${BASE_CSS}
         }
         if (code.length < 6) return showError("Please enter the complete 6-digit verification code.");
         button("Verifying code...", true);
-        post("/api/account/verify", { email: sent.email, code: code, purpose: "signin" })
+        post(CONFIG.base + "/api/account/verify", { email: sent.email, code: code, purpose: "signin" })
           .then(done, function (err) { button("Verify & Sign In"); showError(err.message); });
       });
 
       $("resend-btn").addEventListener("click", function () {
         clearMessages();
         var purpose = mode === "forgot" ? "reset" : mode === "register" ? "signup" : "signin";
-        post("/api/account/code", { email: sent.email, purpose: purpose, name: sent.name || undefined })
+        post(CONFIG.base + "/api/account/code", { email: sent.email, purpose: purpose, name: sent.name || undefined })
           .then(startResendCountdown, function (err) { showError(err.message); });
       });
 
@@ -571,7 +574,7 @@ export function renderAuthSuccessPage(options: { theme: "light" | "dark"; trial:
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="robots" content="noindex">
   <title>Authenticated - ${PLUGIN}</title>
-  <link rel="icon" type="image/svg+xml" href="${ICON}">
+  <link rel="icon" type="image/svg+xml" href="${icon()}">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -591,7 +594,7 @@ ${BASE_CSS}
 </head>
 <body class="${themeClass}">
   <div class="success-card">
-    <div class="icon-box"><img src="${ICON}" alt="${PLUGIN}" /></div>
+    <div class="icon-box"><img src="${icon()}" alt="${PLUGIN}" /></div>
     <div class="title">Authentication Successful!</div>
     ${
       options.trial
@@ -656,7 +659,7 @@ export function renderMockGooglePage(options: { sessionId: string; theme: "light
     <span class="badge">Local Dev Mode</span>
     <h2>Simulate Google Sign In</h2>
     <p>OAuth credentials missing in <code>.env</code> (<code>CREATOR_GOOGLE_CLIENT_ID</code>, <code>CREATOR_GOOGLE_CLIENT_SECRET</code>). Enter test details to proceed:</p>
-    <form action="/api/account/google/mock" method="POST">
+    <form action="${escapeHtml(basePath())}/api/account/google/mock" method="POST">
       <input type="hidden" name="sessionId" value="${escapeHtml(options.sessionId)}" />
       <input type="hidden" name="theme" value="${options.theme}" />
       <div class="form-group">

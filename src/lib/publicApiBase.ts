@@ -44,3 +44,17 @@ export function publicApiBase(req: Request): string {
 
   return `https://${host}`;
 }
+
+/**
+ * The path the API is served under, from `API_BASE_URL`: "" at a domain's
+ * root, "/memberframe" for `https://app.framefic.com/memberframe`. Every path
+ * a page of ours links to, posts to, or redirects to starts with it, or the
+ * browser asks the domain's root, where a reverse proxy has nothing.
+ */
+export function basePath(): string {
+  try {
+    return new URL(env.apiBaseUrl).pathname.replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}

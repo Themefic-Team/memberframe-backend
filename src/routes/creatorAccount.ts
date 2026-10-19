@@ -26,6 +26,7 @@ import { prisma } from "../config/db.js";
 import { ApiError, ok, route } from "../middleware/errors.js";
 import { guardCredentialCheck, guardEmailSend } from "../middleware/rateLimit.js";
 import { hashPassword, verifyAgainstNothing, verifyPassword } from "../lib/password.js";
+import { basePath } from "../lib/publicApiBase.js";
 import { renderAuthSuccessPage, renderCreatorAuthPage, renderMockGooglePage } from "../lib/creatorAuthPageHtml.js";
 import { sendMail } from "../lib/mailer.js";
 import {
@@ -63,7 +64,7 @@ const MESSAGES = {
 /** Where the page goes after any sign in: the success page, with the trial pill when one is coming. */
 async function successUrl(userId: string, theme: "light" | "dark"): Promise<string> {
   const hadTrial = await prisma.pluginTrial.findFirst({ where: { userId }, select: { id: true } });
-  return `/auth/success?theme=${theme}${hadTrial ? "" : "&trial=1"}`;
+  return `${basePath()}/auth/success?theme=${theme}${hadTrial ? "" : "&trial=1"}`;
 }
 
 const themeOf = (req: Request): "light" | "dark" => readTheme(req.body?.theme ?? req.query["theme"]);
@@ -239,7 +240,7 @@ accountRouter.get("/google", (req: Request, res: Response) => {
   const id = req.query["sessionId"];
   const theme = readTheme(req.query["theme"]);
   if (!isValidSessionId(id) || (!googleConfigured() && !googleMockAllowed())) {
-    res.redirect(302, `/auth?theme=${theme}&error=google`);
+    res.redirect(302, `${basePath()}/auth?theme=${theme}&error=google`);
     return;
   }
   if (!googleConfigured()) {
@@ -264,7 +265,7 @@ accountRouter.get(
   route(async (req, res) => {
     const [id = "", rawTheme = "dark"] = String(req.query["state"] ?? "").split(".");
     const theme = readTheme(rawTheme);
-    const back = () => res.redirect(302, `/auth?sessionId=${encodeURIComponent(id)}&theme=${theme}&error=google`);
+    const back = () => res.redirect(302, `${basePath()}/auth?sessionId=${encodeURIComponent(id)}&theme=${theme}&error=google`);
     const code = req.query["code"];
     if (!isValidSessionId(id) || typeof code !== "string") {
       back();
