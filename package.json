@@ -5,7 +5,7 @@
   "type": "module",
   "description": "MemberFrame API. Node, Express, Prisma, MySQL. Serves the Framer plugin and the canvas components on published sites.",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
+    "dev": "tsx watch --include .env src/server.ts",
     "start": "node dist/server.js",
     "build": "prisma generate && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
