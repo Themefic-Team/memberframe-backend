@@ -11,6 +11,7 @@
  */
 
 import { prisma } from "../../config/db.js";
+import { emitLicenseChanged } from "./licenseEvents.js";
 
 export type LicenseState = "trial" | "active" | "expired" | "trial_claimed_other_site" | "none";
 export type PlanId = "monthly" | "yearly" | "lifetime";
@@ -220,4 +221,6 @@ export async function siteLicense(siteId: string): Promise<{ licensed: boolean; 
 export function invalidateLicense(siteId?: string): void {
   if (siteId) cache.delete(siteId);
   else cache.clear();
+  // And tell the open plugin panels, which relock the canvas (licenseEvents.ts).
+  emitLicenseChanged(siteId);
 }

@@ -14,6 +14,7 @@ import { hit } from "../middleware/rateLimit.js";
 import { requireOwnedSite } from "../services/creatorAuthService.js";
 import { PlatformBillingError } from "../lib/stripeRest.js";
 import { invalidateLicense, resolveLicense } from "../services/license/licenseService.js";
+import { onLicenseChanged } from "../services/license/licenseEvents.js";
 import { startTrialIfEligible } from "../services/license/trialService.js";
 import { trialStartedMail } from "../services/license/licenseMail.js";
 import { sendMail } from "../lib/mailer.js";
@@ -70,6 +71,104 @@ pluginBillingRouter.get(
     const input = z.object({ siteId }).parse(req.query);
     const { project } = await ownedProject(req, input.siteId);
     ok(res, { license: await resolveLicense(project.siteId) });
+  })
+);
+
+/** Streams one creator may hold open: a panel per open project, with room for a reconnect overlap. */
+export const MAX_STREAMS_PER_CREATOR = 5;
+/** A ping comment this often keeps proxies from closing a quiet stream. */
+export const STREAM_PING_MS = 25_000;
+/**
+ * Each open stream also reads the license itself this often, and sends it only
+ * when it changed: a trial ends by date before the hourly license job runs,
+ * and a row edited outside this process (a script, the database) calls nothing.
+ * One small read a minute per open panel, and no request from the panel.
+ */
+export const STREAM_RECHECK_MS = 60_000;
+/** A stream ends after this long and the panel opens a fresh one, so none outlives its token check. */
+export const STREAM_LIFETIME_MS = 60 * 60 * 1000;
+const openStreams = new Map<string, number>();
+
+/** One server-sent event frame. */
+export function sseFrame(event: string, data: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+/**
+ * The license, pushed (19-pro-lock-and-trial.md 5.1). The panel holds this
+ * open while it is open: the license now, then again whenever it changes (a
+ * trial ends, a plan is bought, renewed, or expires). The panel rewrites the
+ * components' baked lines, so the canvas locks at once and nothing polls.
+ */
+pluginBillingRouter.get(
+  "/events",
+  route(async (req, res) => {
+    const input = z.object({ siteId }).parse(req.query);
+    const { owner, project } = await ownedProject(req, input.siteId);
+    const held = openStreams.get(owner.id) ?? 0;
+    if (held >= MAX_STREAMS_PER_CREATOR) throw rateLimited(60);
+    openStreams.set(owner.id, held + 1);
+
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      // nginx and similar proxies buffer responses unless told not to.
+      "X-Accel-Buffering": "no",
+    });
+    res.write("retry: 5000\n\n");
+
+    let closed = false;
+    let lastSent = "";
+    let sending = false;
+    let again = false;
+    // Changes that arrive while one is being sent collapse into one more send.
+    const send = async (): Promise<void> => {
+      if (closed) return;
+      if (sending) {
+        again = true;
+        return;
+      }
+      sending = true;
+      try {
+        do {
+          again = false;
+          const frame = sseFrame("license", { license: await resolveLicense(project.siteId) });
+          // Unchanged since the last frame: nothing to tell the panel.
+          if (!closed && frame !== lastSent) {
+            lastSent = frame;
+            res.write(frame);
+          }
+        } while (again && !closed);
+      } catch {
+        // A failed read sends nothing; the next change, or the next stream, tries again.
+      } finally {
+        sending = false;
+      }
+    };
+
+    const unsubscribe = onLicenseChanged(project.siteId, () => void send());
+    const ping = setInterval(() => {
+      if (!closed) res.write(": ping\n\n");
+    }, STREAM_PING_MS);
+    const recheck = setInterval(() => void send(), STREAM_RECHECK_MS);
+    const lifetime = setTimeout(() => res.end(), STREAM_LIFETIME_MS);
+
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      unsubscribe();
+      clearInterval(ping);
+      clearInterval(recheck);
+      clearTimeout(lifetime);
+      const left = (openStreams.get(owner.id) ?? 1) - 1;
+      if (left > 0) openStreams.set(owner.id, left);
+      else openStreams.delete(owner.id);
+    };
+    req.on("close", close);
+    res.on("close", close);
+
+    await send();
   })
 );
 
