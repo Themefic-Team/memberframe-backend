@@ -75,7 +75,12 @@ async function razorpay(
   const json = asRecord(await response.json().catch(() => ({})));
   if (!response.ok) {
     const error = asRecord(json["error"]);
-    throw new GatewayError("razorpay", response.status, asString(error["description"]) ?? `Razorpay answered ${response.status}.`);
+    const description = asString(error["description"]) ?? `Razorpay answered ${response.status}.`;
+    // A currency the account cannot take is the usual refusal outside INR.
+    const hint = /currenc/i.test(description)
+      ? " Turn on International Payments in your Razorpay account, or price this plan in INR."
+      : "";
+    throw new GatewayError("razorpay", response.status, description + hint);
   }
   return json;
 }
@@ -256,6 +261,13 @@ export const razorpayAdapter: GatewayAdapter = {
   },
 
   async ensurePrice(credentials, spec) {
+    if (spec.interval !== "lifetime" && credentials.options[SUBSCRIPTIONS_OFF] === "1") {
+      throw new GatewayError(
+        "razorpay",
+        400,
+        "Subscriptions is not enabled on your Razorpay account, so monthly and yearly plans cannot be sold through it. Enable Subscriptions in Razorpay, then click Update keys in MemberFrame."
+      );
+    }
     if (spec.interval === "lifetime") {
       // A one-time purchase is an order made per checkout, not a stored price.
       return { externalId: "order", externalProductId: null };

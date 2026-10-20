@@ -265,3 +265,46 @@ describe("connecting", () => {
     expect(result.webhookEndpointId).toBe("wh_1");
   });
 });
+
+describe("a chosen method that cannot take the price says why (29-checkout-methods.md)", () => {
+  const spec = {
+    siteId: "site",
+    siteName: "Site",
+    tierKey: "standard",
+    tierName: "Standard",
+    interval: "month" as const,
+    amountMinor: 1000,
+    currency: "USD",
+    checkoutId: "chk_1",
+    member: { id: "m1", email: "buyer@example.com", name: null },
+    successUrl: "https://site.example/pricing",
+    cancelUrl: "https://site.example/pricing",
+    price: null,
+    customerId: null,
+  };
+
+  it("refuses a Lemon Squeezy store in another currency, naming both", async () => {
+    const store = credentials("lemonsqueezy", { options: { monthlyVariantId: "1", storeCurrency: "BDT" } });
+    await expect(lemonSqueezyAdapter.createCheckout(store, spec)).rejects.toThrow(
+      "Your Lemon Squeezy store charges in BDT, but this plan is priced in USD."
+    );
+  });
+
+  it("names a missing Lemon Squeezy variant by period", async () => {
+    const store = credentials("lemonsqueezy", { options: { storeCurrency: "USD" } });
+    await expect(lemonSqueezyAdapter.createCheckout(store, spec)).rejects.toThrow("No monthly variant is linked.");
+  });
+
+  it("explains Razorpay without Subscriptions, and a currency Razorpay refuses", async () => {
+    const off = credentials("razorpay", { publicId: "rzp_test_1", secrets: { keySecret: "s" }, options: { subscriptionsOff: "1" } });
+    await expect(razorpayAdapter.ensurePrice!(off, { ...spec, tierKey: "standard" } as never, null)).rejects.toThrow(
+      "Subscriptions is not enabled on your Razorpay account"
+    );
+
+    vi.stubGlobal("fetch", async () => new Response(JSON.stringify({ error: { description: "Currency is not supported" } }), { status: 400 }));
+    const on = credentials("razorpay", { publicId: "rzp_test_1", secrets: { keySecret: "s" } });
+    await expect(razorpayAdapter.ensurePrice!(on, { ...spec, tierKey: "standard" } as never, null)).rejects.toThrow(
+      "Turn on International Payments in your Razorpay account, or price this plan in INR."
+    );
+  });
+});

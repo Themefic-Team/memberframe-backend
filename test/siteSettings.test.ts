@@ -264,12 +264,23 @@ describe("toJsonDocument", () => {
 });
 
 describe("gatedPages rules handling", () => {
-  it("defaults to /dashboard and /private-content", () => {
-    const doc = withDefaults(null);
-    expect(doc.gatedPages).toHaveLength(2);
-    expect(doc.gatedPages[0]!.path).toBe("/dashboard");
-    expect(doc.gatedPages[0]!.enabled).toBe(true);
-    expect(doc.gatedPages[1]!.path).toBe("/private-content");
+  it("starts with no page locks", () => {
+    expect(withDefaults(null).gatedPages).toEqual([]);
+    expect(withDefaults({ gatedPages: "junk" }).gatedPages).toEqual([]);
+  });
+
+  it("reads the two untouched seeded samples as no rules, and keeps them once changed", () => {
+    const sample = (path: string, extra: Record<string, unknown> = {}) => ({
+      path,
+      enabled: true,
+      requiredTier: "signed_in",
+      fallbackAction: "redirect",
+      redirectPath: "/login",
+      ...extra,
+    });
+    expect(withDefaults({ gatedPages: [sample("/dashboard"), sample("/private-content")] }).gatedPages).toEqual([]);
+    expect(withDefaults({ gatedPages: [sample("/dashboard"), sample("/private-content", { enabled: false })] }).gatedPages).toHaveLength(2);
+    expect(withDefaults({ gatedPages: [sample("/dashboard")] }).gatedPages).toHaveLength(1);
   });
 
   it("validates that paths must be valid site paths", () => {
@@ -293,8 +304,10 @@ describe("gatedPages rules handling", () => {
   });
 
   it("persists removing rule 2 through toJsonDocument and round trip", () => {
-    const current = defaultSettings();
-    // Simulate removing rule 2 (leaving only rule 1)
+    // Two rules of the creator's own (the default list is empty), then rule 2 removed.
+    const rule = (path: string) => ({ path, enabled: true, requiredTier: "signed_in", fallbackAction: "redirect" as const, redirectPath: "/login" });
+    const current = mergeSettings(defaultSettings(), { gatedPages: [rule("/dashboard"), rule("/members-only")] });
+    expect(current.gatedPages).toHaveLength(2);
     const next = mergeSettings(current, {
       gatedPages: [current.gatedPages[0]],
     });

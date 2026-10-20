@@ -16,10 +16,11 @@ export interface MethodLabel {
 
 export type MethodLabels = Partial<Record<GatewayId, Partial<MethodLabel>>>;
 
+/** The gateway by name, as in the Payments cards (product owner, 2026-10-20), and what it takes. */
 export const DEFAULT_METHOD_LABELS: Record<GatewayId, MethodLabel> = {
-  stripe: { title: "Credit or debit card", description: "Visa, Mastercard, Amex, Apple Pay, and Google Pay." },
-  lemonsqueezy: { title: "Card or PayPal", description: "Sales tax and VAT included." },
-  razorpay: { title: "UPI, cards, and net banking", description: "For buyers in India." },
+  stripe: { title: "Stripe", description: "Credit or debit card, Apple Pay, and Google Pay." },
+  lemonsqueezy: { title: "Lemon Squeezy", description: "Card or PayPal. Sales tax and VAT included." },
+  razorpay: { title: "Razorpay", description: "UPI, cards, net banking, and wallets." },
 };
 
 const labelSchema = z.object({

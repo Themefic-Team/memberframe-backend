@@ -35,7 +35,6 @@ import {
   isPaymentMode,
   type BillingInterval,
   type CheckoutEmbed,
-  type GatewayCredentials,
   type GatewayId,
   type KnownPrice,
   type PaymentMode,
@@ -134,7 +133,9 @@ async function ensureGatewayPrice(
   });
 
   const credentials = await loadCredentials(siteId, gateway, mode);
-  if (!credentials) throw new ApiError(409, "no_gateway");
+  if (!credentials) {
+    throw new GatewayError(gateway, 400, "MemberFrame could not read this gateway's keys. Open it in Manage, Payments, and click Update keys.");
+  }
 
   const created = await adapter.ensurePrice(
     credentials,
@@ -252,16 +253,6 @@ export type CheckoutOptions =
       recommended: GatewayId | null;
     };
 
-/** Why a gateway shown at checkout cannot sell this price, in the buyer's words. */
-function unavailableReason(credentials: GatewayCredentials, interval: BillingInterval, currency: string): string {
-  if (credentials.gateway === "lemonsqueezy") {
-    const storeCurrency = credentials.options["storeCurrency"];
-    if (typeof storeCurrency === "string" && storeCurrency !== currency) return `Not available for ${currency} prices`;
-    return interval === "lifetime" ? "Not available for one payment" : `Not available for ${interval === "year" ? "yearly" : "monthly"} plans`;
-  }
-  if (credentials.gateway === "razorpay" && interval !== "lifetime") return "Not available for subscriptions";
-  return "Not available for this plan";
-}
 
 /**
  * What the pricing card's chooser shows for one price (29-checkout-methods.md):
@@ -307,7 +298,7 @@ export async function checkoutOptions(input: {
   // deciding which is preselected. One that cannot sell this price is listed
   // too, unavailable with the reason, rather than silently missing.
   const connected = await connectedGateways(input.siteId, settings.mode, { enabledOnly: true });
-  const { methods: sellable, recommended } = availableMethods({ connected, interval: input.interval, currency, country: input.country });
+  const { recommended } = availableMethods({ connected, interval: input.interval, currency, country: input.country });
   const ordered = [...connected].sort(
     (a, b) =>
       (a.gateway === recommended ? -1 : 0) - (b.gateway === recommended ? -1 : 0) ||
@@ -316,15 +307,14 @@ export async function checkoutOptions(input: {
   return {
     kind: "choose",
     summary: { tierName: tier.name, interval: input.interval, amountMinor, currency },
-    methods: ordered.map((credentials) => {
-      const available = sellable.includes(credentials.gateway);
-      return {
-        gateway: credentials.gateway,
-        ...resolveMethodLabel(credentials.gateway, settings.methodLabels),
-        available,
-        reason: available ? null : unavailableReason(credentials, input.interval, currency),
-      };
-    }),
+    // Every gateway shown at checkout can be chosen. One that cannot take this
+    // price explains itself when chosen, rather than being greyed out here.
+    methods: ordered.map((credentials) => ({
+      gateway: credentials.gateway,
+      ...resolveMethodLabel(credentials.gateway, settings.methodLabels),
+      available: true,
+      reason: null,
+    })),
     recommended,
   };
 }
@@ -358,8 +348,11 @@ export async function createCheckout(input: CheckoutRequest): Promise<CheckoutOu
   // Only gateways shown at checkout. The buyer's choice must be one of them
   // and able to sell this price; without one, the method their location suits.
   const connected = await connectedGateways(input.siteId, settings.mode, { enabledOnly: true });
-  const { methods, recommended } = availableMethods({ connected, interval: input.interval, currency, country: input.country });
-  if (input.gateway && !methods.includes(input.gateway)) throw badRequest("method_unavailable");
+  const { recommended } = availableMethods({ connected, interval: input.interval, currency, country: input.country });
+  // The buyer's choice is taken as long as the gateway is connected and shown
+  // at checkout (29-checkout-methods.md): MemberFrame does not second-guess
+  // it. A gateway that refuses says why, through gateway_error's detail.
+  if (input.gateway && !connected.some((entry) => entry.gateway === input.gateway)) throw badRequest("method_unavailable");
   const chosen = input.gateway ?? recommended;
   if (!chosen) throw new ApiError(409, "no_gateway");
   const decision = { gateway: chosen, reason: input.gateway ? "buyer's choice" : "recommended" };
@@ -426,7 +419,7 @@ export async function createCheckout(input: CheckoutRequest): Promise<CheckoutOu
     if (error instanceof GatewayError) {
       process.stderr.write(`[payments] ${error.gateway} checkout failed: ${error.message}\n`);
       // Named, so the chooser can say this method failed and offer the others.
-      throw new ApiError(502, "gateway_error", undefined, { gateway: decision.gateway });
+      throw new ApiError(502, "gateway_error", undefined, { gateway: decision.gateway, detail: error.message });
     }
     throw error;
   }

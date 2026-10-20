@@ -314,9 +314,20 @@ export const lemonSqueezyAdapter: GatewayAdapter = {
   },
 
   async createCheckout(credentials, spec: CheckoutSpec) {
+    // The store charges in its own currency: the plan's amount sent to a store
+    // in another currency would charge that number in the wrong money.
+    const storeCurrency = credentials.options["storeCurrency"];
+    if (typeof storeCurrency === "string" && storeCurrency !== spec.currency) {
+      throw new GatewayError(
+        "lemonsqueezy",
+        400,
+        `Your Lemon Squeezy store charges in ${storeCurrency}, but this plan is priced in ${spec.currency}. Set the store currency to ${spec.currency} in Lemon Squeezy, Settings, Stores, then click Update keys in MemberFrame.`
+      );
+    }
     const variantId = credentials.options[VARIANT_OPTION[spec.interval]];
     if (typeof variantId !== "string") {
-      throw new GatewayError("lemonsqueezy", 400, "No Lemon Squeezy variant is linked for this billing period.");
+      const period = spec.interval === "lifetime" ? "one-time" : spec.interval === "year" ? "yearly" : "monthly";
+      throw new GatewayError("lemonsqueezy", 400, `No ${period} variant is linked. Add its variant ID on the Lemon Squeezy card in MemberFrame.`);
     }
 
     const checkout = await lemon(apiKeyOf(credentials), "POST", "/checkouts", {

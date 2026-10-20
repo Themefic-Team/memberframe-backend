@@ -251,22 +251,37 @@ export interface GatedPageRule {
   redirectPath?: string;
 }
 
-export const DEFAULT_GATED_PAGES: GatedPageRule[] = [
-  {
-    path: "/dashboard",
-    enabled: true,
-    requiredTier: "signed_in",
-    fallbackAction: "redirect",
-    redirectPath: "/login",
-  },
-  {
-    path: "/private-content",
-    enabled: true,
-    requiredTier: "signed_in",
-    fallbackAction: "redirect",
-    redirectPath: "/login",
-  },
+/**
+ * A new site has no page locks: the creator adds the ones they want
+ * (product owner, 2026-10-20). Two sample rules used to be seeded here.
+ */
+export const DEFAULT_GATED_PAGES: GatedPageRule[] = [];
+
+/**
+ * The two sample rules every site was seeded with before 2026-10-20. A stored
+ * list that is exactly these, untouched, was never the creator's choice, so it
+ * reads as no rules. Any change to either one keeps both.
+ */
+const SEEDED_SAMPLE_PAGES: ReadonlyArray<GatedPageRule> = [
+  { path: "/dashboard", enabled: true, requiredTier: "signed_in", fallbackAction: "redirect", redirectPath: "/login" },
+  { path: "/private-content", enabled: true, requiredTier: "signed_in", fallbackAction: "redirect", redirectPath: "/login" },
 ];
+
+function isSeededSample(rules: ReadonlyArray<GatedPageRule>): boolean {
+  return (
+    rules.length === SEEDED_SAMPLE_PAGES.length &&
+    rules.every((rule, index) => {
+      const sample = SEEDED_SAMPLE_PAGES[index]!;
+      return (
+        rule.path === sample.path &&
+        rule.enabled === sample.enabled &&
+        rule.requiredTier === sample.requiredTier &&
+        rule.fallbackAction === sample.fallbackAction &&
+        (rule.redirectPath ?? "") === (sample.redirectPath ?? "")
+      );
+    })
+  );
+}
 
 /**
  * A section lock: a rule a layer opts into by its name, "Lock: <name>".
@@ -640,7 +655,7 @@ function readGatedPages(value: unknown): GatedPageRule[] {
     rules.push(rule);
   }
 
-  return rules;
+  return isSeededSample(rules) ? [] : rules;
 }
 
 // ============================================================================
