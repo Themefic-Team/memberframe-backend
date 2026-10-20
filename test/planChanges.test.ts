@@ -141,3 +141,38 @@ describe("after payment", () => {
     expect(apply).toContain("scheduledTierKey: null,");
   });
 });
+
+describe("an active plan past its period end (a missed webhook)", () => {
+  const future = Math.floor(Date.now() / 1000) + 30 * 86_400;
+
+  it("asks Stripe and turns its answer into the webhook's event", async () => {
+    const stripe = credentials("stripe", { secrets: { secretKey: "sk_test_x" } });
+    capture({ status: "active", current_period_end: future });
+    expect((await stripeAdapter.syncStatus!(stripe, "sub_1"))?.action).toBe("renewed");
+    capture({ status: "past_due" });
+    expect((await stripeAdapter.syncStatus!(stripe, "sub_1"))?.action).toBe("payment_failed");
+    capture({ status: "canceled" });
+    expect((await stripeAdapter.syncStatus!(stripe, "sub_1"))?.action).toBe("ended");
+  });
+
+  it("asks Lemon Squeezy and Razorpay the same way", async () => {
+    const store = credentials("lemonsqueezy", { secrets: { apiKey: "key" } });
+    capture({ data: { attributes: { status: "expired" } } });
+    expect((await lemonSqueezyAdapter.syncStatus!(store, "77"))?.action).toBe("ended");
+    capture({ data: { attributes: { status: "cancelled", ends_at: "2027-10-20T00:00:00Z" } } });
+    expect((await lemonSqueezyAdapter.syncStatus!(store, "77"))?.action).toBe("cancel_scheduled");
+
+    const keys = credentials("razorpay", { publicId: "rzp_test_1", secrets: { keySecret: "s" } });
+    capture({ status: "halted" });
+    expect((await razorpayAdapter.syncStatus!(keys, "sub_1"))?.action).toBe("ended");
+    capture({ status: "pending" });
+    expect((await razorpayAdapter.syncStatus!(keys, "sub_1"))?.action).toBe("payment_failed");
+  });
+
+  it("is checked by the sweep, applies only a renewal into a new period, and fails it after a day unanswered", () => {
+    const apply = readFileSync(new URL("../src/services/payments/apply.ts", import.meta.url), "utf8");
+    expect(apply).toContain("await reconcileOverdue(now)");
+    expect(apply).toContain('if (credentials && event && (event.action !== "renewed" || renewedPastNow)) {');
+    expect(apply).toContain('action: "payment_failed", type: "sync"');
+  });
+});

@@ -416,6 +416,16 @@ export const lemonSqueezyAdapter: GatewayAdapter = {
     return fromIso(asRecord(asRecord(subscription["data"])["attributes"])["renews_at"]);
   },
 
+  async syncStatus(credentials, externalId) {
+    const subscription = await lemon(apiKeyOf(credentials), "GET", `/subscriptions/${encodeURIComponent(externalId)}`);
+    const attributes = asRecord(asRecord(subscription["data"])["attributes"]);
+    const status = asString(attributes["status"]);
+    if (status === "expired") return paymentEvent("ended", "sync", { externalId });
+    if (status === "past_due" || status === "unpaid" || status === "paused") return paymentEvent("payment_failed", "sync", { externalId });
+    if (status === "cancelled") return paymentEvent("cancel_scheduled", "sync", { externalId, currentPeriodEnd: fromIso(attributes["ends_at"]) });
+    return paymentEvent("renewed", "sync", { externalId, currentPeriodEnd: fromIso(attributes["renews_at"]) });
+  },
+
   async portalUrl(credentials, subscription) {
     // The portal link in the subscription is signed and expires, so a fresh one is read each time.
     try {

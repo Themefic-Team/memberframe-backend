@@ -347,6 +347,16 @@ export const razorpayAdapter: GatewayAdapter = {
     return fromUnix(subscription["current_end"]);
   },
 
+  async syncStatus(credentials, externalId) {
+    const subscription = await razorpay(keysOf(credentials), "GET", `/subscriptions/${encodeURIComponent(externalId)}`);
+    const status = asString(subscription["status"]);
+    if (status === "halted" || status === "cancelled" || status === "completed" || status === "expired") {
+      return paymentEvent("ended", "sync", { externalId });
+    }
+    if (status === "pending") return paymentEvent("payment_failed", "sync", { externalId });
+    return paymentEvent("renewed", "sync", { externalId, currentPeriodEnd: fromUnix(subscription["current_end"]) });
+  },
+
   async portalUrl(_credentials, subscription) {
     // No hosted portal. The subscription's own link is where a card is updated.
     return subscription.manageUrl;

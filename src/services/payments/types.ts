@@ -236,6 +236,12 @@ export interface GatewayAdapter {
    * renewal charges `price`, nothing is charged now.
    */
   scheduleChange?(credentials: GatewayCredentials, externalId: string, price: KnownPrice | null): Promise<void>;
+  /**
+   * What the gateway says about a subscription now, as the event its webhook
+   * would have sent: renewed (with the period end), payment_failed,
+   * cancel_scheduled, or ended. The sweep's safety net for a missed webhook.
+   */
+  syncStatus?(credentials: GatewayCredentials, externalId: string): Promise<PaymentEvent | null>;
   /** Undo `scheduleChange`. `price` is the current plan's, for a gateway that set the next price. */
   cancelScheduledChange?(credentials: GatewayCredentials, externalId: string, price: KnownPrice | null): Promise<void>;
   /**

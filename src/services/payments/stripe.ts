@@ -471,6 +471,16 @@ export const stripeAdapter: GatewayAdapter = {
     return subscriptionPeriodEnd(subscription);
   },
 
+  async syncStatus(credentials, externalId) {
+    const subscription = await stripe(secretKeyOf(credentials), "GET", `/subscriptions/${encodeURIComponent(externalId)}`);
+    const status = asString(subscription["status"]);
+    const currentPeriodEnd = subscriptionPeriodEnd(subscription);
+    if (status === "canceled" || status === "incomplete_expired") return paymentEvent("ended", "sync", { externalId });
+    if (status === "past_due" || status === "unpaid") return paymentEvent("payment_failed", "sync", { externalId });
+    if (subscription["cancel_at_period_end"] === true) return paymentEvent("cancel_scheduled", "sync", { externalId, currentPeriodEnd });
+    return paymentEvent("renewed", "sync", { externalId, currentPeriodEnd });
+  },
+
   async portalUrl(credentials, subscription, returnUrl) {
     if (!subscription.customerId) return null;
     try {

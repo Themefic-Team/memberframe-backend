@@ -471,7 +471,74 @@ async function inviteToScheduledPlan(siteId: string, memberId: string, tierKey: 
  * first: a canceled plan past its period end, and a failed payment past its
  * grace window. Also expires checkouts nobody finished.
  */
+/** How long past its period end an active plan waits for the gateway's renewal before it is checked. */
+const RENEWAL_WAIT_MS = 60 * 60 * 1000;
+/** How long past its period end, with no answer from the gateway, before the grace period starts. */
+const UNANSWERED_MS = DAY_MS;
+
+/**
+ * Active monthly or yearly plans past their period end with no renewal: a
+ * missed webhook. Ask the gateway what happened and apply its answer exactly
+ * as the webhook would have. A renewal moves the period on (and switches a
+ * scheduled downgrade); a failure starts the grace period; a cancel or end is
+ * applied. When the gateway cannot be asked, or still has not renewed a day
+ * later, the plan goes into its grace period and the sweep ends it after that.
+ */
+export async function reconcileOverdue(now: Date = new Date()): Promise<number> {
+  const overdue = await prisma.subscription.findMany({
+    where: {
+      status: "active",
+      interval: { not: "lifetime" },
+      currentPeriodEnd: { lt: new Date(now.getTime() - RENEWAL_WAIT_MS) },
+    },
+    take: 50,
+  });
+
+  let changed = 0;
+  for (const subscription of overdue) {
+    const gateway = subscription.gateway as GatewayId;
+    const credentials = await loadCredentials(subscription.siteId, gateway, subscription.mode as PaymentMode).catch(() => null);
+    const adapter = ADAPTERS[gateway];
+    let event: PaymentEvent | null = null;
+    if (credentials && adapter?.syncStatus) {
+      event = await adapter.syncStatus(credentials, subscription.externalId).catch((error: unknown) => {
+        log(`could not check ${gateway} subscription ${subscription.externalId}: ${error instanceof Error ? error.message : String(error)}`);
+        return null;
+      });
+    }
+
+    const renewedPastNow =
+      event?.action === "renewed" && event.currentPeriodEnd !== null && event.currentPeriodEnd !== undefined && event.currentPeriodEnd > now;
+    const overdueLong = (subscription.currentPeriodEnd?.getTime() ?? now.getTime()) < now.getTime() - UNANSWERED_MS;
+
+    if (credentials && event && (event.action !== "renewed" || renewedPastNow)) {
+      // The gateway's own answer: renewed into a new period, failed, cancelled, or ended.
+      await applyPaymentEvent(subscription.siteId, credentials, event);
+      changed += 1;
+    } else if (overdueLong && credentials) {
+      // No renewal and no answer a day later: treat it as a failed renewal.
+      await applyPaymentEvent(subscription.siteId, credentials, { ...(event ?? {}), action: "payment_failed", type: "sync", externalId: subscription.externalId } as PaymentEvent);
+      changed += 1;
+    } else if (overdueLong) {
+      // The gateway is gone (keys removed): end it after the grace period.
+      const { graceDays } = await loadPaymentSettings(subscription.siteId);
+      await prisma.subscription.update({
+        where: { id: subscription.id },
+        data: { status: "past_due", gracePeriodEndsAt: subscription.gracePeriodEndsAt ?? new Date(now.getTime() + graceDays * DAY_MS) },
+      });
+      await recomputeMember(subscription.siteId, subscription.memberId);
+      changed += 1;
+    }
+  }
+  return changed;
+}
+
 export async function sweepExpired(now: Date = new Date()): Promise<number> {
+  // First the plans a missed webhook left "active" past their period end.
+  await reconcileOverdue(now).catch((error: unknown) => {
+    log(`reconcile failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
+
   const expired = await prisma.subscription.findMany({
     where: {
       OR: [
