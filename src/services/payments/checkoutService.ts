@@ -38,6 +38,7 @@ import {
   type KnownPrice,
   type PaymentMode,
 } from "./types.js";
+import { readTierFeatures, type TierFeature } from "../../lib/tierFeatures.js";
 
 type TierRow = PricedTier & { key: string; name: string; rank: number };
 
@@ -61,6 +62,8 @@ export interface PublicTier {
   prices: Record<BillingInterval, number | null>;
   /** Whether a connected gateway can actually sell each price right now. */
   purchasable: Record<BillingInterval, boolean>;
+  /** The tier's pricing card lines, in order (28-tier-features.md). */
+  features: TierFeature[];
 }
 
 export interface PublicPricing {
@@ -95,7 +98,7 @@ export async function publicPricing(siteId: string, country: string | null): Pro
           prices[interval] !== null &&
           connected.some((credentials) => ADAPTERS[credentials.gateway].canSell(credentials, interval, currency));
       }
-      return { key: tier.key, name: tier.name, rank: tier.rank, currency, prices, purchasable };
+      return { key: tier.key, name: tier.name, rank: tier.rank, currency, prices, purchasable, features: readTierFeatures(tier.features) };
     }),
   };
 }

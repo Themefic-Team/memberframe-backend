@@ -175,6 +175,10 @@ model Tier {
   currency String  @default("USD") @db.Char(3)
   isActive Boolean @default(true) @map("is_active")
 
+  /// What the tier includes, shown on its pricing card: [{ text, included }].
+  /// memberframe/docs/development-docs/28-tier-features.md
+  features Json?
+
   createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
   updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
 

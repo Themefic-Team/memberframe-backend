@@ -31,6 +31,7 @@ import { invalidateSiteSettings, loadSiteSettings } from "../services/settingsSe
 import { applyMetadata } from "../lib/memberMetadata.js";
 import { currencySchema } from "../lib/currencies.js";
 import { FREE_TIER_RANK, tierPriceProblem, type TierPriceInput } from "../lib/tiers.js";
+import { readTierFeatures, tierFeaturesSchema } from "../lib/tierFeatures.js";
 import { loadPaymentSettings } from "../services/payments/gatewayStore.js";
 import { storePatchSecrets, takePatchSecrets, withoutSecrets } from "../services/integrationSecrets.js";
 import {
@@ -421,6 +422,7 @@ siteRouter.get(
         currency: tier.currency,
         rank: tier.rank,
         isActive: tier.isActive,
+        features: readTierFeatures(tier.features),
       })),
     });
   })
@@ -448,6 +450,8 @@ const tierBodySchema = z.object({
   currency: z.string().optional(),
   rank: z.number().int().min(FREE_TIER_RANK).max(1000),
   isActive: z.boolean().default(true),
+  // Absent on an update keeps the stored list (28-tier-features.md).
+  features: tierFeaturesSchema.optional(),
 });
 
 /** The Free and paid tier price rules, in lib/tiers.ts. A problem is a 400 with its reason. */
@@ -491,10 +495,11 @@ siteRouter.post(
         currency: defaultCurrency,
         rank: input.rank,
         isActive: input.isActive,
+        features: input.features ?? [],
       },
     });
 
-    ok(res, { tier });
+    ok(res, { tier: { ...tier, features: readTierFeatures(tier.features) } });
   })
 );
 
@@ -544,13 +549,14 @@ siteRouter.patch(
           currency: defaultCurrency,
           rank: input.rank,
           isActive: input.isActive,
+          ...(input.features !== undefined ? { features: input.features } : {}),
         },
       }),
       // Prices in other currencies are gone (one site currency); drop any left.
       prisma.tierPrice.deleteMany({ where: { tierId: existing.id } }),
     ]);
 
-    ok(res, { tier });
+    ok(res, { tier: { ...tier, features: readTierFeatures(tier.features) } });
   })
 );
 
