@@ -39,11 +39,14 @@ import { loadSiteSettings } from "../services/settingsService.js";
 import { loadTierLadder } from "../services/sessionService.js";
 import { isSafeSitePath, sectionLockSlug, type GatedPageRule, type SectionLockRule } from "../lib/siteSettings.js";
 import type { TierLadderEntry } from "../lib/entitlement.js";
+import { loadPaymentSettings } from "../services/payments/gatewayStore.js";
 
 export interface ShieldScriptConfig {
   siteKey: string;
   apiBase: string;
   loginPath: string;
+  /** The pricing page, where a section lock's "See plans" card goes. */
+  pricingPath?: string;
   /** Where a signed-in member on a guest page is sent. */
   afterLoginPath?: string;
   /** Sign in and sign up pages. A signed-in member is moved off them. */
@@ -97,6 +100,7 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
   var SITE_KEY = ${JSON.stringify(config.siteKey)};
   var API_BASE = ${JSON.stringify(config.apiBase)};
   var LOGIN_PATH = ${JSON.stringify(config.loginPath || "/login")};
+  var PRICING_PATH = ${JSON.stringify(config.pricingPath || "/pricing")};
   var AFTER_LOGIN_PATH = ${JSON.stringify(config.afterLoginPath || "")};
   var GUEST_PATHS = ${JSON.stringify(config.guestPaths || [])};
   var RULES = ${JSON.stringify(activeRules)};
@@ -412,6 +416,7 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
   function sectionCss(result) {
     var shown = [];
     var blurred = [];
+    gateRules = [];
     for (var i = 0; i < SECTION_RULES.length; i++) {
       var r = SECTION_RULES[i];
       var visible;
@@ -423,7 +428,11 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
         visible = r.audience === "members" ? entitled : !entitled;
       }
       if (visible) shown.push(sectionSelector(r));
-      else if (result !== null && r.lockedAction === "blur") blurred.push(sectionSelector(r));
+      else if (result !== null && r.lockedAction === "blur") {
+        blurred.push(sectionSelector(r));
+        // A members' lock gets the sign in or upgrade card over its blur.
+        if (r.audience === "members") gateRules.push(r);
+      }
     }
 
     var exempt = shown.concat(blurred);
@@ -444,7 +453,175 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
       (document.head || document.documentElement).appendChild(sectionStyle);
     }
     sectionStyle.textContent = sectionCss(result);
+    gateResult = result;
+    resetGates();
   }
+
+  /* ---- Section gates ----
+   *
+   * Over each blurred members' section, a centred card: "Sign in" for a
+   * visitor, "See plans" for a member whose plan is too low. The card lives
+   * in <body>, laid over the section's box, never inside it: the section is
+   * React's, and a node added there before hydration is a mismatch React
+   * removes. Placed again on every DOM change, resize, and load, in a frame.
+   */
+
+  var GATE_CSS =
+    ".mf-section-gate{position:absolute;z-index:5;display:flex;flex-direction:column;align-items:center;box-sizing:border-box;padding:16px;pointer-events:auto}" +
+    ".mf-section-gate-card{position:sticky;top:30vh;margin:auto 0;display:flex;flex-direction:column;align-items:center;gap:8px;max-width:320px;padding:20px 22px;box-sizing:border-box;border-radius:14px;background:#ffffff;color:#111111;border:1px solid rgba(0,0,0,0.08);box-shadow:0 12px 32px -12px rgba(0,0,0,0.28);text-align:center;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Inter,Helvetica,Arial,sans-serif}" +
+    ".mf-section-gate.is-tall .mf-section-gate-card{margin-top:15vh}" +
+    ".mf-section-gate-title{margin:0;font-size:16px;font-weight:700;line-height:1.3}" +
+    ".mf-section-gate-text{margin:0;font-size:13px;line-height:1.5;color:#555555}" +
+    ".mf-section-gate-button{display:inline-flex;align-items:center;justify-content:center;margin-top:4px;padding:10px 18px;border-radius:10px;background:#111111;color:#ffffff;font-size:14px;font-weight:600;line-height:1;text-decoration:none;cursor:pointer}" +
+    ".mf-section-gate-button:hover{background:#333333}" +
+    ".mf-section-gate-button:focus-visible{outline:2px solid #5271ff;outline-offset:2px}";
+
+  var gateRules = [];
+  var gateResult = null;
+  var gates = [];
+  var gateFrame = 0;
+  var gateStyle = null;
+  var gateObserver = null;
+
+  function tierName(key, ladder) {
+    for (var i = 0; i < (ladder || []).length; i++) if (ladder[i].key === key) return ladder[i].name || "";
+    return "";
+  }
+
+  function gateCopy(rule) {
+    var member = gateResult && gateResult !== "unavailable" ? gateResult.member : null;
+    if (!member) return { title: "Members only", text: "Sign in to see this.", label: "Sign in", href: LOGIN_PATH, signIn: true };
+    var name = tierName(rule.requiredTier, gateResult.ladder || TIERS);
+    return {
+      title: name ? name + " members only" : "Members only",
+      text: "Upgrade your plan to see this.",
+      label: "See plans",
+      href: PRICING_PATH,
+      signIn: false
+    };
+  }
+
+  /** Back to this page after signing in: the key MemberAuth reads. */
+  function rememberReturn() {
+    try {
+      window.sessionStorage.setItem(
+        "memberframe:return-to:" + SITE_KEY,
+        JSON.stringify({ path: window.location.pathname + window.location.search, ts: Date.now() })
+      );
+    } catch (e) {}
+  }
+
+  function makeGate(rule) {
+    var copy = gateCopy(rule);
+    var gate = document.createElement("div");
+    gate.className = "mf-section-gate";
+    gate.setAttribute("data-mf-section-gate", rule.slug);
+    var card = document.createElement("div");
+    card.className = "mf-section-gate-card";
+    card.setAttribute("role", "group");
+    card.setAttribute("aria-label", copy.title);
+    var title = document.createElement("p");
+    title.className = "mf-section-gate-title";
+    title.textContent = copy.title;
+    var text = document.createElement("p");
+    text.className = "mf-section-gate-text";
+    text.textContent = copy.text;
+    var link = document.createElement("a");
+    link.className = "mf-section-gate-button";
+    link.href = copy.href;
+    link.textContent = copy.label;
+    if (copy.signIn) link.addEventListener("click", rememberReturn);
+    card.appendChild(title);
+    card.appendChild(text);
+    card.appendChild(link);
+    gate.appendChild(card);
+    return gate;
+  }
+
+  function resetGates() {
+    for (var i = 0; i < gates.length; i++) if (gates[i].gate.parentNode) gates[i].gate.parentNode.removeChild(gates[i].gate);
+    gates = [];
+    scheduleGates();
+  }
+
+  function scheduleGates() {
+    if (gateFrame || !document.body) return;
+    gateFrame = 1;
+    var frame = window.requestAnimationFrame || function(fn) { return setTimeout(fn, 16); };
+    frame(function() {
+      gateFrame = 0;
+      placeGates();
+    });
+  }
+
+  function placeGates() {
+    if (!document.body) return;
+    if (!gateStyle && gateRules.length) {
+      gateStyle = document.createElement("style");
+      gateStyle.id = "memberframe-section-gates";
+      gateStyle.textContent = GATE_CSS;
+      (document.head || document.documentElement).appendChild(gateStyle);
+    }
+    var next = [];
+    for (var r = 0; r < gateRules.length; r++) {
+      var found = document.querySelectorAll(sectionSelector(gateRules[r]));
+      for (var f = 0; f < found.length; f++) {
+        var el = found[f];
+        var existing = null;
+        for (var g = 0; g < gates.length; g++) if (gates[g].el === el) existing = gates[g];
+        next.push(existing || { el: el, gate: makeGate(gateRules[r]), box: "" });
+      }
+    }
+    // Gates whose section is gone, or no longer locked, go.
+    for (var o = 0; o < gates.length; o++) {
+      if (next.indexOf(gates[o]) === -1 && gates[o].gate.parentNode) gates[o].gate.parentNode.removeChild(gates[o].gate);
+    }
+    gates = next;
+    for (var n = 0; n < gates.length; n++) {
+      var entry = gates[n];
+      if (!entry.gate.parentNode) document.body.appendChild(entry.gate);
+      var rect = entry.el.getBoundingClientRect();
+      var hidden = rect.width === 0 && rect.height === 0;
+      var box = hidden
+        ? "display:none"
+        : "top:" + Math.round(rect.top + window.pageYOffset) + "px;left:" + Math.round(rect.left + window.pageXOffset) +
+          "px;width:" + Math.round(rect.width) + "px;height:" + Math.round(rect.height) + "px";
+      // Written only when it moved, so placing a gate never triggers another pass.
+      if (box !== entry.box) {
+        entry.box = box;
+        entry.gate.setAttribute("style", box);
+        entry.gate.className = "mf-section-gate" + (rect.height > window.innerHeight * 0.8 ? " is-tall" : "");
+      }
+    }
+  }
+
+  function watchGates() {
+    if (gateObserver || typeof MutationObserver === "undefined") return;
+    gateObserver = new MutationObserver(function(records) {
+      if (!gateRules.length) return;
+      for (var i = 0; i < records.length; i++) {
+        var target = records[i].target;
+        // Changes inside a gate are the gate's own.
+        if (!(target && target.closest && target.closest(".mf-section-gate"))) {
+          scheduleGates();
+          return;
+        }
+      }
+    });
+    gateObserver.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["style", "class"] });
+    window.addEventListener("resize", scheduleGates);
+    // Framer's scroll effects move layers without touching their attributes.
+    window.addEventListener("scroll", scheduleGates, { passive: true });
+    window.addEventListener("load", scheduleGates);
+    // Its appear animations too: place again once they have run.
+    setTimeout(scheduleGates, 600);
+    setTimeout(scheduleGates, 1600);
+    setTimeout(scheduleGates, 3200);
+    scheduleGates();
+  }
+
+  if (document.body) watchGates();
+  else document.addEventListener("DOMContentLoaded", watchGates);
 
   function resolveSections() {
     var anyEnabled = false;
@@ -707,12 +884,14 @@ export async function handleShieldScript(req: Request, res: Response): Promise<v
   const tiers = await loadTierLadder(site.id);
   const rules = settings.gatedPages || [];
   const loginPath = settings.auth?.loginPath || "/login";
+  const { pricingPath } = await loadPaymentSettings(site.id);
   const apiBase = env.apiBaseUrl;
 
   const js = generateShieldJs({
     siteKey: site.siteKey,
     apiBase,
     loginPath,
+    pricingPath,
     afterLoginPath: settings.auth?.afterLoginPath || "/",
     guestPaths: shieldGuestPaths([settings.auth?.loginPath, settings.auth?.signupPath]),
     rules,

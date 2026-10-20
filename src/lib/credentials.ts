@@ -47,6 +47,18 @@ export const PASSWORD_MIN_LENGTH = 8;
  */
 export const PASSWORD_MAX_LENGTH = 128;
 
+/** The longest minimum a site may ask for. */
+export const PASSWORD_POLICY_MAX_MIN = 64;
+
+/** The rules a creator sets in Settings, Membership. Sign in never checks them. */
+export interface PasswordPolicy {
+  minLength: number;
+  requireNumber: boolean;
+  requireUppercase: boolean;
+  requireLowercase: boolean;
+  requireSymbol: boolean;
+}
+
 /** Below three characters the email check fires on ordinary words. */
 export const EMAIL_FRAGMENT_MIN_LENGTH = 3;
 
@@ -83,6 +95,9 @@ export type PasswordProblem =
   | "too_long"
   | "needs_letter"
   | "needs_number"
+  | "needs_uppercase"
+  | "needs_lowercase"
+  | "needs_symbol"
   | "contains_email"
   | "too_common";
 
@@ -101,12 +116,13 @@ export function looksLikeEmail(value: string): boolean {
 export function passwordProblems(
   password: string,
   email: string,
-  requireStrength: boolean
+  policy: PasswordPolicy
 ): ReadonlyArray<PasswordProblem> {
   const problems: PasswordProblem[] = [];
   const value = String(password ?? "");
+  const rules = readPasswordPolicy(policy);
 
-  if (value.length < PASSWORD_MIN_LENGTH) problems.push("too_short");
+  if (value.length < rules.minLength) problems.push("too_short");
   if (value.length > PASSWORD_MAX_LENGTH) problems.push("too_long");
 
   const lowered = value.toLowerCase();
@@ -126,12 +142,31 @@ export function passwordProblems(
     problems.push("contains_email");
   }
 
-  if (requireStrength) {
-    if (!/[a-zA-Z]/.test(value)) problems.push("needs_letter");
-    if (!/[0-9]/.test(value)) problems.push("needs_number");
-  }
+  // Always a letter; the rest as the site's rules say (05-member-auth.md 13).
+  if (!/[a-zA-Z]/.test(value)) problems.push("needs_letter");
+  if (rules.requireNumber && !/[0-9]/.test(value)) problems.push("needs_number");
+  if (rules.requireUppercase && !/[A-Z]/.test(value)) problems.push("needs_uppercase");
+  if (rules.requireLowercase && !/[a-z]/.test(value)) problems.push("needs_lowercase");
+  if (rules.requireSymbol && !/[^a-zA-Z0-9]/.test(value)) problems.push("needs_symbol");
 
   return problems;
+}
+
+/**
+ * The site's rules, read defensively: a length from 8 to 64, and a number
+ * required unless the rules say otherwise, which is the rule before rules
+ * could be set. Anything missing or malformed falls back to that.
+ */
+export function readPasswordPolicy(value: unknown): PasswordPolicy {
+  const raw = (value && typeof value === "object" ? value : {}) as Partial<Record<keyof PasswordPolicy, unknown>>;
+  const length = Math.round(Number(raw.minLength));
+  return {
+    minLength: Number.isFinite(length) ? Math.min(PASSWORD_POLICY_MAX_MIN, Math.max(PASSWORD_MIN_LENGTH, length)) : PASSWORD_MIN_LENGTH,
+    requireNumber: raw.requireNumber !== false,
+    requireUppercase: raw.requireUppercase === true,
+    requireLowercase: raw.requireLowercase === true,
+    requireSymbol: raw.requireSymbol === true,
+  };
 }
 
 export function passwordScore(password: string): PasswordScore {
@@ -164,14 +199,23 @@ export function passwordScore(password: string): PasswordScore {
 /**
  * The one call a route makes.
  *
- * `requireStrength` is `true` here with no way to turn it off, unlike the
- * client where it is a creator-facing property control. A creator who unticks
- * "Strong Password" is choosing what their sign-up form nags about, not
- * choosing to let a one-character password into the database.
+ * `policy` is the site's rules from its settings (`auth.passwordPolicy`),
+ * never anything the caller sends: the form follows the same rules, but only
+ * this check counts. Whatever the rules, a password is at least 8 characters,
+ * has a letter, is not common, and does not contain the email.
  */
-export function isAcceptablePassword(password: string, email: string): boolean {
-  return passwordProblems(password, email, true).length === 0;
+export function isAcceptablePassword(password: string, email: string, policy: PasswordPolicy): boolean {
+  return passwordProblems(password, email, policy).length === 0;
 }
+
+/** A new site's rules, and the rule before rules could be set: 8 characters, a letter, a number. */
+export const DEFAULT_PASSWORD_POLICY: PasswordPolicy = {
+  minLength: 8,
+  requireNumber: true,
+  requireUppercase: false,
+  requireLowercase: false,
+  requireSymbol: false,
+};
 
 /**
  * Normalize an address for storage and lookup.

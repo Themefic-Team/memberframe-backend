@@ -40,11 +40,14 @@ import {
   touchSession,
 } from "../services/sessionService.js";
 import { loadSiteSettings } from "../services/settingsService.js";
+import { isSafeSitePath } from "../lib/siteSettings.js";
 import { pickSiteOrigin } from "../lib/siteLinks.js";
 import { emitMemberEvent } from "../services/webhookService.js";
 import { applyMetadata, publicFieldDefinitions } from "../lib/memberMetadata.js";
 import type { Prisma } from "@prisma/client";
 import { z } from "zod";
+import { signOAuthState, verifyOAuthState } from "../lib/oauthState.js";
+import { resolveOAuthMember, type OAuthProfile } from "../services/memberIdentityService.js";
 import {
   forgotPasswordSchema,
   loginPasswordSchema,
@@ -97,6 +100,17 @@ function memberPayload(member: {
 // renders its locked state. Returning anything else would make the gate show a
 // failure message to someone who simply has not signed in.
 
+/**
+ * Where a member goes once signed in: the site's setting now (Settings,
+ * Membership, After sign in). Sent with every sign in answer, so the forms
+ * follow a change at once; the path a component was written with is only
+ * their fallback. "" means stay on the page.
+ */
+async function afterLoginPathOf(siteId: string): Promise<string> {
+  const path = (await loadSiteSettings(siteId)).auth.afterLoginPath;
+  return path === "" || isSafeSitePath(path) ? path : "/dashboard";
+}
+
 const handleSession = route(async (req: Request, res: Response) => {
   const site = requireSite(req);
   const token = req.cookies?.[env.session.cookieName] as string | undefined;
@@ -113,11 +127,27 @@ const handleSession = route(async (req: Request, res: Response) => {
 
   void touchSession(session.sessionId);
 
-  ok(res, { member: session.member, tiers: session.tiers });
+  ok(res, { member: session.member, tiers: session.tiers, afterLoginPath: await afterLoginPathOf(site.id) });
 });
 
 memberRouter.get("/session", handleSession);
 memberRouter.post("/session", handleSession);
+
+/**
+ * The site's password rules, for the sign up and reset forms
+ * (05-member-auth.md 13). Public and the same for every visitor, so cached a
+ * minute. The forms follow these; the server enforces them on register and
+ * reset either way.
+ */
+memberRouter.get(
+  "/auth-config",
+  route(async (req, res) => {
+    const site = requireSite(req);
+    const settings = await loadSiteSettings(site.id);
+    res.setHeader("Cache-Control", "public, max-age=60");
+    ok(res, { passwordPolicy: settings.auth.passwordPolicy });
+  })
+);
 
 // ============================================================================
 // POST /api/member/register
@@ -190,7 +220,7 @@ memberRouter.post(
 
     setSessionCookie(res, session.token, { maxAgeSeconds: ttl });
 
-    ok(res, { member: memberPayload(member), tiers: await loadTierLadder(site.id) });
+    ok(res, { member: memberPayload(member), tiers: await loadTierLadder(site.id), afterLoginPath: await afterLoginPathOf(site.id) });
   })
 );
 
@@ -271,7 +301,7 @@ memberRouter.post(
 
     if (!member) throw unauthorized("invalid_token");
 
-    ok(res, { member: memberPayload(member), tiers: await loadTierLadder(site.id) });
+    ok(res, { member: memberPayload(member), tiers: await loadTierLadder(site.id), afterLoginPath: await afterLoginPathOf(site.id) });
   })
 );
 
@@ -323,7 +353,7 @@ memberRouter.post(
 
     setSessionCookie(res, session.token, { maxAgeSeconds: ttl });
 
-    ok(res, { member: memberPayload(member), tiers: await loadTierLadder(site.id) });
+    ok(res, { member: memberPayload(member), tiers: await loadTierLadder(site.id), afterLoginPath: await afterLoginPathOf(site.id) });
   })
 );
 
@@ -539,31 +569,21 @@ memberRouter.patch(
 // MULTI-PROVIDER OAUTH COMMON HELPERS
 // ============================================================================
 
+/** Signed and expiring (lib/oauthState.ts): the callback trusts only a state this server wrote. */
 function buildOAuthState(siteId: string, origin: string, returnTo = ""): string {
-  const statePayload = {
-    siteId,
-    origin,
-    returnTo,
-    nonce: Math.random().toString(36).substring(2),
-  };
-  return Buffer.from(JSON.stringify(statePayload)).toString("base64url");
+  return signOAuthState({ siteId, origin, returnTo });
 }
 
+/**
+ * The state, if this server signed it and it has not expired; otherwise empty,
+ * and the callback refuses (`invalid_state`) without sending anything anywhere.
+ */
 function parseOAuthState(stateParam?: string | null): {
   siteId?: string;
   origin?: string;
   returnTo?: string;
 } {
-  if (!stateParam) return {};
-  try {
-    return JSON.parse(Buffer.from(stateParam, "base64url").toString("utf8")) as {
-      siteId?: string;
-      origin?: string;
-      returnTo?: string;
-    };
-  } catch {
-    return {};
-  }
+  return verifyOAuthState(stateParam) ?? {};
 }
 
 /**
@@ -620,6 +640,29 @@ function parseJwtPayload(token: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * The claims of an Apple id_token from Apple's token endpoint, checked: issued
+ * by Apple, for this site's client id, unexpired, with a subject and an email.
+ * Null when any of that fails.
+ */
+export function appleIdClaims(
+  idToken: string,
+  clientId: string,
+  now: number = Date.now()
+): { sub: string; email: string; emailVerified: boolean } | null {
+  const payload = parseJwtPayload(idToken);
+  if (!payload) return null;
+  const aud = payload["aud"];
+  const audiences = Array.isArray(aud) ? aud : [aud];
+  if (payload["iss"] !== "https://appleid.apple.com" || !audiences.includes(clientId)) return null;
+  if (typeof payload["exp"] !== "number" || payload["exp"] * 1000 < now) return null;
+  if (typeof payload["sub"] !== "string" || payload["sub"] === "") return null;
+  if (typeof payload["email"] !== "string" || payload["email"] === "") return null;
+  // Apple sends this as a boolean or as the string "true".
+  const verified = payload["email_verified"] === true || payload["email_verified"] === "true";
+  return { sub: payload["sub"], email: payload["email"], emailVerified: verified };
 }
 
 function renderOAuthPopupHtml(options: {
@@ -698,42 +741,12 @@ async function completeOAuthMemberLogin(
   res: Response,
   req: Request,
   siteId: string,
-  profile: {
-    email: string;
-    name?: string | null;
-    avatarUrl?: string | null;
-    emailVerified?: boolean;
-  }
-) {
-  const emailNormalized = profile.email.toLowerCase().trim();
-  let member = await prisma.member.findFirst({
-    where: { siteId, email: emailNormalized, deletedAt: null },
-  });
-
-  if (!member) {
-    member = await prisma.member.create({
-      data: {
-        siteId,
-        email: emailNormalized,
-        name: profile.name || null,
-        avatarUrl: profile.avatarUrl || null,
-        emailVerifiedAt: profile.emailVerified ? new Date() : null,
-        activeTier: await freeTierKey(siteId),
-        status: "active",
-      },
-    });
-    void emitMemberEvent("member.created", { id: member.id, siteId });
-  } else {
-    await prisma.member.update({
-      where: { id: member.id },
-      data: {
-        lastLoginAt: new Date(),
-        name: member.name || profile.name || null,
-        avatarUrl: member.avatarUrl || profile.avatarUrl || null,
-        emailVerifiedAt: member.emailVerifiedAt || (profile.emailVerified ? new Date() : null),
-      },
-    });
-  }
+  profile: OAuthProfile
+): Promise<{ handoff: string; refused?: undefined } | { handoff: null; refused: string }> {
+  // Which member, by this provider's identity first, then a verified email
+  // (services/memberIdentityService.ts, 31-sign-in-methods.md).
+  const member = await resolveOAuthMember(siteId, profile);
+  if ("refused" in member) return { handoff: null, refused: member.refused };
 
   const ttl = sessionLifetimeSeconds(true);
   const session = await issueSession(member.id, siteId, ttl, {
@@ -749,7 +762,7 @@ async function completeOAuthMemberLogin(
     ipAddress: req.ip,
   });
 
-  return { member, handoff: handoff.token };
+  return { handoff: handoff.token };
 }
 
 // ============================================================================
@@ -782,7 +795,7 @@ memberRouter.post(
     });
     setSessionCookie(res, session.token, { maxAgeSeconds: ttl });
 
-    ok(res, { member: handoff.member, tiers: handoff.tiers });
+    ok(res, { member: handoff.member, tiers: handoff.tiers, afterLoginPath: await afterLoginPathOf(site.id) });
   })
 );
 
@@ -848,8 +861,9 @@ memberRouter.get(
       return;
     }
 
-    const siteId = stateObj.siteId || req.site?.id;
-    if (!siteId) throw badRequest("missing_site_id");
+    const siteId = stateObj.siteId;
+    // Only a state this server signed names the site (lib/oauthState.ts).
+    if (!siteId) throw badRequest("invalid_state");
 
     const site = await prisma.site.findUnique({ where: { id: siteId } });
     if (!site) throw badRequest("unknown_site");
@@ -900,6 +914,7 @@ memberRouter.get(
     if (!userinfoResponse.ok) throw badRequest("google_userinfo_failed");
 
     const profile = (await userinfoResponse.json()) as {
+      sub?: string;
       email: string;
       email_verified?: boolean;
       name?: string;
@@ -907,18 +922,23 @@ memberRouter.get(
     };
 
     if (!profile.email) throw badRequest("google_profile_missing_email");
+    if (!profile.sub) throw badRequest("google_profile_missing_id");
 
     const login = await completeOAuthMemberLogin(res, req, site.id, {
+      provider: "google",
+      providerUserId: profile.sub,
       email: profile.email,
       name: profile.name,
       avatarUrl: profile.picture,
-      emailVerified: profile.email_verified,
+      emailVerified: profile.email_verified === true,
     });
 
     res.type("html").send(
       renderOAuthPopupHtml({
-        ok: true,
-        handoff: login.handoff,
+        // A refused link (an unverified email on an existing account) goes back with its reason.
+        ok: login.refused === undefined,
+        handoff: login.handoff ?? undefined,
+        reason: login.refused,
         targetOrigin,
         returnTo: stateObj.returnTo,
         providerName: "Google",
@@ -988,8 +1008,9 @@ memberRouter.get(
       return;
     }
 
-    const siteId = stateObj.siteId || req.site?.id;
-    if (!siteId) throw badRequest("missing_site_id");
+    const siteId = stateObj.siteId;
+    // Only a state this server signed names the site (lib/oauthState.ts).
+    if (!siteId) throw badRequest("invalid_state");
 
     const site = await prisma.site.findUnique({ where: { id: siteId } });
     if (!site) throw badRequest("unknown_site");
@@ -1063,28 +1084,42 @@ memberRouter.get(
       email?: string | null;
     };
 
-    let resolvedEmail = userProfile.email;
-    if (!resolvedEmail) {
-      const emailsResponse = await fetch("https://api.github.com/user/emails", {
-        headers: {
-          Authorization: `Bearer ${tokenData.access_token}`,
-          "User-Agent": "MemberFrame-OAuth",
-        },
-      });
-      if (emailsResponse.ok) {
-        const emails = (await emailsResponse.json()) as Array<{
-          email: string;
-          primary?: boolean;
-          verified?: boolean;
-        }>;
-        const primary = emails.find((e) => e.primary && e.verified) || emails.find((e) => e.verified) || emails[0];
-        if (primary) resolvedEmail = primary.email;
-      }
+    // Always the address list, never the profile's public email: only the list
+    // says which addresses GitHub verified, and an unverified one must never
+    // sign in to an account (31-sign-in-methods.md 4).
+    let resolvedEmail: string | null = null;
+    const emailsResponse = await fetch("https://api.github.com/user/emails", {
+      headers: {
+        Authorization: `Bearer ${tokenData.access_token}`,
+        "User-Agent": "MemberFrame-OAuth",
+      },
+    });
+    if (emailsResponse.ok) {
+      const emails = (await emailsResponse.json()) as Array<{
+        email: string;
+        primary?: boolean;
+        verified?: boolean;
+      }>;
+      const verified = emails.find((e) => e.primary && e.verified) || emails.find((e) => e.verified);
+      if (verified) resolvedEmail = verified.email;
     }
 
-    if (!resolvedEmail) throw badRequest("github_profile_missing_email");
+    if (!resolvedEmail) {
+      res.type("html").send(
+        renderOAuthPopupHtml({
+          ok: false,
+          targetOrigin,
+          returnTo: stateObj.returnTo,
+          reason: "github_email_unverified",
+          providerName: "GitHub",
+        })
+      );
+      return;
+    }
 
     const login = await completeOAuthMemberLogin(res, req, site.id, {
+      provider: "github",
+      providerUserId: String(userProfile.id),
       email: resolvedEmail,
       name: userProfile.name || userProfile.login,
       avatarUrl: userProfile.avatar_url,
@@ -1093,8 +1128,10 @@ memberRouter.get(
 
     res.type("html").send(
       renderOAuthPopupHtml({
-        ok: true,
-        handoff: login.handoff,
+        // A refused link (an unverified email on an existing account) goes back with its reason.
+        ok: login.refused === undefined,
+        handoff: login.handoff ?? undefined,
+        reason: login.refused,
         targetOrigin,
         returnTo: stateObj.returnTo,
         providerName: "GitHub",
@@ -1145,40 +1182,40 @@ memberRouter.get(
 
 const handleAppleCallback = route(async (req, res) => {
   const code = typeof req.body?.["code"] === "string" ? req.body["code"] : typeof req.query?.["code"] === "string" ? req.query["code"] : null;
-  const idToken = typeof req.body?.["id_token"] === "string" ? req.body["id_token"] : typeof req.query?.["id_token"] === "string" ? req.query["id_token"] : null;
   const stateParam = typeof req.body?.["state"] === "string" ? req.body["state"] : typeof req.query?.["state"] === "string" ? req.query["state"] : null;
   const errorParam = typeof req.body?.["error"] === "string" ? req.body["error"] : typeof req.query?.["error"] === "string" ? req.query["error"] : null;
 
   const stateObj = parseOAuthState(stateParam);
   const targetOrigin = stateObj.origin || "*";
 
-  if (errorParam || (!code && !idToken)) {
+  const fail = (reason: string) => {
     res.type("html").send(
-      renderOAuthPopupHtml({
-        ok: false,
-        targetOrigin,
-        returnTo: stateObj.returnTo,
-        reason: errorParam || "no_code_or_token",
-        providerName: "Apple",
-      })
+      renderOAuthPopupHtml({ ok: false, targetOrigin, returnTo: stateObj.returnTo, reason, providerName: "Apple" })
     );
+  };
+
+  // An `id_token` posted to this page is never read: anyone can post one, and
+  // it was once trusted unsigned, which let a forged token sign in as any
+  // member. Only the token Apple's own endpoint returns for this code counts.
+  if (errorParam || !code) {
+    fail(errorParam || "no_code");
     return;
   }
 
-  const siteId = stateObj.siteId || req.site?.id;
-  if (!siteId) throw badRequest("missing_site_id");
+  const siteId = stateObj.siteId;
+  // Only a state this server signed names the site (lib/oauthState.ts).
+  if (!siteId) throw badRequest("invalid_state");
 
   const site = await prisma.site.findUnique({ where: { id: siteId } });
   if (!site) throw badRequest("unknown_site");
 
   const settings = await loadSiteSettings(site.id);
-
-  let email: string | null = null;
-  if (idToken) {
-    const jwtPayload = parseJwtPayload(idToken);
-    if (jwtPayload && typeof jwtPayload["email"] === "string") {
-      email = jwtPayload["email"];
-    }
+  const apple = settings.integrations?.["apple_oauth"];
+  const appleSecret = apple ? await readIntegrationSecret(site.id, "apple_oauth", "clientSecret", apple.values) : "";
+  const clientId = apple?.values?.["clientId"] || "";
+  if (!apple || !appleSecret || !clientId) {
+    fail("apple_oauth_credentials_missing");
+    return;
   }
 
   let appleName: string | null = null;
@@ -1192,57 +1229,46 @@ const handleAppleCallback = route(async (req, res) => {
     }
   }
 
-  if (!email && code) {
-    // If id_token wasn't returned in form_post directly, exchange code with Apple token endpoint
-    const apple = settings.integrations?.["apple_oauth"];
-    const appleSecret = apple ? await readIntegrationSecret(site.id, "apple_oauth", "clientSecret", apple.values) : "";
-    if (apple && appleSecret) {
-      const redirectUri = apple.values["redirect_url"] || `${env.apiBaseUrl}/api/member/oauth/apple/callback`;
-      const tokenRes = await fetch("https://appleid.apple.com/auth/token", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          client_id: apple.values["clientId"] || "",
-          client_secret: appleSecret,
-          code,
-          grant_type: "authorization_code",
-          redirect_uri: redirectUri,
-        }),
-      });
-      if (tokenRes.ok) {
-        const tokenJson = (await tokenRes.json()) as { id_token?: string };
-        if (tokenJson.id_token) {
-          const payload = parseJwtPayload(tokenJson.id_token);
-          if (payload && typeof payload["email"] === "string") email = payload["email"];
-        }
-      }
-    }
+  const redirectUri = apple.values["redirect_url"] || `${env.apiBaseUrl}/api/member/oauth/apple/callback`;
+  const tokenRes = await fetch("https://appleid.apple.com/auth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: clientId,
+      client_secret: appleSecret,
+      code,
+      grant_type: "authorization_code",
+      redirect_uri: redirectUri,
+    }),
+  });
+  if (!tokenRes.ok) {
+    fail("token_exchange_failed");
+    return;
   }
 
-  if (!email) {
-    res.type("html").send(
-      renderOAuthPopupHtml({
-        ok: false,
-        targetOrigin,
-        returnTo: stateObj.returnTo,
-        reason: "apple_profile_missing_email",
-        providerName: "Apple",
-      })
-    );
+  // Straight from Apple over TLS, so its signature need not be checked here
+  // (OpenID Connect Core 3.1.3.7); who issued it, for whom, and when still are.
+  const tokenJson = (await tokenRes.json()) as { id_token?: string };
+  const claims = tokenJson.id_token ? appleIdClaims(tokenJson.id_token, clientId) : null;
+  if (!claims) {
+    fail("apple_invalid_token");
     return;
   }
 
   const login = await completeOAuthMemberLogin(res, req, site.id, {
-    email,
+    provider: "apple",
+    providerUserId: claims.sub,
+    email: claims.email,
     name: appleName,
     avatarUrl: null,
-    emailVerified: true,
+    emailVerified: claims.emailVerified,
   });
 
   res.type("html").send(
     renderOAuthPopupHtml({
-      ok: true,
-      handoff: login.handoff,
+      ok: login.refused === undefined,
+      handoff: login.handoff ?? undefined,
+      reason: login.refused,
       targetOrigin,
       returnTo: stateObj.returnTo,
       providerName: "Apple",
@@ -1316,8 +1342,9 @@ memberRouter.get(
       return;
     }
 
-    const siteId = stateObj.siteId || req.site?.id;
-    if (!siteId) throw badRequest("missing_site_id");
+    const siteId = stateObj.siteId;
+    // Only a state this server signed names the site (lib/oauthState.ts).
+    if (!siteId) throw badRequest("invalid_state");
 
     const site = await prisma.site.findUnique({ where: { id: siteId } });
     if (!site) throw badRequest("unknown_site");
@@ -1378,21 +1405,39 @@ memberRouter.get(
 
     if (!user.email) throw badRequest("discord_profile_missing_email");
 
+    // An address Discord has not verified signs in to nothing (31-sign-in-methods.md 4).
+    if (user.verified !== true) {
+      res.type("html").send(
+        renderOAuthPopupHtml({
+          ok: false,
+          targetOrigin,
+          returnTo: stateObj.returnTo,
+          reason: "discord_email_unverified",
+          providerName: "Discord",
+        })
+      );
+      return;
+    }
+
     const avatarUrl = user.avatar
       ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png`
       : null;
 
     const login = await completeOAuthMemberLogin(res, req, site.id, {
+      provider: "discord",
+      providerUserId: user.id,
       email: user.email,
       name: user.global_name || user.username,
       avatarUrl,
-      emailVerified: Boolean(user.verified),
+      emailVerified: true,
     });
 
     res.type("html").send(
       renderOAuthPopupHtml({
-        ok: true,
-        handoff: login.handoff,
+        // A refused link (an unverified email on an existing account) goes back with its reason.
+        ok: login.refused === undefined,
+        handoff: login.handoff ?? undefined,
+        reason: login.refused,
         targetOrigin,
         returnTo: stateObj.returnTo,
         providerName: "Discord",

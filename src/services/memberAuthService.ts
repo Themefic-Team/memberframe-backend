@@ -98,9 +98,10 @@ export async function registerMember(input: {
   // Server-side policy, independent of the client's copy. The client's rules
   // are a hint; `lib/credentials.ts` is the rule. A request that bypasses the
   // form entirely arrives here and is refused the same way.
-  if (!isAcceptablePassword(input.password, email)) {
+  const { passwordPolicy } = (await loadSiteSettings(input.siteId)).auth;
+  if (!isAcceptablePassword(input.password, email, passwordPolicy)) {
     throw badRequest("weak_password", {
-      problems: passwordProblems(input.password, email, true),
+      problems: passwordProblems(input.password, email, passwordPolicy),
     });
   }
 
@@ -123,6 +124,7 @@ export async function registerMember(input: {
         passwordUpdatedAt: new Date(),
         // Set by `verifyMemberEmail`. Sign in waits on it.
         emailVerifiedAt: null,
+        signupMethod: "email",
         activeTier: await freeTierKey(input.siteId),
         status: "active",
       },
@@ -397,9 +399,10 @@ export async function resetPassword(input: {
 
   const email = record.member.email;
 
-  if (!isAcceptablePassword(input.newPassword, email)) {
+  const { passwordPolicy } = (await loadSiteSettings(input.siteId)).auth;
+  if (!isAcceptablePassword(input.newPassword, email, passwordPolicy)) {
     throw badRequest("weak_password", {
-      problems: passwordProblems(input.newPassword, email, true),
+      problems: passwordProblems(input.newPassword, email, passwordPolicy),
     });
   }
 

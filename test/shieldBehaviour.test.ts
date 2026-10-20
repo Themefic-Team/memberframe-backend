@@ -634,3 +634,108 @@ describe("section locks", () => {
     expect(exempt(shield.sectionCss())).toContain(VIP);
   });
 });
+
+describe("section gates: the card over a blurred members' section", () => {
+  type FakeEl = {
+    tag: string;
+    id: string;
+    className: string;
+    textContent: string;
+    href?: string;
+    attrs: Record<string, string>;
+    children: FakeEl[];
+    parentNode: FakeEl | null;
+    listeners: Record<string, Array<() => void>>;
+    setAttribute(name: string, value: string): void;
+    appendChild(child: FakeEl): void;
+    removeChild(child: FakeEl): void;
+    addEventListener(type: string, fn: () => void): void;
+  };
+  const el = (tag: string): FakeEl => ({
+    tag,
+    id: "",
+    className: "",
+    textContent: "",
+    attrs: {},
+    children: [],
+    parentNode: null,
+    listeners: {},
+    setAttribute(name, value) {
+      this.attrs[name] = value;
+    },
+    appendChild(child) {
+      child.parentNode = this;
+      this.children.push(child);
+    },
+    removeChild(child) {
+      this.children = this.children.filter((entry) => entry !== child);
+      child.parentNode = null;
+    },
+    addEventListener(type, fn) {
+      (this.listeners[type] ??= []).push(fn);
+    },
+  });
+
+  function run(answer: { status: number; body: unknown }) {
+    const head = el("head");
+    const body = el("body");
+    const section = { getBoundingClientRect: () => ({ top: 100, left: 20, width: 600, height: 300 }) };
+    const session = memoryStorage();
+    const window = {
+      location: { pathname: "/about", search: "", hash: "", origin: ORIGIN, href: `${ORIGIN}/about`, replace: vi.fn(), reload: vi.fn() },
+      history: { pushState: vi.fn(), replaceState: vi.fn() },
+      localStorage: memoryStorage(),
+      sessionStorage: session,
+      addEventListener: vi.fn(),
+      requestAnimationFrame: (fn: () => void) => {
+        fn();
+        return 1;
+      },
+      pageXOffset: 0,
+      pageYOffset: 50,
+      innerHeight: 800,
+    };
+    const document = {
+      head,
+      body,
+      documentElement: head,
+      createElement: (tag: string) => el(tag),
+      addEventListener: vi.fn(),
+      querySelectorAll: (selector: string) => (selector.includes(".mf-lock-about-content") ? [section] : []),
+    };
+    const fetch = vi.fn(() => Promise.resolve({ status: answer.status, ok: answer.status < 300, json: () => Promise.resolve(answer.body) }));
+    const js = generateShieldJs({
+      siteKey: SITE_KEY,
+      apiBase: "https://api.test",
+      loginPath: "/login",
+      pricingPath: "/pricing",
+      rules: [],
+      tiers: [...TIERS, { key: "standard", rank: 1, name: "Standard" }],
+      sectionRules: [{ name: "About Content", enabled: true, audience: "members", requiredTier: "standard", lockedAction: "blur" }],
+    });
+    new Function("window", "document", "fetch", "setTimeout", "clearTimeout", "URL", js)(window, document, fetch, () => 0, () => undefined, URL);
+    const card = () => body.children[0]?.children[0];
+    return { body, session, card };
+  }
+
+  const text = (node: FakeEl | undefined) => (node ? node.children.map((child) => child.textContent) : []);
+
+  it("asks a visitor to sign in, over the section's box, and remembers the page", async () => {
+    const shield = run({ status: 401, body: {} });
+    await flush();
+    const gate = shield.body.children[0]!;
+    expect(gate.attrs["style"]).toBe("top:150px;left:20px;width:600px;height:300px");
+    expect(text(shield.card())).toEqual(["Members only", "Sign in to see this.", "Sign in"]);
+    const link = shield.card()!.children[2]!;
+    expect(link.href).toBe("/login");
+    link.listeners["click"]![0]!();
+    expect(JSON.parse(shield.session.getItem(`memberframe:return-to:${SITE_KEY}`)!).path).toBe("/about");
+  });
+
+  it("offers a member on a lower plan the plans, naming the tier", async () => {
+    const shield = run({ status: 200, body: { member: FREE_MEMBER, tiers: [...TIERS, { key: "standard", rank: 1, name: "Standard" }] } });
+    await flush();
+    expect(text(shield.card())).toEqual(["Standard members only", "Upgrade your plan to see this.", "See plans"]);
+    expect(shield.card()!.children[2]!.href).toBe("/pricing");
+  });
+});

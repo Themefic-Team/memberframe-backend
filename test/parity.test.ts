@@ -209,12 +209,13 @@ describe("the parity check can fail", () => {
 // THE PASSWORD POLICY, ALL THREE COPIES
 // ============================================================================
 
-const SHARED_FUNCTIONS = ["looksLikeEmail", "passwordProblems", "passwordScore"] as const;
+const SHARED_FUNCTIONS = ["looksLikeEmail", "passwordProblems", "readPasswordPolicy", "passwordScore"] as const;
 
 const SHARED_CONSTANTS = [
   "PASSWORD_MIN_LENGTH",
   "PASSWORD_MAX_LENGTH",
   "EMAIL_FRAGMENT_MIN_LENGTH",
+  "PASSWORD_POLICY_MAX_MIN",
 ] as const;
 
 describe("the password policy is identical in all three copies", () => {
@@ -258,18 +259,18 @@ describe("the password policy is identical in all three copies", () => {
 describe("the server copy is the rule, not the hint", () => {
   const backendSource = read(SOURCES.backend.credentials);
 
-  it("does not let a caller turn strength checking off", () => {
-    // `requirePasswordStrength` is a creator-facing property control on the
-    // component, where it decides what the sign-up form nags about. A creator
-    // unticking it is not choosing to let a one-character password into the
-    // database, so the server's own entry point hard-codes true.
-    expect(backendSource).toContain("passwordProblems(password, email, true)");
+  it("takes the rules only from the site's settings, never from the request", () => {
+    // 05-member-auth.md 13: the creator sets the rules in the plugin; a caller
+    // posting to register or reset cannot choose weaker ones.
+    expect(backendSource).toMatch(/export function isAcceptablePassword\(password: string, email: string, policy: PasswordPolicy\)/);
+    const service = read(path.join(process.cwd(), "src", "services", "memberAuthService.ts"));
+    expect(service.match(/const \{ passwordPolicy \} = \(await loadSiteSettings\(input\.siteId\)\)\.auth;/g)?.length).toBe(2);
+    expect(service).not.toMatch(/passwordProblems\([^)]*true\)/);
   });
 
-  it("exposes an entry point that takes no strength flag at all", () => {
-    expect(backendSource).toMatch(
-      /export function isAcceptablePassword\(\s*password: string,\s*email: string\s*\)/
-    );
+  it("keeps the floor whatever the rules: 8 characters and a letter", () => {
+    expect(backendSource).toContain("Math.max(PASSWORD_MIN_LENGTH, length)");
+    expect(backendSource).toContain('if (!/[a-zA-Z]/.test(value)) problems.push("needs_letter");');
   });
 });
 

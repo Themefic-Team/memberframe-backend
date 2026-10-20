@@ -239,6 +239,11 @@ model Member {
   lockedUntil      DateTime? @map("locked_until") @db.DateTime(3)
   lastLoginAt      DateTime? @map("last_login_at") @db.DateTime(3)
 
+  /// How the account was created: email, google, apple, github, discord, or
+  /// added (by the creator). NULL for members from before 2026-10-23.
+  /// 31-sign-in-methods.md.
+  signupMethod String? @map("signup_method") @db.VarChar(20)
+
   createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
   updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
 
@@ -253,11 +258,36 @@ model Member {
   bookmarks      Bookmark[]
   /// FP-07, one row while signed in
   meterCycle     MeterCycle?
+  /// The social sign ins linked to this account. 31-sign-in-methods.md.
+  identities     MemberIdentity[]
 
   @@index([siteId, status])
   @@index([siteId, activeTier])
   @@index([lockedUntil])
   @@map("members")
+}
+
+/// One social sign in linked to a member: the provider and the provider's own
+/// stable user id (Google and Apple `sub`, GitHub and Discord `id`). Found by
+/// that id first, so a member who changes their email at the provider still
+/// reaches the same account. 31-sign-in-methods.md.
+model MemberIdentity {
+  id             String   @id @default(uuid(7)) @db.Char(36)
+  siteId         String   @map("site_id") @db.Char(36)
+  memberId       String   @map("member_id") @db.Char(36)
+  /// google, apple, github, discord
+  provider       String   @db.VarChar(20)
+  providerUserId String   @map("provider_user_id") @db.VarChar(191)
+  /// The address the provider gave at the last sign in.
+  email          String   @db.VarChar(255)
+  createdAt      DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  lastUsedAt     DateTime @default(now()) @map("last_used_at") @db.DateTime(3)
+
+  member Member @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@unique([siteId, provider, providerUserId])
+  @@index([memberId])
+  @@map("member_identities")
 }
 
 /// An opaque server-side session.

@@ -529,3 +529,29 @@ describe("section lock identity", () => {
     expect(dup.some((p) => p.path === "sectionLocks.1.name")).toBe(true);
   });
 });
+
+describe("password rules (05-member-auth.md 13)", () => {
+  it("reads an older document's Strong Password flag as the number rule", () => {
+    expect(withDefaults({ auth: { requirePasswordStrength: true } }).auth.passwordPolicy).toEqual({
+      minLength: 8,
+      requireNumber: true,
+      requireUppercase: false,
+      requireLowercase: false,
+      requireSymbol: false,
+    });
+    expect(withDefaults({ auth: { requirePasswordStrength: false } }).auth.passwordPolicy.requireNumber).toBe(false);
+  });
+
+  it("refuses a minimum outside 8 to 64 and a rule that is not on or off", () => {
+    expect(validatePatch({ auth: { passwordPolicy: { minLength: 4 } } }).map((p) => p.path)).toContain("auth.passwordPolicy.minLength");
+    expect(validatePatch({ auth: { passwordPolicy: { requireSymbol: "yes" } } }).map((p) => p.path)).toContain("auth.passwordPolicy.requireSymbol");
+    expect(validatePatch({ auth: { passwordPolicy: { minLength: 12, requireSymbol: true } } })).toEqual([]);
+  });
+
+  it("merges a patch into the rules, and keeps the old flag in step", () => {
+    const next = mergeSettings(defaultSettings(), { auth: { passwordPolicy: { minLength: 12, requireNumber: false, requireSymbol: true } } });
+    expect(next.auth.passwordPolicy).toMatchObject({ minLength: 12, requireNumber: false, requireSymbol: true });
+    expect(next.auth.requirePasswordStrength).toBe(false);
+    expect(toJsonDocument(next).auth).toMatchObject({ passwordPolicy: { minLength: 12, requireSymbol: true } });
+  });
+});

@@ -35,6 +35,13 @@
 import type { Prisma } from "@prisma/client";
 import { env } from "../config/env.js";
 import { SITE_SMTP_ID, smtpValueProblems } from "./siteSmtp.js";
+import {
+  DEFAULT_PASSWORD_POLICY,
+  PASSWORD_MIN_LENGTH,
+  PASSWORD_POLICY_MAX_MIN,
+  readPasswordPolicy,
+  type PasswordPolicy,
+} from "./credentials.js";
 
 // ============================================================================
 // THE SHAPE
@@ -75,8 +82,13 @@ export interface AuthSettings {
   allowRegistration: boolean;
   /** Which view `<MemberAuth>` opens on. */
   defaultMethod: AuthMethodSetting;
-  /** Whether the password policy asks for a letter and a digit. */
+  /** Kept for older plugins: the same as `passwordPolicy.requireNumber`. */
   requirePasswordStrength: boolean;
+  /**
+   * The site's password rules for sign up and reset (05-member-auth.md 13).
+   * The server enforces them; every form follows them. Sign in never checks.
+   */
+  passwordPolicy: PasswordPolicy;
   /** Days a "remember me" session lasts. */
   rememberMeDays: number;
 }
@@ -398,6 +410,7 @@ export const DEFAULT_AUTH_SETTINGS: AuthSettings = {
   // touch anything, so it points at the path that works.
   defaultMethod: "password",
   requirePasswordStrength: true,
+  passwordPolicy: { ...DEFAULT_PASSWORD_POLICY },
   rememberMeDays: 30,
 };
 
@@ -721,6 +734,11 @@ export function withDefaults(stored: unknown): SiteSettingsDocument {
         "requirePasswordStrength",
         base.auth.requirePasswordStrength
       ),
+      // Before rules could be set, the one flag meant "a number"; off meant none.
+      passwordPolicy:
+        auth["passwordPolicy"] !== undefined
+          ? readPasswordPolicy(auth["passwordPolicy"])
+          : { ...DEFAULT_PASSWORD_POLICY, requireNumber: bool(auth, "requirePasswordStrength", base.auth.requirePasswordStrength) },
       rememberMeDays: int(auth, "rememberMeDays", base.auth.rememberMeDays),
     },
     branding: {
@@ -857,6 +875,26 @@ export function validatePatch(patch: unknown): SettingsProblem[] {
       for (const field of ["allowRegistration", "requirePasswordStrength"] as const) {
         if (auth[field] !== undefined && typeof auth[field] !== "boolean") {
           problems.push({ path: `auth.${field}`, message: "That must be on or off." });
+        }
+      }
+
+      const policy = auth["passwordPolicy"];
+      if (policy !== undefined) {
+        if (!isRecord(policy)) {
+          problems.push({ path: "auth.passwordPolicy", message: "Password rules must be an object." });
+        } else {
+          const length = policy["minLength"];
+          if (length !== undefined && (typeof length !== "number" || !Number.isInteger(length) || length < PASSWORD_MIN_LENGTH || length > PASSWORD_POLICY_MAX_MIN)) {
+            problems.push({
+              path: "auth.passwordPolicy.minLength",
+              message: `Choose a minimum between ${PASSWORD_MIN_LENGTH} and ${PASSWORD_POLICY_MAX_MIN} characters.`,
+            });
+          }
+          for (const field of ["requireNumber", "requireUppercase", "requireLowercase", "requireSymbol"] as const) {
+            if (policy[field] !== undefined && typeof policy[field] !== "boolean") {
+              problems.push({ path: `auth.passwordPolicy.${field}`, message: "That must be on or off." });
+            }
+          }
         }
       }
 
@@ -1087,6 +1125,12 @@ export function mergeSettings(
 
     if (typeof auth["requirePasswordStrength"] === "boolean") {
       next.auth.requirePasswordStrength = auth["requirePasswordStrength"];
+      next.auth.passwordPolicy = { ...next.auth.passwordPolicy, requireNumber: auth["requirePasswordStrength"] };
+    }
+
+    if (isRecord(auth["passwordPolicy"])) {
+      next.auth.passwordPolicy = readPasswordPolicy({ ...next.auth.passwordPolicy, ...auth["passwordPolicy"] });
+      next.auth.requirePasswordStrength = next.auth.passwordPolicy.requireNumber;
     }
 
     if (typeof auth["rememberMeDays"] === "number" && Number.isInteger(auth["rememberMeDays"])) {
@@ -1191,6 +1235,7 @@ export function toJsonDocument(document: SiteSettingsDocument): Prisma.InputJson
       allowRegistration: document.auth.allowRegistration,
       defaultMethod: document.auth.defaultMethod,
       requirePasswordStrength: document.auth.requirePasswordStrength,
+      passwordPolicy: { ...document.auth.passwordPolicy },
       rememberMeDays: document.auth.rememberMeDays,
     },
     branding: {

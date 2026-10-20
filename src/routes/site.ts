@@ -86,6 +86,37 @@ const memberQuerySchema = z.object({
   status: z.enum(["active", "trialing", "past_due", "canceled"]).optional(),
 });
 
+/**
+ * How a member signs in, for the Manage flyout (31-sign-in-methods.md): how
+ * the account was made, the social identities linked to it, and whether it
+ * has a password. The hash itself never leaves this file.
+ */
+const SIGN_IN_SELECT = {
+  signupMethod: true,
+  passwordHash: true,
+  identities: {
+    select: { provider: true, email: true, createdAt: true, lastUsedAt: true },
+    orderBy: { createdAt: "asc" as const },
+  },
+};
+
+function signInMethods(row: {
+  signupMethod: string | null;
+  passwordHash: string | null;
+  identities: ReadonlyArray<{ provider: string; email: string; createdAt: Date; lastUsedAt: Date }>;
+}) {
+  return {
+    signupMethod: row.signupMethod,
+    hasPassword: row.passwordHash !== null,
+    identities: row.identities.map((identity) => ({
+      provider: identity.provider,
+      email: identity.email,
+      createdAt: identity.createdAt.toISOString(),
+      lastUsedAt: identity.lastUsedAt.toISOString(),
+    })),
+  };
+}
+
 siteRouter.get(
   "/members",
   route(async (req, res) => {
@@ -127,6 +158,7 @@ siteRouter.get(
           status: true,
           createdAt: true,
           metadata: true,
+          ...SIGN_IN_SELECT,
         },
       }),
     ]);
@@ -178,6 +210,7 @@ siteRouter.get(
         currency: spendOf(row.id).currency,
         gateway: gatewayOf(row.id),
         metadata: metadataOf(row.metadata),
+        ...signInMethods(row),
       })),
       page: query.page,
       pageSize: PAGE_SIZE,
@@ -293,7 +326,7 @@ const memberActionSchema = z.object({ siteId: siteIdSchema });
 async function memberRecord(siteId: string, memberId: string) {
   const member = await prisma.member.findFirstOrThrow({
     where: { id: memberId, siteId },
-    select: { id: true, email: true, name: true, avatarUrl: true, activeTier: true, status: true, createdAt: true, metadata: true },
+    select: { id: true, email: true, name: true, avatarUrl: true, activeTier: true, status: true, createdAt: true, metadata: true, ...SIGN_IN_SELECT },
   });
   const settings = await loadSiteSettings(siteId);
   return {
@@ -308,6 +341,7 @@ async function memberRecord(siteId: string, memberId: string) {
     currency: (await loadPaymentSettings(siteId)).defaultCurrency,
     gateway: "stripe",
     metadata: applyMetadata(settings.customFields, member.metadata, {}).metadata,
+    ...signInMethods(member),
   };
 }
 
