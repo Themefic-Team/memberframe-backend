@@ -18,6 +18,9 @@ import { freeTierKey } from "../../lib/tiers.js";
 import { loadTierLadder } from "../sessionService.js";
 import { emitMemberEvent } from "../webhookService.js";
 import { ADAPTERS, loadCredentials, loadPaymentSettings } from "./gatewayStore.js";
+import { tierAmount, unusedCredit } from "./prices.js";
+import { sendMail } from "../../lib/mailer.js";
+import { parseAllowedOrigins } from "../../middleware/site.js";
 import type { GatewayCredentials, GatewayId, PaymentEvent, PaymentMode } from "./types.js";
 
 /** Subscription statuses that still grant their tier. */
@@ -103,26 +106,8 @@ export async function recomputeMember(siteId: string, memberId: string): Promise
   }
 }
 
-/**
- * What a switch credits for the time the old plan had left: the last payment
- * on it, times the share of its period still unused. Zero once the period is
- * over, and never more than was paid.
- */
-export function unusedCredit(
-  paidMinor: number,
-  interval: string,
-  periodEnd: Date | null,
-  now: Date = new Date()
-): number {
-  if (!periodEnd || paidMinor <= 0 || (interval !== "month" && interval !== "year")) return 0;
-  const start = new Date(periodEnd);
-  if (interval === "month") start.setUTCMonth(start.getUTCMonth() - 1);
-  else start.setUTCFullYear(start.getUTCFullYear() - 1);
-  const length = periodEnd.getTime() - start.getTime();
-  const left = periodEnd.getTime() - now.getTime();
-  if (length <= 0 || left <= 0) return 0;
-  return Math.floor(paidMinor * Math.min(1, left / length));
-}
+/** Moved to prices.ts (30-plan-changes.md); re-exported for existing callers. */
+export { unusedCredit } from "./prices.js";
 
 /** Refunds below this are not worth a gateway call or the buyer's attention. */
 const MIN_CREDIT_MINOR = 50;
@@ -276,10 +261,32 @@ async function activate(
         orderBy: { paidAt: "desc" },
       });
       const credit = lastPaid ? unusedCredit(lastPaid.amountMinor, other.interval, other.currentPeriodEnd) : 0;
-      if (lastPaid && credit >= MIN_CREDIT_MINOR && otherAdapter.refund) {
+      // Already given off this purchase's first charge (30-plan-changes.md):
+      // refunding it as well would credit the member twice.
+      if ((checkout.creditMinor ?? 0) > 0) {
+        log(`unused time on ${other.tierKey} already credited as a discount of ${checkout.creditMinor}`);
+      } else if (!lastPaid) {
+        log(`no recorded payment on ${other.id} to refund its unused time from`);
+      } else if (credit >= MIN_CREDIT_MINOR && otherAdapter.refund) {
         try {
           await otherAdapter.refund(otherCredentials, lastPaid.externalId, credit, lastPaid.currency);
           log(`credited ${credit} ${lastPaid.currency} for unused time on ${other.tierKey}`);
+          // In the member's history as its own line.
+          await prisma.payment.create({
+            data: {
+              siteId,
+              memberId: checkout.memberId,
+              subscriptionId: other.id,
+              gateway: other.gateway,
+              mode: other.mode,
+              externalId: `credit-${other.id}`,
+              amountMinor: credit,
+              currency: lastPaid.currency,
+              status: "credited",
+              receiptUrl: null,
+              paidAt: new Date(),
+            },
+          }).catch(() => undefined);
         } catch (error) {
           log(`could not credit unused time on ${other.id}: ${error instanceof Error ? error.message : String(error)}`);
         }
@@ -320,6 +327,25 @@ export async function applyPaymentEvent(siteId: string, credentials: GatewayCred
 
   switch (event.action) {
     case "renewed": {
+      // A downgrade scheduled for this renewal takes effect now (30-plan-changes.md).
+      if (subscription.scheduledTierKey) {
+        const next = await prisma.tier.findFirst({
+          where: { siteId, key: subscription.scheduledTierKey },
+          include: { extraPrices: { select: { currency: true, interval: true, amountMinor: true } } },
+        });
+        const nextInterval = (subscription.scheduledInterval ?? subscription.interval) as "month" | "year";
+        await prisma.subscription.update({
+          where: { id: subscription.id },
+          data: {
+            tierKey: subscription.scheduledTierKey,
+            interval: nextInterval,
+            amountMinor: (next ? tierAmount(next, nextInterval, subscription.currency) : null) ?? subscription.amountMinor,
+            scheduledTierKey: null,
+            scheduledInterval: null,
+          },
+        });
+        log(`member ${subscription.memberId} moved to ${subscription.scheduledTierKey} on renewal, as scheduled`);
+      }
       const periodEnd =
         event.currentPeriodEnd ??
         (await ADAPTERS[gateway].periodEnd?.(credentials, subscription.externalId).catch(() => null)) ??
@@ -383,6 +409,13 @@ export async function applyPaymentEvent(siteId: string, credentials: GatewayCred
         where: { id: subscription.id },
         data: { status: "ended", endedAt: subscription.endedAt ?? now },
       });
+      // A Lemon Squeezy downgrade is a cancel at period end: now that it has
+      // ended, invite the member to continue on the plan they chose.
+      if (subscription.scheduledTierKey && subscription.status !== "ended") {
+        await inviteToScheduledPlan(siteId, subscription.memberId, subscription.scheduledTierKey).catch((error: unknown) => {
+          log(`could not email the scheduled plan link: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }
       break;
 
     case "refunded":
@@ -402,6 +435,33 @@ export async function applyPaymentEvent(siteId: string, credentials: GatewayCred
   }
 
   await recomputeMember(siteId, subscription.memberId);
+}
+
+/** Email a member whose plan ended with a downgrade scheduled: a link to continue on that plan. */
+async function inviteToScheduledPlan(siteId: string, memberId: string, tierKey: string): Promise<void> {
+  const [member, site, tier, settings] = await Promise.all([
+    prisma.member.findFirst({ where: { id: memberId, siteId }, select: { email: true, name: true } }),
+    prisma.site.findUnique({ where: { id: siteId }, select: { siteName: true, allowedOrigins: true } }),
+    prisma.tier.findFirst({ where: { siteId, key: tierKey }, select: { name: true } }),
+    loadPaymentSettings(siteId),
+  ]);
+  const origin = site ? parseAllowedOrigins(site.allowedOrigins)[0] : undefined;
+  if (!member || !site || !tier || !origin) return;
+  const url = `${origin}${settings.pricingPath}`;
+  await sendMail({
+    to: member.email,
+    subject: `Continue on ${tier.name} at ${site.siteName}`,
+    text: [
+      `Hi ${member.name || "there"},`,
+      "",
+      `Your previous plan at ${site.siteName} has ended, as you asked. To continue on ${tier.name}, choose it here:`,
+      url,
+      "",
+      "Nothing is charged until you confirm.",
+    ].join("\n"),
+    template: "plan_downgrade_continue",
+    siteId,
+  });
 }
 
 /**

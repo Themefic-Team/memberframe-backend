@@ -83,12 +83,20 @@ export interface CheckoutSpec extends PriceSpec {
   price: KnownPrice | null;
   /** A customer id from this member's earlier purchase on this gateway, if any. */
   customerId: string | null;
+  /**
+   * Unused credit from the plan being upgraded, taken off the first charge
+   * only (30-plan-changes.md). A gateway that cannot discount ignores it, and
+   * the credit is refunded after payment instead.
+   */
+  discountMinor?: number;
 }
 
 export interface CheckoutResult {
   /** Where to send the buyer. For Razorpay this is MemberFrame's own bridge page. */
   url: string;
   externalId: string;
+  /** The credit actually taken off the first charge, when the gateway applied `discountMinor`. */
+  discountApplied?: number;
   /**
    * How to open the checkout on the creator's own page instead of sending the
    * buyer away. `url` stays the fallback when the gateway's script cannot load.
@@ -223,6 +231,13 @@ export interface GatewayAdapter {
   changePlan?(credentials: GatewayCredentials, externalId: string, price: KnownPrice, upgrade: boolean): Promise<{ currentPeriodEnd: Date | null }>;
   /** Refund part of one payment, in that payment's currency. Used to credit unused time on a switch. */
   refund?(credentials: GatewayCredentials, paymentExternalId: string, amountMinor: number, currency: string): Promise<void>;
+  /**
+   * A downgrade at the end of the paid period (30-plan-changes.md): the next
+   * renewal charges `price`, nothing is charged now.
+   */
+  scheduleChange?(credentials: GatewayCredentials, externalId: string, price: KnownPrice | null): Promise<void>;
+  /** Undo `scheduleChange`. `price` is the current plan's, for a gateway that set the next price. */
+  cancelScheduledChange?(credentials: GatewayCredentials, externalId: string, price: KnownPrice | null): Promise<void>;
   /**
    * Ask the gateway whether this checkout was paid, and answer in the same
    * events its webhooks would have sent. Empty while it is unpaid.

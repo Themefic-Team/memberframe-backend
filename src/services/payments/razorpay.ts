@@ -59,7 +59,7 @@ const SUBSCRIPTIONS_OFF = "subscriptionsOff";
 
 async function razorpay(
   credentials: { keyId: string; keySecret: string },
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "PATCH",
   path: string,
   body?: Record<string, unknown>
 ): Promise<Record<string, unknown>> {
@@ -359,6 +359,20 @@ export const razorpayAdapter: GatewayAdapter = {
   },
 
   resume: null,
+
+  /** A downgrade at period end: Razorpay moves the subscription to the lower plan at the cycle end. */
+  async scheduleChange(credentials, externalId, price) {
+    if (!price) throw new GatewayError("razorpay", 500, "No Razorpay plan for this downgrade.");
+    await razorpay(keysOf(credentials), "PATCH", `/subscriptions/${encodeURIComponent(externalId)}`, {
+      plan_id: price.externalId,
+      schedule_change_at: "cycle_end",
+      customer_notify: 1,
+    });
+  },
+
+  async cancelScheduledChange(credentials, externalId) {
+    await razorpay(keysOf(credentials), "POST", `/subscriptions/${encodeURIComponent(externalId)}/cancel_scheduled_changes`);
+  },
 
   async cancelNow(credentials, externalId) {
     await razorpay(keysOf(credentials), "POST", `/subscriptions/${encodeURIComponent(externalId)}/cancel`, {

@@ -75,6 +75,18 @@ export function formEncode(params: Params, prefix = ""): string[] {
   return out;
 }
 
+/** Put a subscription on another price from its next invoice, with no charge or credit now. */
+async function setNextPrice(secretKey: string, externalId: string, priceId: string): Promise<void> {
+  const current = await stripe(secretKey, "GET", `/subscriptions/${encodeURIComponent(externalId)}`);
+  const items = asRecord(current["items"]);
+  const itemId = asString(asRecord(Array.isArray(items["data"]) ? items["data"][0] : null)["id"]);
+  if (!itemId) throw new GatewayError("stripe", 502, "Stripe returned a subscription with no item.");
+  await stripe(secretKey, "POST", `/subscriptions/${encodeURIComponent(externalId)}`, {
+    items: [{ id: itemId, price: priceId }],
+    proration_behavior: "none",
+  });
+}
+
 async function stripe(
   secretKey: string,
   method: "GET" | "POST" | "DELETE",
@@ -410,6 +422,19 @@ export const stripeAdapter: GatewayAdapter = {
     const recurring = spec.interval !== "lifetime";
     const metadata = { mf_checkout_id: spec.checkoutId, mf_member_id: spec.member.id, mf_site_id: spec.siteId };
 
+    // Unused credit from an upgrade, off the first charge only.
+    let coupon: string | null = null;
+    if (spec.discountMinor && spec.discountMinor > 0) {
+      const created = await stripe(secretKeyOf(credentials), "POST", "/coupons", {
+        amount_off: toStripeAmount(spec.discountMinor, spec.currency),
+        currency: spec.currency.toLowerCase(),
+        duration: "once",
+        max_redemptions: 1,
+        name: "Credit for unused time",
+      });
+      coupon = asString(created["id"]);
+    }
+
     const session = await stripe(secretKeyOf(credentials), "POST", "/checkout/sessions", {
       mode: recurring ? "subscription" : "payment",
       line_items: [{ price: spec.price.externalId, quantity: 1 }],
@@ -421,13 +446,14 @@ export const stripeAdapter: GatewayAdapter = {
       ...(recurring
         ? { subscription_data: { metadata } }
         : { payment_intent_data: { metadata }, customer_creation: spec.customerId ? undefined : "always" }),
-      allow_promotion_codes: true,
+      // Stripe takes either a discount or promotion codes, not both.
+      ...(coupon ? { discounts: [{ coupon }] } : { allow_promotion_codes: true }),
     });
 
     const url = asString(session["url"]);
     const id = asString(session["id"]);
     if (!url || !id) throw new GatewayError("stripe", 502, "Stripe did not return a checkout page.");
-    return { url, externalId: id };
+    return { url, externalId: id, ...(coupon ? { discountApplied: spec.discountMinor } : {}) };
   },
 
   verifyWebhook(rawBody, headers, secrets) {
@@ -493,9 +519,23 @@ export const stripeAdapter: GatewayAdapter = {
     const updated = await stripe(secretKey, "POST", `/subscriptions/${encodeURIComponent(externalId)}`, {
       items: [{ id: itemId, price: price.externalId }],
       proration_behavior: upgrade ? "always_invoice" : "create_prorations",
+      // An upgrade starts the new period today, Stripe crediting the unused
+      // time of the old one: new price minus credit, due now (30-plan-changes.md).
+      ...(upgrade ? { billing_cycle_anchor: "now" } : {}),
       cancel_at_period_end: false,
     });
     return { currentPeriodEnd: subscriptionPeriodEnd(updated) };
+  },
+
+  /** A downgrade at period end: the next invoice is the new price, nothing is charged now. */
+  async scheduleChange(credentials, externalId, price) {
+    if (!price) throw new GatewayError("stripe", 500, "No Stripe price for this plan.");
+    await setNextPrice(secretKeyOf(credentials), externalId, price.externalId);
+  },
+
+  async cancelScheduledChange(credentials, externalId, price) {
+    if (!price) return;
+    await setNextPrice(secretKeyOf(credentials), externalId, price.externalId);
   },
 
   /** A partial refund of an invoice (subscription) or a payment intent (one-time). */

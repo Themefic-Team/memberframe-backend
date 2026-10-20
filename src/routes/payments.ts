@@ -50,6 +50,7 @@ import {
   memberBilling,
   publicPricing,
   resumeSubscription,
+  undoScheduledChange,
 } from "../services/payments/checkoutService.js";
 import { resolveCountry } from "../services/payments/gatewayRouter.js";
 import { GatewayError, isGatewayId, isInterval, isPaymentMode, type GatewayId, type PaymentMode } from "../services/payments/types.js";
@@ -392,6 +393,17 @@ billingRouter.post(
     const { site, session } = await requireMember(req);
     limit(req, `billing:${session.member.memberId}`, 20);
     await cancelSubscription(site.id, session.member.memberId);
+    ok(res, await memberBilling(site.id, session.member.memberId));
+  })
+);
+
+/** Undo a downgrade scheduled for the period end (30-plan-changes.md). */
+billingRouter.post(
+  "/undo-change",
+  route(async (req, res) => {
+    const { site, session } = await requireMember(req);
+    limit(req, `billing:${session.member.memberId}`, 20);
+    await undoScheduledChange(site.id, session.member.memberId);
     ok(res, await memberBilling(site.id, session.member.memberId));
   })
 );

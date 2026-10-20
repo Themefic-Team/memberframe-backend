@@ -26,7 +26,7 @@ import { ADAPTERS, connectedGateways, loadCredentials, loadPaymentSettings } fro
 import { METHOD_ORDER, availableMethods } from "./gatewayRouter.js";
 import { resolveMethodLabel } from "../../lib/methodLabels.js";
 import { RUNNING, applyPaymentEvent, governingSubscription, recomputeMember } from "./apply.js";
-import { tierAmount, type PricedTier } from "./prices.js";
+import { isUpgrade, planChangeCredit, tierAmount, type PricedTier } from "./prices.js";
 import {
   GatewayError,
   INTERVALS,
@@ -176,7 +176,9 @@ export type CheckoutOutcome =
       mode: PaymentMode;
       embed: CheckoutEmbed | null;
     }
-  | { kind: "changed"; tierName: string; interval: BillingInterval };
+  | { kind: "changed"; tierName: string; interval: BillingInterval }
+  /** A downgrade waiting for the end of the paid period. */
+  | { kind: "scheduled"; tierName: string; interval: BillingInterval; effectiveAt: string | null };
 
 const INTERVAL_WEIGHT: Record<BillingInterval, number> = { month: 0, year: 1, lifetime: 2 };
 
@@ -243,16 +245,86 @@ async function changeInPlace(
   return { kind: "changed", tierName: tier.name, interval };
 }
 
+/** What a plan costs, and the unused credit an upgrade gets (30-plan-changes.md). */
+export interface CheckoutSummary {
+  tierName: string;
+  interval: BillingInterval;
+  amountMinor: number;
+  currency: string;
+  /** Unused credit from the plan being upgraded; 0 for a first purchase. */
+  creditMinor: number;
+  /** What is charged today: the price minus the credit. */
+  dueMinor: number;
+  /** The plan the credit comes from. */
+  creditFrom: string | null;
+}
+
 export type CheckoutOptions =
-  | { kind: "change" }
+  | { kind: "change"; summary: CheckoutSummary }
+  | { kind: "downgrade"; summary: CheckoutSummary; effectiveAt: string | null }
   | {
       kind: "choose";
-      summary: { tierName: string; interval: BillingInterval; amountMinor: number; currency: string };
+      summary: CheckoutSummary;
       /** Every gateway shown at checkout, recommended first; `available` false with a reason when it cannot sell this price. */
       methods: Array<{ gateway: GatewayId; title: string; description: string; available: boolean; reason: string | null }>;
       recommended: GatewayId | null;
     };
 
+
+type RunningSubscription = NonNullable<Awaited<ReturnType<typeof governingSubscription>>>;
+
+/**
+ * Is moving from the member's running plan to this one an upgrade, and how
+ * much unused credit does it bring (30-plan-changes.md)? The credit is worked
+ * out from the plan's last payment, or its own amount when no payment was
+ * recorded, so a missed webhook cannot zero it.
+ */
+async function planChange(
+  siteId: string,
+  current: RunningSubscription | null,
+  tier: TierRow,
+  interval: BillingInterval,
+  amountMinor: number,
+  currency: string
+): Promise<{ upgrade: boolean; creditMinor: number; creditFrom: string | null }> {
+  if (!current || current.interval === "lifetime") return { upgrade: true, creditMinor: 0, creditFrom: null };
+  const held = await prisma.tier.findFirst({ where: { siteId, key: current.tierKey }, select: { rank: true, name: true } });
+  const creditFrom = held?.name ?? current.tierKey;
+  const upgrade = isUpgrade({ rank: held?.rank ?? -1, interval: current.interval }, { rank: tier.rank, interval });
+  if (!upgrade) return { upgrade: false, creditMinor: 0, creditFrom };
+  const lastPaid = await prisma.payment.findFirst({
+    where: { subscriptionId: current.id, status: "paid" },
+    orderBy: { paidAt: "desc" },
+    select: { amountMinor: true },
+  });
+  const creditMinor = planChangeCredit({
+    paidMinor: lastPaid?.amountMinor ?? current.amountMinor,
+    interval: current.interval,
+    periodEnd: current.currentPeriodEnd,
+    currency: current.currency,
+    newCurrency: currency,
+    newPriceMinor: amountMinor,
+  });
+  return { upgrade: true, creditMinor, creditFrom };
+}
+
+function summaryOf(
+  tier: TierRow,
+  interval: BillingInterval,
+  amountMinor: number,
+  currency: string,
+  change: { creditMinor: number; creditFrom: string | null }
+): CheckoutSummary {
+  return {
+    tierName: tier.name,
+    interval,
+    amountMinor,
+    currency,
+    creditMinor: change.creditMinor,
+    dueMinor: amountMinor - change.creditMinor,
+    creditFrom: change.creditMinor > 0 ? change.creditFrom : null,
+  };
+}
 
 /**
  * What the pricing card's chooser shows for one price (29-checkout-methods.md):
@@ -283,6 +355,14 @@ export async function checkoutOptions(input: {
   if (current && current.tierKey === tier.key && (current.interval === input.interval || current.interval === "lifetime")) {
     throw badRequest("already_subscribed");
   }
+  const change = await planChange(input.siteId, current, tier, input.interval, amountMinor, currency);
+  const summary = summaryOf(tier, input.interval, amountMinor, currency, change);
+
+  // A downgrade waits for the end of the paid period: nothing to pay now.
+  if (current && current.interval !== "lifetime" && input.interval !== "lifetime" && !change.upgrade) {
+    return { kind: "downgrade", summary, effectiveAt: current.currentPeriodEnd?.toISOString() ?? null };
+  }
+
   // Mirrors changeInPlace's own conditions, without changing anything yet.
   if (
     current &&
@@ -291,7 +371,7 @@ export async function checkoutOptions(input: {
     ADAPTERS[current.gateway as GatewayId]?.changePlan &&
     tierAmount(tier, input.interval, current.currency) !== null
   ) {
-    return { kind: "change" };
+    return { kind: "change", summary };
   }
 
   // Every gateway shown at checkout is listed, the buyer's location only
@@ -306,7 +386,7 @@ export async function checkoutOptions(input: {
   );
   return {
     kind: "choose",
-    summary: { tierName: tier.name, interval: input.interval, amountMinor, currency },
+    summary,
     // Every gateway shown at checkout can be chosen. One that cannot take this
     // price explains itself when chosen, rather than being greyed out here.
     methods: ordered.map((credentials) => ({
@@ -337,6 +417,13 @@ export async function createCheckout(input: CheckoutRequest): Promise<CheckoutOu
   const current = await governingSubscription(input.siteId, input.member.id, settings.mode);
   if (current && current.tierKey === tier.key && (current.interval === input.interval || current.interval === "lifetime")) {
     throw badRequest("already_subscribed");
+  }
+
+  const change = await planChange(input.siteId, current, tier, input.interval, amountMinor, currency);
+
+  // A downgrade waits for the end of the paid period (30-plan-changes.md).
+  if (current && current.interval !== "lifetime" && input.interval !== "lifetime" && !change.upgrade) {
+    return scheduleDowngrade(input.siteId, current, tier, input.interval);
   }
 
   if (current) {
@@ -403,9 +490,15 @@ export async function createCheckout(input: CheckoutRequest): Promise<CheckoutOu
       cancelUrl: withParam(input.origin, input.returnPath, "mf_checkout_cancelled", "1"),
       price,
       customerId: earlier?.externalCustomerId ?? null,
+      ...(change.creditMinor > 0 ? { discountMinor: change.creditMinor } : {}),
     });
 
-    await prisma.checkout.update({ where: { id: checkout.id }, data: { externalId: result.externalId } });
+    // A credit given off the first charge is not refunded again when the old
+    // plan ends; one the gateway could not apply is (apply.ts).
+    await prisma.checkout.update({
+      where: { id: checkout.id },
+      data: { externalId: result.externalId, creditMinor: result.discountApplied ?? null },
+    });
     return {
       kind: "checkout",
       url: result.url,
@@ -505,6 +598,78 @@ export async function checkoutStatus(siteId: string, memberId: string, checkoutI
 // THE MEMBER'S OWN BILLING
 // ============================================================================
 
+/**
+ * A downgrade at the end of the paid period: the gateway's next renewal is
+ * the lower plan, nothing is charged now, and the member keeps the current
+ * tier until then (30-plan-changes.md).
+ */
+async function scheduleDowngrade(
+  siteId: string,
+  current: RunningSubscription,
+  tier: TierRow,
+  interval: BillingInterval
+): Promise<CheckoutOutcome> {
+  const gateway = current.gateway as GatewayId;
+  const mode = current.mode as PaymentMode;
+  const adapter = ADAPTERS[gateway];
+  if (!adapter.scheduleChange) throw badRequest("downgrade_not_supported");
+  const credentials = await loadCredentials(siteId, gateway, mode);
+  if (!credentials) throw new ApiError(409, "no_gateway");
+  const amountMinor = tierAmount(tier, interval, current.currency);
+  if (amountMinor === null) throw badRequest("price_not_available");
+
+  try {
+    const price = adapter.ensurePrice
+      ? await ensureGatewayPrice(siteId, gateway, mode, tier, interval, amountMinor, current.currency)
+      : null;
+    await adapter.scheduleChange(credentials, current.externalId, price);
+  } catch (error) {
+    if (error instanceof GatewayError) {
+      throw new ApiError(502, "gateway_error", undefined, { gateway, detail: error.message });
+    }
+    throw error;
+  }
+
+  await prisma.subscription.update({
+    where: { id: current.id },
+    data: {
+      scheduledTierKey: tier.key,
+      scheduledInterval: interval,
+      // Lemon Squeezy's way is a cancel at period end (lemonsqueezy.ts).
+      ...(gateway === "lemonsqueezy" ? { status: "canceling", cancelAtPeriodEnd: true } : {}),
+    },
+  });
+  process.stdout.write(`[payments] member ${current.memberId} downgrade to ${tier.key}/${interval} scheduled on ${gateway}\n`);
+  return { kind: "scheduled", tierName: tier.name, interval, effectiveAt: current.currentPeriodEnd?.toISOString() ?? null };
+}
+
+/** Undo a scheduled downgrade: the plan renews as it is. */
+export async function undoScheduledChange(siteId: string, memberId: string): Promise<void> {
+  const { subscription, credentials, adapter } = await runningSubscription(siteId, memberId);
+  if (!subscription.scheduledTierKey) return;
+  const gateway = subscription.gateway as GatewayId;
+  const mode = subscription.mode as PaymentMode;
+  try {
+    const tier = await prisma.tier.findFirst({ where: { siteId, key: subscription.tierKey }, include: TIER_WITH_PRICES });
+    const price =
+      tier && adapter.ensurePrice
+        ? await ensureGatewayPrice(siteId, gateway, mode, tier, subscription.interval as BillingInterval, subscription.amountMinor, subscription.currency)
+        : null;
+    await adapter.cancelScheduledChange?.(credentials, subscription.externalId, price);
+  } catch (error) {
+    if (error instanceof GatewayError) throw new ApiError(502, "gateway_error", undefined, { gateway, detail: error.message });
+    throw error;
+  }
+  await prisma.subscription.update({
+    where: { id: subscription.id },
+    data: {
+      scheduledTierKey: null,
+      scheduledInterval: null,
+      ...(gateway === "lemonsqueezy" ? { status: "active", cancelAtPeriodEnd: false } : {}),
+    },
+  });
+}
+
 export async function memberBilling(siteId: string, memberId: string) {
   const { pricingPath } = await loadPaymentSettings(siteId);
   const subscription = await governingSubscription(siteId, memberId);
@@ -559,8 +724,57 @@ export async function memberBilling(siteId: string, memberId: string) {
     },
   }));
 
+  // Every plan the member held, and every credit given off a first charge,
+  // so the history is complete whichever gateway took the money.
+  const [held, credited] = await Promise.all([
+    prisma.subscription.findMany({
+      where: { siteId, memberId },
+      orderBy: { createdAt: "desc" },
+      take: 24,
+      select: {
+        tierKey: true,
+        interval: true,
+        gateway: true,
+        mode: true,
+        status: true,
+        amountMinor: true,
+        currency: true,
+        createdAt: true,
+        endedAt: true,
+        currentPeriodEnd: true,
+      },
+    }),
+    prisma.checkout.findMany({
+      where: { siteId, memberId, state: "complete", creditMinor: { gt: 0 } },
+      orderBy: { completedAt: "desc" },
+      take: 24,
+      select: { tierKey: true, gateway: true, mode: true, creditMinor: true, currency: true, completedAt: true },
+    }),
+  ]);
+  const history = {
+    plans: held.map((entry) => ({
+      planName: tierName(entry.tierKey),
+      interval: entry.interval,
+      gateway: entry.gateway,
+      mode: entry.mode,
+      status: entry.status,
+      amountMinor: entry.amountMinor,
+      currency: entry.currency,
+      startedAt: entry.createdAt.toISOString(),
+      endedAt: entry.endedAt?.toISOString() ?? null,
+    })),
+    credits: credited.map((entry) => ({
+      planName: tierName(entry.tierKey),
+      gateway: entry.gateway,
+      mode: entry.mode,
+      amountMinor: entry.creditMinor ?? 0,
+      currency: entry.currency ?? "",
+      at: entry.completedAt?.toISOString() ?? null,
+    })),
+  };
+
   if (!subscription) {
-    return { subscription: null, payments, plans, pricingPath };
+    return { subscription: null, payments, plans, history, pricingPath };
   }
 
   const tier = await prisma.tier.findFirst({ where: { siteId, key: subscription.tierKey }, select: { name: true } });
@@ -573,6 +787,9 @@ export async function memberBilling(siteId: string, memberId: string) {
       tierName: tier?.name ?? subscription.tierKey,
       interval: subscription.interval,
       gateway: subscription.gateway,
+      /** A downgrade waiting for the period end (30-plan-changes.md). */
+      scheduledTierName: subscription.scheduledTierKey ? tierName(subscription.scheduledTierKey) : null,
+      scheduledInterval: subscription.scheduledInterval,
       status: subscription.status,
       amountMinor: subscription.amountMinor,
       currency: subscription.currency,
@@ -586,6 +803,7 @@ export async function memberBilling(siteId: string, memberId: string) {
     },
     payments,
     plans,
+    history,
     pricingPath,
   };
 }
@@ -623,7 +841,7 @@ export async function cancelSubscription(siteId: string, memberId: string): Prom
   }
   await prisma.subscription.update({
     where: { id: subscription.id },
-    data: { status: "canceling", cancelAtPeriodEnd: true },
+    data: { status: "canceling", cancelAtPeriodEnd: true, scheduledTierKey: null, scheduledInterval: null },
   });
   await prisma.member.update({ where: { id: memberId }, data: { status: "canceled" } });
 }

@@ -635,6 +635,9 @@ model Checkout {
   currency    String? @db.Char(3)
   /// A running subscription this purchase replaces, credited for its unused time.
   replacesSubscriptionId String? @map("replaces_subscription_id") @db.Char(36)
+  /// The unused credit given off this checkout's first charge, so it is not
+  /// refunded again when the replaced plan ends (30-plan-changes.md).
+  creditMinor Int? @map("credit_minor")
 
   createdAt   DateTime  @default(now()) @map("created_at") @db.DateTime(3)
   completedAt DateTime? @map("completed_at") @db.DateTime(3)
@@ -665,6 +668,11 @@ model Subscription {
   currentPeriodEnd  DateTime? @map("current_period_end") @db.DateTime(3)
   gracePeriodEndsAt DateTime? @map("grace_period_ends_at") @db.DateTime(3)
   cancelAtPeriodEnd Boolean   @default(false) @map("cancel_at_period_end")
+
+  /// A downgrade waiting for the end of the paid period: the plan it switches
+  /// to on the next renewal (30-plan-changes.md).
+  scheduledTierKey  String? @map("scheduled_tier_key") @db.VarChar(50)
+  scheduledInterval String? @map("scheduled_interval") @db.VarChar(10)
 
   amountMinor Int    @map("amount_minor")
   currency    String @db.Char(3)

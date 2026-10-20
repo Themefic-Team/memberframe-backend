@@ -330,6 +330,35 @@ export const lemonSqueezyAdapter: GatewayAdapter = {
       throw new GatewayError("lemonsqueezy", 400, `No ${period} variant is linked. Add its variant ID on the Lemon Squeezy card in MemberFrame.`);
     }
 
+    // Unused credit from an upgrade: a one-time fixed discount, for this
+    // variant and one use only. custom_price stays the full price, so the
+    // renewals are right (30-plan-changes.md).
+    let discountCode: string | null = null;
+    if (spec.discountMinor && spec.discountMinor > 0) {
+      const code = `MF${spec.checkoutId.replace(/[^a-zA-Z0-9]/g, "").slice(-12).toUpperCase()}`;
+      await lemon(apiKeyOf(credentials), "POST", "/discounts", {
+        data: {
+          type: "discounts",
+          attributes: {
+            name: `Credit for unused time (${spec.tierName})`,
+            code,
+            amount: spec.discountMinor,
+            amount_type: "fixed",
+            duration: "once",
+            is_limited_to_products: true,
+            is_limited_redemptions: true,
+            max_redemptions: 1,
+            test_mode: credentials.mode === "test",
+          },
+          relationships: {
+            store: { data: { type: "stores", id: credentials.publicId ?? "" } },
+            variants: { data: [{ type: "variants", id: variantId }] },
+          },
+        },
+      });
+      discountCode = code;
+    }
+
     const checkout = await lemon(apiKeyOf(credentials), "POST", "/checkouts", {
       data: {
         type: "checkouts",
@@ -344,6 +373,7 @@ export const lemonSqueezyAdapter: GatewayAdapter = {
             email: spec.member.email,
             ...(spec.member.name ? { name: spec.member.name } : {}),
             custom: { mf_checkout_id: spec.checkoutId, mf_member_id: spec.member.id, mf_site_id: spec.siteId },
+            ...(discountCode ? { discount_code: discountCode } : {}),
           },
           test_mode: credentials.mode === "test",
           // Opens as an overlay on the creator's page through lemon.js. The
@@ -361,7 +391,7 @@ export const lemonSqueezyAdapter: GatewayAdapter = {
     const url = asString(asRecord(data["attributes"])["url"]);
     const id = asString(data["id"]);
     if (!url || !id) throw new GatewayError("lemonsqueezy", 502, "Lemon Squeezy did not return a checkout page.");
-    return { url, externalId: id, embed: { kind: "lemonsqueezy" } };
+    return { url, externalId: id, embed: { kind: "lemonsqueezy" }, ...(discountCode ? { discountApplied: spec.discountMinor } : {}) };
   },
 
   verifyWebhook(rawBody, headers, secrets) {
@@ -395,6 +425,19 @@ export const lemonSqueezyAdapter: GatewayAdapter = {
     } catch {
       return subscription.manageUrl;
     }
+  },
+
+  /**
+   * A downgrade at period end. Lemon Squeezy cannot change a custom price on a
+   * running subscription, so it cancels at the period end; MemberFrame then
+   * emails the member a link to continue on the lower plan.
+   */
+  async scheduleChange(credentials, externalId) {
+    await lemonSqueezyAdapter.cancelAtPeriodEnd(credentials, externalId);
+  },
+
+  async cancelScheduledChange(credentials, externalId) {
+    await lemonSqueezyAdapter.resume!(credentials, externalId);
   },
 
   async cancelAtPeriodEnd(credentials, externalId) {
