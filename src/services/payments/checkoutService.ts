@@ -23,7 +23,8 @@ import { prisma } from "../../config/db.js";
 import { badRequest, notFound, ApiError } from "../../middleware/errors.js";
 import { isSafeSitePath } from "../../lib/siteSettings.js";
 import { ADAPTERS, connectedGateways, loadCredentials, loadPaymentSettings } from "./gatewayStore.js";
-import { chooseGateway } from "./gatewayRouter.js";
+import { availableMethods } from "./gatewayRouter.js";
+import { resolveMethodLabel } from "../../lib/methodLabels.js";
 import { RUNNING, applyPaymentEvent, governingSubscription, recomputeMember } from "./apply.js";
 import { tierAmount, type PricedTier } from "./prices.js";
 import {
@@ -78,7 +79,7 @@ export async function publicPricing(siteId: string, country: string | null): Pro
   const settings = await loadPaymentSettings(siteId);
   const [tiers, connected] = await Promise.all([
     prisma.tier.findMany({ where: { siteId, isActive: true }, orderBy: { rank: "asc" }, include: TIER_WITH_PRICES }),
-    connectedGateways(siteId, settings.mode),
+    connectedGateways(siteId, settings.mode, { enabledOnly: true }),
   ]);
   // One site currency (23-dynamic-tiers.md): every buyer sees the tier's own
   // price, wherever they are. `country` still routes the gateway.
@@ -160,6 +161,8 @@ export interface CheckoutRequest {
   returnPath: string;
   origin: string;
   country: string | null;
+  /** The method the buyer chose (29-checkout-methods.md). Absent: the recommended one. */
+  gateway?: GatewayId;
 }
 
 export type CheckoutOutcome =
@@ -238,6 +241,65 @@ async function changeInPlace(
   return { kind: "changed", tierName: tier.name, interval };
 }
 
+export type CheckoutOptions =
+  | { kind: "change" }
+  | {
+      kind: "choose";
+      summary: { tierName: string; interval: BillingInterval; amountMinor: number; currency: string };
+      methods: Array<{ gateway: GatewayId; title: string; description: string }>;
+      recommended: GatewayId | null;
+    };
+
+/**
+ * What the pricing card's chooser shows for one price (29-checkout-methods.md):
+ * the order summary and the methods that can sell it, or `change` when a paid
+ * member's switch will happen in place on the gateway they already pay through.
+ * The same refusals as `createCheckout`, so the chooser never offers what the
+ * checkout would then refuse.
+ */
+export async function checkoutOptions(input: {
+  siteId: string;
+  memberId: string;
+  tierKey: string;
+  interval: BillingInterval;
+  country: string | null;
+}): Promise<CheckoutOptions> {
+  const settings = await loadPaymentSettings(input.siteId);
+  const tier = await prisma.tier.findFirst({
+    where: { siteId: input.siteId, key: input.tierKey, isActive: true },
+    include: TIER_WITH_PRICES,
+  });
+  if (!tier) throw notFound("tier_not_found");
+
+  const currency = tier.currency;
+  const amountMinor = tierAmount(tier, input.interval, currency);
+  if (amountMinor === null) throw badRequest("price_not_available");
+
+  const current = await governingSubscription(input.siteId, input.memberId, settings.mode);
+  if (current && current.tierKey === tier.key && (current.interval === input.interval || current.interval === "lifetime")) {
+    throw badRequest("already_subscribed");
+  }
+  // Mirrors changeInPlace's own conditions, without changing anything yet.
+  if (
+    current &&
+    current.interval !== "lifetime" &&
+    input.interval !== "lifetime" &&
+    ADAPTERS[current.gateway as GatewayId]?.changePlan &&
+    tierAmount(tier, input.interval, current.currency) !== null
+  ) {
+    return { kind: "change" };
+  }
+
+  const connected = await connectedGateways(input.siteId, settings.mode, { enabledOnly: true });
+  const { methods, recommended } = availableMethods({ connected, interval: input.interval, currency, country: input.country });
+  return {
+    kind: "choose",
+    summary: { tierName: tier.name, interval: input.interval, amountMinor, currency },
+    methods: methods.map((gateway) => ({ gateway, ...resolveMethodLabel(gateway, settings.methodLabels) })),
+    recommended,
+  };
+}
+
 export async function createCheckout(input: CheckoutRequest): Promise<CheckoutOutcome> {
   if (!isSafeSitePath(input.returnPath)) throw badRequest("unsafe_path");
 
@@ -264,16 +326,14 @@ export async function createCheckout(input: CheckoutRequest): Promise<CheckoutOu
     if (changed) return changed;
   }
 
-  const connected = await connectedGateways(input.siteId, settings.mode);
-  const decision = chooseGateway({
-    connected,
-    interval: input.interval,
-    currency,
-    country: input.country,
-    autoDetectGeolocation: settings.autoDetectGeolocation,
-    defaultGateway: settings.defaultGateway,
-  });
-  if (!decision) throw new ApiError(409, "no_gateway");
+  // Only gateways shown at checkout. The buyer's choice must be one of them
+  // and able to sell this price; without one, the method their location suits.
+  const connected = await connectedGateways(input.siteId, settings.mode, { enabledOnly: true });
+  const { methods, recommended } = availableMethods({ connected, interval: input.interval, currency, country: input.country });
+  if (input.gateway && !methods.includes(input.gateway)) throw badRequest("method_unavailable");
+  const chosen = input.gateway ?? recommended;
+  if (!chosen) throw new ApiError(409, "no_gateway");
+  const decision = { gateway: chosen, reason: input.gateway ? "buyer's choice" : "recommended" };
 
   process.stdout.write(
     `[payments] checkout ${tier.key}/${input.interval} in ${currency} on ${decision.gateway} (${decision.reason}, country ${input.country ?? "unknown"})\n`

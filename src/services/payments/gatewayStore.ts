@@ -11,6 +11,7 @@ import { env } from "../../config/env.js";
 import { openJson, open, seal, sealJson } from "../../lib/secretBox.js";
 import { isSafeSitePath } from "../../lib/siteSettings.js";
 import { badRequest } from "../../middleware/errors.js";
+import { readMethodLabels, type MethodLabels } from "../../lib/methodLabels.js";
 import { lemonSqueezyAdapter, LEMONSQUEEZY_EVENTS } from "./lemonsqueezy.js";
 import { razorpayAdapter, RAZORPAY_EVENTS } from "./razorpay.js";
 import { stripeAdapter, STRIPE_EVENTS } from "./stripe.js";
@@ -45,6 +46,8 @@ export interface PaymentSettingsShape {
   graceDays: number;
   afterPurchasePath: string;
   pricingPath: string;
+  /** The checkout chooser's titles and descriptions (29-checkout-methods.md). */
+  methodLabels: MethodLabels;
 }
 
 export const DEFAULT_PAYMENT_SETTINGS: PaymentSettingsShape = {
@@ -55,6 +58,7 @@ export const DEFAULT_PAYMENT_SETTINGS: PaymentSettingsShape = {
   graceDays: 3,
   afterPurchasePath: "/dashboard",
   pricingPath: "/pricing",
+  methodLabels: {},
 };
 
 export async function loadPaymentSettings(siteId: string): Promise<PaymentSettingsShape> {
@@ -69,6 +73,7 @@ export async function loadPaymentSettings(siteId: string): Promise<PaymentSettin
     graceDays: row.graceDays,
     afterPurchasePath: row.afterPurchasePath,
     pricingPath: row.pricingPath,
+    methodLabels: readMethodLabels(row.methodLabels),
   };
 }
 
@@ -81,12 +86,13 @@ export async function savePaymentSettings(
   }
 
   const current = await loadPaymentSettings(siteId);
-  const next = { ...current, ...patch };
+  const next = { ...current, ...patch, ...(patch.methodLabels ? { methodLabels: readMethodLabels(patch.methodLabels) } : {}) };
+  const row = { ...next, methodLabels: next.methodLabels as object };
 
   await prisma.paymentSettings.upsert({
     where: { siteId },
-    create: { siteId, ...next },
-    update: next,
+    create: { siteId, ...row },
+    update: row,
   });
 
   return next;
@@ -121,8 +127,21 @@ export async function loadCredentials(
 }
 
 /** Every gateway connected in this mode, decrypted. */
-export async function connectedGateways(siteId: string, mode: PaymentMode): Promise<GatewayCredentials[]> {
-  const rows = await prisma.gatewayConfig.findMany({ where: { siteId, mode }, select: { gateway: true } });
+/**
+ * The gateways connected in this mode. `enabledOnly` leaves out those switched
+ * off for checkout: use it for anything a buyer starts (checkout, prices shown
+ * as buyable, going live). Renewals, webhooks, and refunds read credentials
+ * directly, so members already paying through an off gateway are unaffected.
+ */
+export async function connectedGateways(
+  siteId: string,
+  mode: PaymentMode,
+  options: { enabledOnly?: boolean } = {}
+): Promise<GatewayCredentials[]> {
+  const rows = await prisma.gatewayConfig.findMany({
+    where: { siteId, mode, ...(options.enabledOnly ? { enabled: true } : {}) },
+    select: { gateway: true },
+  });
   const out: GatewayCredentials[] = [];
   for (const row of rows) {
     if (!isGatewayId(row.gateway)) continue;
@@ -142,6 +161,8 @@ export interface GatewayStatus {
   /** Lemon Squeezy variant ids, safe to show. */
   options: Record<string, unknown>;
   webhookUrl: string;
+  /** Shown to buyers at checkout. False when not connected. */
+  enabled: boolean;
   /** A webhook secret is stored, so events can be verified. */
   webhookConfigured: boolean;
   /** MemberFrame registered the endpoint itself. */
@@ -166,6 +187,7 @@ export async function gatewayStatuses(siteId: string, base: string = env.apiBase
         maskedSuffix: row?.maskedSuffix ?? null,
         options: asRecord(row?.options),
         webhookUrl: webhookUrl(siteId, gateway, mode, base),
+        enabled: Boolean(row?.enabled),
         webhookConfigured: Boolean(row?.webhookSecretEncrypted),
         webhookAutomatic: Boolean(row?.webhookEndpointId),
         lastWebhookAt: row?.lastWebhookAt?.toISOString() ?? null,
@@ -237,6 +259,23 @@ export async function liveSubscriptionCount(siteId: string, gateway: GatewayId, 
   return prisma.subscription.count({
     where: { siteId, gateway, mode, status: { in: ["active", "past_due", "canceling"] }, interval: { not: "lifetime" } },
   });
+}
+
+/**
+ * Show or hide a connected gateway at checkout. The last enabled gateway of a
+ * site in Live mode cannot be turned off: the site would take no payments.
+ */
+export async function setGatewayEnabled(siteId: string, gateway: GatewayId, mode: PaymentMode, enabled: boolean): Promise<void> {
+  const row = await prisma.gatewayConfig.findFirst({ where: { siteId, gateway, mode }, select: { id: true } });
+  if (!row) throw badRequest("gateway_not_connected");
+
+  if (!enabled && mode === "live") {
+    const settings = await loadPaymentSettings(siteId);
+    const others = await prisma.gatewayConfig.count({ where: { siteId, mode, enabled: true, NOT: { id: row.id } } });
+    if (settings.mode === "live" && others === 0) throw badRequest("last_live_method");
+  }
+
+  await prisma.gatewayConfig.update({ where: { id: row.id }, data: { enabled } });
 }
 
 export async function disconnectGateway(siteId: string, gateway: GatewayId, mode: PaymentMode): Promise<void> {

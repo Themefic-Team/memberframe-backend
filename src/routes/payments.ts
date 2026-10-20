@@ -37,11 +37,14 @@ import {
   loadCredentials,
   loadPaymentSettings,
   savePaymentSettings,
+  setGatewayEnabled,
 } from "../services/payments/gatewayStore.js";
+import { DEFAULT_METHOD_LABELS, methodLabelsSchema } from "../lib/methodLabels.js";
 import { applyPaymentEvent, endTestSubscriptions } from "../services/payments/apply.js";
 import {
   billingPortal,
   cancelSubscription,
+  checkoutOptions,
   checkoutStatus,
   createCheckout,
   memberBilling,
@@ -90,6 +93,8 @@ async function paymentsOverview(siteId: string, base: string = env.apiBaseUrl) {
   return {
     settings,
     gateways,
+    /** What the chooser says for a gateway with no title or description of its own. */
+    defaultMethodLabels: DEFAULT_METHOD_LABELS,
     secretsAvailable: secretsAvailable(),
     /** A gateway cannot reach a local address, so webhooks need a public one. */
     publicApi: base.startsWith("https://"),
@@ -111,8 +116,10 @@ paymentsRouter.get(
 const settingsSchema = z.object({
   siteId: siteIdSchema,
   mode: z.enum(["test", "live"]).optional(),
+  // Accepted from older plugins and ignored: buyers choose now (29-checkout-methods.md).
   defaultGateway: z.enum(["", "stripe", "lemonsqueezy", "razorpay"]).optional(),
   autoDetectGeolocation: z.boolean().optional(),
+  methodLabels: methodLabelsSchema.optional(),
   defaultCurrency: currencySchema.optional(),
   graceDays: z.number().int().min(0).max(30).optional(),
   afterPurchasePath: z.string().trim().max(255).optional(),
@@ -124,7 +131,7 @@ paymentsRouter.put(
   route(async (req, res) => {
     const input = settingsSchema.parse(req.body);
     const site = await creatorSite(req, input.siteId);
-    const { siteId: _ignored, ...patch } = input;
+    const { siteId: _ignored, defaultGateway: _gateway, autoDetectGeolocation: _routing, ...patch } = input;
 
     const before = await loadPaymentSettings(site.id);
 
@@ -132,7 +139,7 @@ paymentsRouter.put(
     // so a creator never "goes live" into a site that cannot sell.
     if (patch.mode === "live" && before.mode !== "live") {
       requireSecrets();
-      const live = await connectedGateways(site.id, "live");
+      const live = await connectedGateways(site.id, "live", { enabledOnly: true });
       if (live.length === 0) throw badRequest("no_live_gateway");
     }
 
@@ -195,6 +202,22 @@ paymentsRouter.delete(
     if (!isPaymentMode(mode)) throw badRequest("unknown_mode");
 
     await disconnectGateway(site.id, gateway, mode);
+    ok(res, await paymentsOverview(site.id, publicApiBase(req)));
+  })
+);
+
+const enabledSchema = z.object({ siteId: siteIdSchema, mode: z.enum(["test", "live"]), enabled: z.boolean() });
+
+/** Show or hide a connected gateway at checkout (29-checkout-methods.md). */
+paymentsRouter.put(
+  "/gateways/:gateway/enabled",
+  route(async (req, res) => {
+    const input = enabledSchema.parse(req.body);
+    const site = await creatorSite(req, input.siteId);
+    const gateway = req.params["gateway"];
+    if (!isGatewayId(gateway)) throw badRequest("unknown_gateway");
+
+    await setGatewayEnabled(site.id, gateway, input.mode, input.enabled);
     ok(res, await paymentsOverview(site.id, publicApiBase(req)));
   })
 );
@@ -268,7 +291,37 @@ const createSessionSchema = z.object({
   tierKey: z.string().trim().min(1).max(50),
   interval: z.string().refine(isInterval, "interval"),
   returnPath: z.string().trim().max(255).default("/pricing"),
+  /** The buyer's chosen method. Absent from components published before 29-checkout-methods.md. */
+  gateway: z.enum(["stripe", "lemonsqueezy", "razorpay"]).optional(),
 });
+
+const optionsSchema = z.object({
+  tierKey: z.string().trim().min(1).max(50),
+  interval: z.string().refine(isInterval, "interval"),
+});
+
+/** The order summary and payment methods for the pricing card's chooser. */
+checkoutRouter.post(
+  "/options",
+  route(async (req, res) => {
+    requireSecrets();
+    const { site, session } = await requireMember(req);
+    const input = optionsSchema.parse(req.body);
+    limit(req, `checkout:${session.member.memberId}`, 10);
+    const { mode } = await loadPaymentSettings(site.id);
+
+    ok(
+      res,
+      await checkoutOptions({
+        siteId: site.id,
+        memberId: session.member.memberId,
+        tierKey: input.tierKey,
+        interval: input.interval as "month" | "year" | "lifetime",
+        country: resolveCountry(req, mode === "test"),
+      })
+    );
+  })
+);
 
 checkoutRouter.post(
   "/create-session",
@@ -290,6 +343,7 @@ checkoutRouter.post(
       returnPath: input.returnPath,
       origin: siteOrigin(req, site.allowedOrigins),
       country: resolveCountry(req, mode === "test"),
+      ...(input.gateway ? { gateway: input.gateway } : {}),
     });
 
     ok(res, result);

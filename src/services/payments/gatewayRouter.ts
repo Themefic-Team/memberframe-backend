@@ -143,3 +143,28 @@ export function chooseGateway(input: {
   }
   return has("stripe") ? { gateway: "stripe", reason: "global" } : fallback("global, Stripe not available");
 }
+
+/** The order methods are listed in after the recommended one (29-checkout-methods.md). */
+export const METHOD_ORDER: ReadonlyArray<GatewayId> = ["stripe", "lemonsqueezy", "razorpay"];
+
+/**
+ * The methods a buyer may choose for this price: every connected gateway
+ * that can sell it, the one suiting their location first. Routing always runs
+ * here, with no default gateway: the buyer decides, this only preselects.
+ */
+export function availableMethods(input: {
+  connected: GatewayCredentials[];
+  interval: BillingInterval;
+  currency: string;
+  country: string | null;
+}): { methods: GatewayId[]; recommended: GatewayId | null } {
+  const sellable = METHOD_ORDER.filter((gateway) =>
+    input.connected.some(
+      (credentials) => credentials.gateway === gateway && ADAPTERS[gateway].canSell(credentials, input.interval, input.currency)
+    )
+  );
+  const recommended =
+    chooseGateway({ ...input, autoDetectGeolocation: true, defaultGateway: "" })?.gateway ?? sellable[0] ?? null;
+  const methods = recommended ? [recommended, ...sellable.filter((gateway) => gateway !== recommended)] : sellable;
+  return { methods, recommended };
+}

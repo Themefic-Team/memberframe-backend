@@ -538,6 +538,10 @@ model PaymentSettings {
   afterPurchasePath String @default("/dashboard") @map("after_purchase_path") @db.VarChar(255)
   pricingPath       String @default("/pricing") @map("pricing_path") @db.VarChar(255)
 
+  /// The checkout chooser's title and description per gateway, overriding the
+  /// defaults in lib/methodLabels.ts (29-checkout-methods.md).
+  methodLabels Json? @map("method_labels")
+
   updatedAt DateTime @updatedAt @map("updated_at") @db.DateTime(3)
 
   site Site @relation(fields: [siteId], references: [id], onDelete: Cascade)
@@ -567,6 +571,10 @@ model GatewayConfig {
 
   /// Non-secret settings, e.g. Lemon Squeezy variant ids per interval.
   options Json?
+
+  /// Shown to buyers at checkout. Off keeps the keys, and members already
+  /// paying through it keep renewing (29-checkout-methods.md).
+  enabled Boolean @default(true)
 
   accountName   String?   @map("account_name") @db.VarChar(255)
   maskedSuffix  String?   @map("masked_suffix") @db.VarChar(8)
