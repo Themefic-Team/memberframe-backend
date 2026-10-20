@@ -307,7 +307,9 @@ checkoutRouter.post(
     requireSecrets();
     const { site, session } = await requireMember(req);
     const input = optionsSchema.parse(req.body);
-    limit(req, `checkout:${session.member.memberId}`, 10);
+    // Its own allowance: listing the methods is read only, and sharing the
+    // checkout's limit locked a buyer out after a few tries (2026-10-20).
+    limit(req, `checkout-options:${session.member.memberId}`, 120);
     const { mode } = await loadPaymentSettings(site.id);
 
     ok(
@@ -331,8 +333,10 @@ checkoutRouter.post(
     const input = createSessionSchema.parse(req.body);
     if (!isSafeSitePath(input.returnPath)) throw badRequest("unsafe_path");
 
-    limit(req, `checkout:${session.member.memberId}`, 10);
     const { mode } = await loadPaymentSettings(site.id);
+    // Per 10 minutes rather than an hour, so a buyer who tries a few methods,
+    // or a creator testing them, is not locked out; Test mode is looser.
+    limit(req, `checkout:${session.member.memberId}`, mode === "test" ? 60 : 30, 600);
 
     const result = await createCheckout({
       siteId: site.id,

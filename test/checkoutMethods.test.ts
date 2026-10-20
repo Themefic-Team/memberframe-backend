@@ -79,3 +79,12 @@ describe("method labels", () => {
     expect(methodLabelsSchema.safeParse({ stripe: { title: "Card" } }).success).toBe(true);
   });
 });
+
+describe("checkout rate limits (2026-10-20)", () => {
+  it("give the methods call its own allowance, and the checkout a 10 minute window", async () => {
+    const { readFileSync } = await import("node:fs");
+    const routes = readFileSync(new URL("../src/routes/payments.ts", import.meta.url), "utf8");
+    expect(routes).toContain("limit(req, `checkout-options:${session.member.memberId}`, 120);");
+    expect(routes).toContain('limit(req, `checkout:${session.member.memberId}`, mode === "test" ? 60 : 30, 600);');
+  });
+});
