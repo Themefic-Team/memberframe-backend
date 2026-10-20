@@ -23,7 +23,7 @@ import { prisma } from "../../config/db.js";
 import { badRequest, notFound, ApiError } from "../../middleware/errors.js";
 import { isSafeSitePath } from "../../lib/siteSettings.js";
 import { ADAPTERS, connectedGateways, loadCredentials, loadPaymentSettings } from "./gatewayStore.js";
-import { availableMethods } from "./gatewayRouter.js";
+import { METHOD_ORDER, availableMethods } from "./gatewayRouter.js";
 import { resolveMethodLabel } from "../../lib/methodLabels.js";
 import { RUNNING, applyPaymentEvent, governingSubscription, recomputeMember } from "./apply.js";
 import { tierAmount, type PricedTier } from "./prices.js";
@@ -35,6 +35,7 @@ import {
   isPaymentMode,
   type BillingInterval,
   type CheckoutEmbed,
+  type GatewayCredentials,
   type GatewayId,
   type KnownPrice,
   type PaymentMode,
@@ -246,9 +247,21 @@ export type CheckoutOptions =
   | {
       kind: "choose";
       summary: { tierName: string; interval: BillingInterval; amountMinor: number; currency: string };
-      methods: Array<{ gateway: GatewayId; title: string; description: string }>;
+      /** Every gateway shown at checkout, recommended first; `available` false with a reason when it cannot sell this price. */
+      methods: Array<{ gateway: GatewayId; title: string; description: string; available: boolean; reason: string | null }>;
       recommended: GatewayId | null;
     };
+
+/** Why a gateway shown at checkout cannot sell this price, in the buyer's words. */
+function unavailableReason(credentials: GatewayCredentials, interval: BillingInterval, currency: string): string {
+  if (credentials.gateway === "lemonsqueezy") {
+    const storeCurrency = credentials.options["storeCurrency"];
+    if (typeof storeCurrency === "string" && storeCurrency !== currency) return `Not available for ${currency} prices`;
+    return interval === "lifetime" ? "Not available for one payment" : `Not available for ${interval === "year" ? "yearly" : "monthly"} plans`;
+  }
+  if (credentials.gateway === "razorpay" && interval !== "lifetime") return "Not available for subscriptions";
+  return "Not available for this plan";
+}
 
 /**
  * What the pricing card's chooser shows for one price (29-checkout-methods.md):
@@ -290,12 +303,28 @@ export async function checkoutOptions(input: {
     return { kind: "change" };
   }
 
+  // Every gateway shown at checkout is listed, the buyer's location only
+  // deciding which is preselected. One that cannot sell this price is listed
+  // too, unavailable with the reason, rather than silently missing.
   const connected = await connectedGateways(input.siteId, settings.mode, { enabledOnly: true });
-  const { methods, recommended } = availableMethods({ connected, interval: input.interval, currency, country: input.country });
+  const { methods: sellable, recommended } = availableMethods({ connected, interval: input.interval, currency, country: input.country });
+  const ordered = [...connected].sort(
+    (a, b) =>
+      (a.gateway === recommended ? -1 : 0) - (b.gateway === recommended ? -1 : 0) ||
+      METHOD_ORDER.indexOf(a.gateway) - METHOD_ORDER.indexOf(b.gateway)
+  );
   return {
     kind: "choose",
     summary: { tierName: tier.name, interval: input.interval, amountMinor, currency },
-    methods: methods.map((gateway) => ({ gateway, ...resolveMethodLabel(gateway, settings.methodLabels) })),
+    methods: ordered.map((credentials) => {
+      const available = sellable.includes(credentials.gateway);
+      return {
+        gateway: credentials.gateway,
+        ...resolveMethodLabel(credentials.gateway, settings.methodLabels),
+        available,
+        reason: available ? null : unavailableReason(credentials, input.interval, currency),
+      };
+    }),
     recommended,
   };
 }
@@ -396,7 +425,8 @@ export async function createCheckout(input: CheckoutRequest): Promise<CheckoutOu
     await prisma.checkout.update({ where: { id: checkout.id }, data: { state: "failed" } });
     if (error instanceof GatewayError) {
       process.stderr.write(`[payments] ${error.gateway} checkout failed: ${error.message}\n`);
-      throw new ApiError(502, "gateway_error");
+      // Named, so the chooser can say this method failed and offer the others.
+      throw new ApiError(502, "gateway_error", undefined, { gateway: decision.gateway });
     }
     throw error;
   }

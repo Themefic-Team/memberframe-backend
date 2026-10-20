@@ -27,16 +27,17 @@ const all = [credentials("razorpay"), credentials("lemonsqueezy", { monthlyVaria
 describe("availableMethods", () => {
   it("lists every method that can sell the price, the location's one first", () => {
     expect(availableMethods({ connected: all, interval: "month", currency: "USD", country: "DE" })).toEqual({
-      methods: ["lemonsqueezy", "stripe"],
+      methods: ["lemonsqueezy", "stripe", "razorpay"],
       recommended: "lemonsqueezy",
     });
     expect(availableMethods({ connected: all, interval: "month", currency: "USD", country: "US" }).methods).toEqual([
       "stripe",
       "lemonsqueezy",
+      "razorpay",
     ]);
   });
 
-  it("offers Razorpay only for a rupee price, preselected in India", () => {
+  it("preselects Razorpay in India, and leaves out a Lemon Squeezy store in another currency", () => {
     expect(availableMethods({ connected: all, interval: "month", currency: "INR", country: "IN" })).toEqual({
       methods: ["razorpay", "stripe"],
       recommended: "razorpay",

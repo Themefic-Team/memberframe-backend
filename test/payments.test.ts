@@ -232,9 +232,9 @@ describe("routing", () => {
     expect(chooseGateway({ connected: [], interval: "month", currency: "USD", country: "US", autoDetectGeolocation: true, defaultGateway: "" })).toBeNull();
   });
 
-  it("does not send an Indian buyer to Razorpay without a rupee price", () => {
-    // Razorpay sells INR. A tier priced only in dollars goes to Stripe instead.
-    expect(route("IN", { currency: "USD" })).toBe("stripe");
+  it("recommends Razorpay to a buyer in India whatever the currency (29-checkout-methods.md)", () => {
+    // Razorpay itself answers whether the account takes the currency; the buyer can choose another method.
+    expect(route("IN", { currency: "USD" })).toBe("razorpay");
   });
 
   it("keeps a Lemon Squeezy store to its own currency", () => {
@@ -242,7 +242,8 @@ describe("routing", () => {
     expect(lemonSqueezyAdapter.canSell(store, "month", "USD")).toBe(true);
     expect(lemonSqueezyAdapter.canSell(store, "month", "EUR")).toBe(false);
     expect(razorpayAdapter.canSell(credentials("razorpay"), "year", "INR")).toBe(true);
-    expect(razorpayAdapter.canSell(credentials("razorpay"), "year", "USD")).toBe(false);
+    expect(razorpayAdapter.canSell(credentials("razorpay"), "year", "USD")).toBe(true);
+    expect(razorpayAdapter.canSell(credentials("razorpay", { subscriptionsOff: "1" }), "year", "INR")).toBe(false);
   });
 
   it("finds a country from the buyer's IP when there is no CDN header", () => {

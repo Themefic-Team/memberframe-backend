@@ -273,14 +273,15 @@ export const razorpayAdapter: GatewayAdapter = {
     return { externalId: planId, externalProductId: null };
   },
 
-  canSell(credentials, interval, currency) {
+  canSell(credentials, interval) {
     // An account without Subscriptions cannot make plans, so a monthly or
-    // yearly checkout goes to another gateway rather than failing at Razorpay.
+    // yearly checkout is not offered rather than failing at Razorpay.
     if (interval !== "lifetime" && credentials.options[SUBSCRIPTIONS_OFF] === "1") return false;
-    // UPI and Indian net banking are rupees only. A creator who wants other
-    // currencies on Razorpay needs international payments enabled on their
-    // account; until that is a setting here, INR is what Razorpay sells.
-    return currency === "INR";
+    // Any currency (29-checkout-methods.md). UPI and net banking are rupees
+    // only, but an account with International Payments on takes cards in USD
+    // and others; Razorpay refuses a currency it cannot take, and the buyer is
+    // told to choose another method.
+    return true;
   },
 
   async createCheckout(credentials, spec: CheckoutSpec) {
