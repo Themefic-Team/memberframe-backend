@@ -508,15 +508,59 @@ export async function checkoutStatus(siteId: string, memberId: string, checkoutI
 export async function memberBilling(siteId: string, memberId: string) {
   const { pricingPath } = await loadPaymentSettings(siteId);
   const subscription = await governingSubscription(siteId, memberId);
-  const payments = await prisma.payment.findMany({
-    where: { siteId, memberId },
-    orderBy: { paidAt: "desc" },
-    take: 12,
-    select: { id: true, amountMinor: true, currency: true, status: true, receiptUrl: true, paidAt: true },
+
+  // Every payment, whichever gateway took it, with the plan it paid for: the
+  // Dashboard's subscription popup lists them all (2026-10-20).
+  const [rows, tiers] = await Promise.all([
+    prisma.payment.findMany({
+      where: { siteId, memberId },
+      orderBy: { paidAt: "desc" },
+      take: 24,
+      select: {
+        id: true,
+        amountMinor: true,
+        currency: true,
+        status: true,
+        receiptUrl: true,
+        paidAt: true,
+        gateway: true,
+        mode: true,
+        subscriptionId: true,
+      },
+    }),
+    prisma.tier.findMany({ where: { siteId, isActive: true }, orderBy: { rank: "asc" }, include: TIER_WITH_PRICES }),
+  ]);
+  const paidFor = await prisma.subscription.findMany({
+    where: { id: { in: rows.flatMap((row) => (row.subscriptionId ? [row.subscriptionId] : [])) } },
+    select: { id: true, tierKey: true, interval: true },
+  });
+  const tierName = (key: string) => tiers.find((tier) => tier.key === key)?.name ?? key;
+  const payments = rows.map((row) => {
+    const plan = paidFor.find((entry) => entry.id === row.subscriptionId);
+    return {
+      ...paymentShape(row),
+      gateway: row.gateway,
+      mode: row.mode,
+      planName: plan ? tierName(plan.tierKey) : null,
+      interval: plan?.interval ?? null,
+    };
   });
 
+  // What a member can switch to: each plan with its prices, by level.
+  const plans = tiers.map((tier) => ({
+    key: tier.key,
+    name: tier.name,
+    rank: tier.rank,
+    currency: tier.currency,
+    prices: {
+      month: tierAmount(tier, "month", tier.currency),
+      year: tierAmount(tier, "year", tier.currency),
+      lifetime: tierAmount(tier, "lifetime", tier.currency),
+    },
+  }));
+
   if (!subscription) {
-    return { subscription: null, payments: payments.map(paymentShape), pricingPath };
+    return { subscription: null, payments, plans, pricingPath };
   }
 
   const tier = await prisma.tier.findFirst({ where: { siteId, key: subscription.tierKey }, select: { name: true } });
@@ -528,6 +572,7 @@ export async function memberBilling(siteId: string, memberId: string) {
       tierKey: subscription.tierKey,
       tierName: tier?.name ?? subscription.tierKey,
       interval: subscription.interval,
+      gateway: subscription.gateway,
       status: subscription.status,
       amountMinor: subscription.amountMinor,
       currency: subscription.currency,
@@ -539,7 +584,8 @@ export async function memberBilling(siteId: string, memberId: string) {
       canResume: recurring && subscription.cancelAtPeriodEnd && adapter.resume !== null,
       canManage: recurring,
     },
-    payments: payments.map(paymentShape),
+    payments,
+    plans,
     pricingPath,
   };
 }
