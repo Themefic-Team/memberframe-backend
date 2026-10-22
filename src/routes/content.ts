@@ -269,8 +269,8 @@ const linkSchema = z.object({
   url: z.string().trim().min(1).max(2000),
   fileName: z.string().trim().max(255).optional(),
   requiredTier: z.string().trim().min(1).max(255).default("signed_in"),
-  /** For requiredTier "password". Hashed by the service; never stored as typed. */
-  password: z.string().min(4).max(200).optional(),
+  /** For requiredTier "password": any letters, numbers, or symbols. Hashed by the service; never stored as typed. */
+  password: z.string().min(1).max(200).optional(),
 });
 
 assetsCreatorRouter.post(
@@ -289,7 +289,7 @@ const patchSchema = z.object({
   fileName: z.string().trim().min(1).max(255).optional(),
   requiredTier: z.string().trim().min(1).max(255).optional(),
   url: z.string().trim().min(1).max(2000).optional(),
-  password: z.string().min(4).max(200).optional(),
+  password: z.string().min(1).max(200).optional(),
 });
 
 function assetIdParam(req: Request): string {

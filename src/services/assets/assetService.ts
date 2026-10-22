@@ -125,9 +125,13 @@ async function checkTier(siteId: string, requiredTier: string): Promise<string> 
   return only ? `only:${keys.join(",")}` : keys[0]!;
 }
 
-/** A shared password: 4 to 200 characters. Hashed before it is stored; never kept. */
+/**
+ * A shared password: any letters, numbers, or symbols, up to 200 characters
+ * (the product owner, 2026-10-22). Hashed before it is stored; never kept.
+ * Guessing is slowed by the route: ten tries a minute per address and file.
+ */
 async function passwordHashFor(password: string): Promise<string> {
-  if (password.length < 4 || password.length > 200) throw badRequest("invalid_password", { message: "Use a password of 4 to 200 characters." });
+  if (password.length < 1 || password.length > 200) throw badRequest("invalid_password", { message: "Use a password of up to 200 characters." });
   return hashPassword(password);
 }
 
