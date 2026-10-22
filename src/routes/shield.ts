@@ -47,6 +47,8 @@ export interface ShieldScriptConfig {
   loginPath: string;
   /** The pricing page, where a section lock's "See plans" card goes. */
   pricingPath?: string;
+  /** The sign up page, for the card's "Create an account" when it differs from sign in. */
+  signupPath?: string;
   /** Where a signed-in member on a guest page is sent. */
   afterLoginPath?: string;
   /** Sign in, sign up, and reset pages. A signed-in member is moved off them. */
@@ -103,6 +105,7 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
   var API_BASE = ${JSON.stringify(config.apiBase)};
   var LOGIN_PATH = ${JSON.stringify(config.loginPath || "/login")};
   var PRICING_PATH = ${JSON.stringify(config.pricingPath || "/pricing")};
+  var SIGNUP_PATH = ${JSON.stringify(config.signupPath || "")};
   var AFTER_LOGIN_PATH = ${JSON.stringify(config.afterLoginPath || "")};
   var GUEST_PATHS = ${JSON.stringify(config.guestPaths || [])};
   var RESET_PATH = ${JSON.stringify(config.resetPath || "")};
@@ -513,15 +516,36 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
    * removes. Placed again on every DOM change, resize, and load, in a frame.
    */
 
+  /*
+    The card: a lock in a soft brand circle, a short title and line, a brand
+    button, and for a visitor a way to sign up. Light, whatever the page, so
+    it reads over any blurred content; the veil behind it lifts the blur a
+    little so the card stands out. Fades in, unless the visitor asked for
+    reduced motion.
+  */
   var GATE_CSS =
-    ".mf-section-gate{position:absolute;z-index:5;display:flex;flex-direction:column;align-items:center;box-sizing:border-box;padding:16px;pointer-events:auto}" +
-    ".mf-section-gate-card{position:sticky;top:30vh;margin:auto 0;display:flex;flex-direction:column;align-items:center;gap:8px;max-width:320px;padding:20px 22px;box-sizing:border-box;border-radius:14px;background:#ffffff;color:#111111;border:1px solid rgba(0,0,0,0.08);box-shadow:0 12px 32px -12px rgba(0,0,0,0.28);text-align:center;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Inter,Helvetica,Arial,sans-serif}" +
+    ".mf-section-gate{position:absolute;z-index:5;display:flex;flex-direction:column;align-items:center;box-sizing:border-box;padding:16px;pointer-events:auto;background:linear-gradient(180deg,rgba(255,255,255,0.08),rgba(255,255,255,0.32));border-radius:12px}" +
+    ".mf-section-gate-card{position:sticky;top:30vh;margin:auto 0;display:flex;flex-direction:column;align-items:center;width:100%;max-width:340px;padding:28px 28px 24px;box-sizing:border-box;border-radius:16px;background:#ffffff;color:#0f172a;border:1px solid rgba(15,23,42,0.08);box-shadow:0 1px 2px rgba(15,23,42,0.06),0 18px 40px -12px rgba(15,23,42,0.22);text-align:center;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Inter,Helvetica,Arial,sans-serif;animation:mf-gate-in 0.24s ease-out both}" +
     ".mf-section-gate.is-tall .mf-section-gate-card{margin-top:15vh}" +
-    ".mf-section-gate-title{margin:0;font-size:16px;font-weight:700;line-height:1.3}" +
-    ".mf-section-gate-text{margin:0;font-size:13px;line-height:1.5;color:#555555}" +
-    ".mf-section-gate-button{display:inline-flex;align-items:center;justify-content:center;margin-top:4px;padding:10px 18px;border-radius:10px;background:#111111;color:#ffffff;font-size:14px;font-weight:600;line-height:1;text-decoration:none;cursor:pointer}" +
-    ".mf-section-gate-button:hover{background:#333333}" +
-    ".mf-section-gate-button:focus-visible{outline:2px solid #5271ff;outline-offset:2px}";
+    ".mf-section-gate-icon{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;margin-bottom:14px;border-radius:50%;background:#eef1ff;color:#5271ff}" +
+    ".mf-section-gate-icon svg{width:20px;height:20px}" +
+    ".mf-section-gate-title{margin:0;font-size:17px;font-weight:700;line-height:1.3;letter-spacing:-0.01em;color:#0f172a}" +
+    ".mf-section-gate-text{margin:6px 0 0;max-width:260px;font-size:14px;line-height:1.5;color:#64748b}" +
+    ".mf-section-gate-button{display:inline-flex;align-items:center;justify-content:center;gap:8px;width:100%;max-width:220px;height:42px;margin-top:20px;padding:0 20px;box-sizing:border-box;border-radius:10px;background:#5271ff;color:#ffffff;font-size:14px;font-weight:600;line-height:1;text-decoration:none;cursor:pointer;box-shadow:0 6px 16px -6px rgba(82,113,255,0.55);transition:background-color 0.15s ease,transform 0.1s ease}" +
+    ".mf-section-gate-button:hover{background:#3f5ef0}" +
+    ".mf-section-gate-button:active{transform:translateY(1px)}" +
+    ".mf-section-gate-button:focus-visible{outline:2px solid #5271ff;outline-offset:3px}" +
+    ".mf-section-gate-button svg{width:16px;height:16px}" +
+    ".mf-section-gate-alt{margin:14px 0 0;font-size:13px;line-height:1.4;color:#64748b}" +
+    ".mf-section-gate-alt a{color:#3f5ef0;font-weight:600;text-decoration:none}" +
+    ".mf-section-gate-alt a:hover{text-decoration:underline}" +
+    "@keyframes mf-gate-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}" +
+    "@media (prefers-reduced-motion:reduce){.mf-section-gate-card{animation:none}}";
+
+  var GATE_LOCK_ICON =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
+  var GATE_ARROW_ICON =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
 
   var gateRules = [];
   var gateResult = null;
@@ -535,13 +559,36 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
     return "";
   }
 
+  /** "Standard", "Standard or VIP", "Paid", or "" for any signed-in member. */
+  function audienceName(requiredTier, ladder) {
+    if (requiredTier === "any_paid") return "Paid";
+    if (requiredTier.indexOf("only:") === 0) {
+      var keys = requiredTier.slice(5).split(",");
+      var names = [];
+      for (var i = 0; i < keys.length; i++) {
+        var name = tierName(keys[i], ladder);
+        if (name) names.push(name);
+      }
+      return names.length > 2 ? names.slice(0, -1).join(", ") + " or " + names[names.length - 1] : names.join(" or ");
+    }
+    return tierName(requiredTier, ladder);
+  }
+
   function gateCopy(rule) {
     var member = gateResult && gateResult !== "unavailable" ? gateResult.member : null;
-    if (!member) return { title: "Members only", text: "Sign in to see this.", label: "Sign in", href: LOGIN_PATH, signIn: true };
-    var name = tierName(rule.requiredTier, gateResult.ladder || TIERS);
+    var name = audienceName(rule.requiredTier, (gateResult && gateResult !== "unavailable" && gateResult.ladder) || TIERS);
+    if (!member) {
+      return {
+        title: name ? name + " members only" : "Members only",
+        text: "Sign in to your account to read this section.",
+        label: "Sign in",
+        href: LOGIN_PATH,
+        signIn: true
+      };
+    }
     return {
       title: name ? name + " members only" : "Members only",
-      text: "Upgrade your plan to see this.",
+      text: "Your current plan does not include this. Upgrade to unlock it.",
       label: "See plans",
       href: PRICING_PATH,
       signIn: false
@@ -563,24 +610,53 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
     var gate = document.createElement("div");
     gate.className = "mf-section-gate";
     gate.setAttribute("data-mf-section-gate", rule.slug);
+
     var card = document.createElement("div");
     card.className = "mf-section-gate-card";
     card.setAttribute("role", "group");
     card.setAttribute("aria-label", copy.title);
+
+    var icon = document.createElement("span");
+    icon.className = "mf-section-gate-icon";
+    icon.innerHTML = GATE_LOCK_ICON;
+
     var title = document.createElement("p");
     title.className = "mf-section-gate-title";
     title.textContent = copy.title;
+
     var text = document.createElement("p");
     text.className = "mf-section-gate-text";
     text.textContent = copy.text;
-    var link = document.createElement("a");
-    link.className = "mf-section-gate-button";
-    link.href = copy.href;
-    link.textContent = copy.label;
-    if (copy.signIn) link.addEventListener("click", rememberReturn);
+
+    var button = document.createElement("a");
+    button.className = "mf-section-gate-button";
+    button.href = copy.href;
+    var label = document.createElement("span");
+    label.textContent = copy.label;
+    var arrow = document.createElement("span");
+    arrow.innerHTML = GATE_ARROW_ICON;
+    button.appendChild(label);
+    button.appendChild(arrow);
+    if (copy.signIn) button.addEventListener("click", rememberReturn);
+
+    card.appendChild(icon);
     card.appendChild(title);
     card.appendChild(text);
-    card.appendChild(link);
+    card.appendChild(button);
+
+    // A visitor without an account: the way to make one, when sign up is its own page.
+    if (copy.signIn && SIGNUP_PATH && norm(SIGNUP_PATH) !== norm(LOGIN_PATH)) {
+      var alt = document.createElement("p");
+      alt.className = "mf-section-gate-alt";
+      alt.appendChild(document.createTextNode("New here? "));
+      var signUp = document.createElement("a");
+      signUp.href = SIGNUP_PATH;
+      signUp.textContent = "Create an account";
+      signUp.addEventListener("click", rememberReturn);
+      alt.appendChild(signUp);
+      card.appendChild(alt);
+    }
+
     gate.appendChild(card);
     return gate;
   }
@@ -962,6 +1038,7 @@ export async function handleShieldScript(req: Request, res: Response): Promise<v
     apiBase,
     loginPath,
     pricingPath,
+    signupPath: settings.auth?.signupPath || "",
     afterLoginPath: settings.auth?.afterLoginPath || "/",
     guestPaths: shieldGuestPaths([settings.auth?.loginPath, settings.auth?.signupPath, settings.auth?.resetPath]),
     resetPath: (settings.auth?.resetPath || "").trim().replace(/\/+$/, ""),

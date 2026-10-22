@@ -690,7 +690,7 @@ describe("section gates: the card over a blurred members' section", () => {
     },
   });
 
-  function run(answer: { status: number; body: unknown }) {
+  function run(answer: { status: number; body: unknown }, signupPath = "") {
     const head = el("head");
     const body = el("body");
     const section = { getBoundingClientRect: () => ({ top: 100, left: 20, width: 600, height: 300 }) };
@@ -714,6 +714,7 @@ describe("section gates: the card over a blurred members' section", () => {
       body,
       documentElement: head,
       createElement: (tag: string) => el(tag),
+      createTextNode: (value: string) => Object.assign(el("#text"), { textContent: value }),
       addEventListener: vi.fn(),
       querySelectorAll: (selector: string) => (selector.includes(".mf-lock-about-content") ? [section] : []),
     };
@@ -723,6 +724,7 @@ describe("section gates: the card over a blurred members' section", () => {
       apiBase: "https://api.test",
       loginPath: "/login",
       pricingPath: "/pricing",
+      signupPath,
       rules: [],
       tiers: [...TIERS, { key: "standard", rank: 1, name: "Standard" }],
       sectionRules: [{ name: "About Content", enabled: true, audience: "members", requiredTier: "standard", lockedAction: "blur" }],
@@ -732,25 +734,44 @@ describe("section gates: the card over a blurred members' section", () => {
     return { body, session, card };
   }
 
-  const text = (node: FakeEl | undefined) => (node ? node.children.map((child) => child.textContent) : []);
+  /** The card's part with this class. */
+  const part = (card: FakeEl | undefined, name: string) => card?.children.find((child) => child.className === name);
+  const label = (button: FakeEl | undefined) => button?.children[0]?.textContent;
 
   it("asks a visitor to sign in, over the section's box, and remembers the page", async () => {
     const shield = run({ status: 401, body: {} });
     await flush();
     const gate = shield.body.children[0]!;
     expect(gate.attrs["style"]).toBe("top:150px;left:20px;width:600px;height:300px");
-    expect(text(shield.card())).toEqual(["Members only", "Sign in to see this.", "Sign in"]);
-    const link = shield.card()!.children[2]!;
-    expect(link.href).toBe("/login");
-    link.listeners["click"]![0]!();
+    const card = shield.card();
+    expect(part(card, "mf-section-gate-icon")).toBeDefined();
+    expect(part(card, "mf-section-gate-title")?.textContent).toBe("Standard members only");
+    expect(part(card, "mf-section-gate-text")?.textContent).toBe("Sign in to your account to read this section.");
+    const button = part(card, "mf-section-gate-button")!;
+    expect(label(button)).toBe("Sign in");
+    expect(button.href).toBe("/login");
+    button.listeners["click"]![0]!();
     expect(JSON.parse(shield.session.getItem(`memberframe:return-to:${SITE_KEY}`)!).path).toBe("/about");
+    // Sign up is the sign-in page here, so no second link.
+    expect(part(card, "mf-section-gate-alt")).toBeUndefined();
+  });
+
+  it("offers a visitor a way to sign up when sign up is its own page", async () => {
+    const shield = run({ status: 401, body: {} }, "/signup");
+    await flush();
+    const alt = part(shield.card(), "mf-section-gate-alt")!;
+    expect(alt.children.map((child) => child.textContent)).toEqual(["New here? ", "Create an account"]);
+    expect(alt.children[1]!.href).toBe("/signup");
   });
 
   it("offers a member on a lower plan the plans, naming the tier", async () => {
     const shield = run({ status: 200, body: { member: FREE_MEMBER, tiers: [...TIERS, { key: "standard", rank: 1, name: "Standard" }] } });
     await flush();
-    expect(text(shield.card())).toEqual(["Standard members only", "Upgrade your plan to see this.", "See plans"]);
-    expect(shield.card()!.children[2]!.href).toBe("/pricing");
+    const card = shield.card();
+    expect(part(card, "mf-section-gate-title")?.textContent).toBe("Standard members only");
+    expect(part(card, "mf-section-gate-text")?.textContent).toBe("Your current plan does not include this. Upgrade to unlock it.");
+    expect(label(part(card, "mf-section-gate-button"))).toBe("See plans");
+    expect(part(card, "mf-section-gate-button")!.href).toBe("/pricing");
   });
 });
 
