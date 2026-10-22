@@ -114,7 +114,7 @@ export async function loadCredentials(
   });
   if (!row) return null;
 
-  return {
+  const credentials = {
     configId: row.id,
     gateway,
     mode,
@@ -124,6 +124,16 @@ export async function loadCredentials(
     options: asRecord(row.options),
     webhookEndpointId: row.webhookEndpointId,
   };
+
+  // Something the account lacked when the keys were saved may be there now
+  // (Razorpay Subscriptions turned on later). The adapter asks at most every
+  // few minutes; a failed ask changes nothing.
+  const refreshed = await ADAPTERS[gateway]?.refreshOptions?.(credentials, Date.now()).catch(() => null);
+  if (refreshed) {
+    await prisma.gatewayConfig.update({ where: { id: row.id }, data: { options: refreshed as object } });
+    credentials.options = refreshed;
+  }
+  return credentials;
 }
 
 /** Every gateway connected in this mode, decrypted. */

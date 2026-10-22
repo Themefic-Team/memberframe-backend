@@ -56,6 +56,9 @@ const TOTAL_COUNT = { month: 120, year: 10 } as const;
 
 /** Set in a connection's options when the account cannot make plans. */
 const SUBSCRIPTIONS_OFF = "subscriptionsOff";
+/** When Subscriptions was last found off, so it is asked about again at most this often. */
+const SUBSCRIPTIONS_CHECKED_AT = "subscriptionsCheckedAt";
+export const SUBSCRIPTIONS_RECHECK_MS = 10 * 60 * 1000;
 
 async function razorpay(
   credentials: { keyId: string; keySecret: string },
@@ -241,7 +244,7 @@ export const razorpayAdapter: GatewayAdapter = {
       notices.push("Connected. Add the webhook in your Razorpay dashboard and paste its secret, or purchases will not unlock access.");
     }
     if (!subscriptions) {
-      notices.push("Subscriptions is not enabled on this Razorpay account, so only lifetime prices can be sold. Enable it in the Razorpay dashboard, then click Update keys.");
+      notices.push("Subscriptions is not enabled on this Razorpay account, so only lifetime prices can be sold. Enable it in the Razorpay dashboard; MemberFrame notices within ten minutes.");
     }
 
     return {
@@ -251,9 +254,28 @@ export const razorpayAdapter: GatewayAdapter = {
       webhookEndpointId: null,
       accountName: null,
       maskedSuffix: maskedSuffix(keyId),
-      options: subscriptions ? {} : { [SUBSCRIPTIONS_OFF]: "1" },
+      options: subscriptions ? {} : { [SUBSCRIPTIONS_OFF]: "1", [SUBSCRIPTIONS_CHECKED_AT]: String(Date.now()) },
       notice: notices.length > 0 ? notices.join(" ") : null,
     };
+  },
+
+  /**
+   * Subscriptions found off when the keys were saved is asked about again,
+   * at most every ten minutes, so turning it on in Razorpay is enough: no
+   * Update keys needed. Once Razorpay can make plans, the flag goes.
+   */
+  async refreshOptions(credentials, now) {
+    if (credentials.options[SUBSCRIPTIONS_OFF] !== "1") return null;
+    const checked = Number(credentials.options[SUBSCRIPTIONS_CHECKED_AT]) || 0;
+    if (now - checked < SUBSCRIPTIONS_RECHECK_MS) return null;
+    const on = await razorpay(keysOf(credentials), "GET", "/plans?count=1").then(
+      () => true,
+      () => false
+    );
+    const rest = { ...credentials.options };
+    delete rest[SUBSCRIPTIONS_OFF];
+    delete rest[SUBSCRIPTIONS_CHECKED_AT];
+    return on ? rest : { ...credentials.options, [SUBSCRIPTIONS_CHECKED_AT]: String(now) };
   },
 
   async disconnect() {
@@ -265,7 +287,7 @@ export const razorpayAdapter: GatewayAdapter = {
       throw new GatewayError(
         "razorpay",
         400,
-        "Subscriptions is not enabled on your Razorpay account, so monthly and yearly plans cannot be sold through it. Enable Subscriptions in Razorpay, then click Update keys in MemberFrame."
+        "Subscriptions is not enabled on your Razorpay account, so monthly and yearly plans cannot be sold through it. Enable Subscriptions in Razorpay; MemberFrame notices within ten minutes."
       );
     }
     if (spec.interval === "lifetime") {

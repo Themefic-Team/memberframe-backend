@@ -176,3 +176,29 @@ describe("an active plan past its period end (a missed webhook)", () => {
     expect(apply).toContain('action: "payment_failed", type: "sync"');
   });
 });
+
+describe("Razorpay Subscriptions turned on after the keys were saved (2026-10-22)", () => {
+  const off = (checkedAt: number) =>
+    credentials("razorpay", { publicId: "rzp_test_1", secrets: { keySecret: "s" }, options: { subscriptionsOff: "1", subscriptionsCheckedAt: String(checkedAt) } });
+
+  it("asks Razorpay again and clears the flag once it can make plans", async () => {
+    const calls = capture({ items: [] });
+    const now = Date.now();
+    expect(await razorpayAdapter.refreshOptions!(off(0), now)).toEqual({});
+    expect(calls.map((call) => call.url)).toEqual(["https://api.razorpay.com/v1/plans?count=1"]);
+  });
+
+  it("keeps the flag, with a new time, while Subscriptions is still off", async () => {
+    vi.stubGlobal("fetch", async () => new Response(JSON.stringify({ error: { description: "not enabled" } }), { status: 400 }));
+    const now = Date.now();
+    expect(await razorpayAdapter.refreshOptions!(off(0), now)).toEqual({ subscriptionsOff: "1", subscriptionsCheckedAt: String(now) });
+  });
+
+  it("asks at most every ten minutes, and never when Subscriptions was on", async () => {
+    const calls = capture({ items: [] });
+    const now = Date.now();
+    expect(await razorpayAdapter.refreshOptions!(off(now - 60_000), now)).toBeNull();
+    expect(await razorpayAdapter.refreshOptions!(credentials("razorpay"), now)).toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+});

@@ -209,6 +209,13 @@ export interface GatewayAdapter {
   ensurePrice?(credentials: GatewayCredentials, spec: PriceSpec, product: string | null): Promise<KnownPrice>;
   /** Can this gateway sell this interval, in this currency, with the current configuration? */
   canSell(credentials: GatewayCredentials, interval: BillingInterval, currency: string): boolean;
+  /**
+   * Look again at something the connect step found missing on the account,
+   * and return the options to store if it changed, else null. Razorpay:
+   * Subscriptions turned on after the keys were saved. Called as credentials
+   * load, so it must stay cheap: the adapter decides how often it really asks.
+   */
+  refreshOptions?(credentials: GatewayCredentials, now: number): Promise<Record<string, unknown> | null>;
   createCheckout(credentials: GatewayCredentials, spec: CheckoutSpec): Promise<CheckoutResult>;
   /** True when the raw body was signed by the gateway with this site's secret. */
   verifyWebhook(rawBody: Buffer, headers: Record<string, string | undefined>, secrets: string[]): boolean;

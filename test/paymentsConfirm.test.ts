@@ -230,7 +230,7 @@ describe("connecting", () => {
     });
 
     expect(calls.some((url) => url.includes("/orders?count=1"))).toBe(true);
-    expect(result.options).toEqual({ subscriptionsOff: "1" });
+    expect(result.options).toMatchObject({ subscriptionsOff: "1", subscriptionsCheckedAt: expect.any(String) });
     expect(result.notice).toMatch(/Subscriptions is not enabled/);
     expect(razorpayAdapter.canSell({ ...credentials("razorpay"), options: result.options }, "month", "INR")).toBe(false);
     expect(razorpayAdapter.canSell({ ...credentials("razorpay"), options: result.options }, "lifetime", "INR")).toBe(true);
