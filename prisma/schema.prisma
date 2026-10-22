@@ -857,8 +857,10 @@ model Asset {
   storageKey   String? @map("storage_key") @db.VarChar(255)
   /// For a linked file. Fetched server side, so it never reaches a visitor.
   remoteUrl    String? @map("remote_url") @db.Text
-  /// signed_in, or a tier key. Checked against the member's tier on every sign.
-  requiredTier String  @default("signed_in") @map("required_tier") @db.VarChar(50)
+  /// signed_in, any_paid, a tier key, only:a,b, or password. Checked on every sign.
+  requiredTier String  @default("signed_in") @map("required_tier") @db.VarChar(255)
+  /// For requiredTier "password": the shared password's hash. Never the password.
+  passwordHash String? @map("password_hash") @db.VarChar(255)
   downloadCount Int    @default(0) @map("download_count")
   lastDownloadAt DateTime? @map("last_download_at") @db.DateTime(3)
 

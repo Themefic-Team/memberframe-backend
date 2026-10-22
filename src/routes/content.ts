@@ -134,6 +134,8 @@ const signSchema = z.object({
   assetId: z.string().trim().min(1).max(40),
   /** Optional, from the plan's contract. When sent it must be this site. */
   siteId: z.string().trim().max(64).optional(),
+  /** For a password file (32-canvas-downloads.md). Never logged or stored. */
+  password: z.string().max(200).optional(),
 });
 
 assetsRouter.post(
@@ -145,10 +147,12 @@ assetsRouter.post(
     // the request authenticated as, whatever the body claims.
     if (input.siteId && input.siteId !== site.id) throw badRequest("site_mismatch");
     limit(`assets-sign:${session?.member.memberId ?? clientIp(req)}`, 60);
+    // Guessing a file's password: ten tries a minute from one address.
+    if (input.password !== undefined) limit(`assets-password:${clientIp(req)}:${input.assetId}`, 10);
 
     res.setHeader("Cache-Control", "private, no-store");
     const context = session ? { member: session.member, tiers: session.tiers } : null;
-    ok(res, await signDownload(site.id, input.assetId, context, publicApiBase(req)));
+    ok(res, await signDownload(site.id, input.assetId, context, publicApiBase(req), input.password));
   })
 );
 
@@ -264,7 +268,9 @@ const linkSchema = z.object({
   name: z.string().max(200).default(""),
   url: z.string().trim().min(1).max(2000),
   fileName: z.string().trim().max(255).optional(),
-  requiredTier: z.string().trim().min(1).max(50).default("signed_in"),
+  requiredTier: z.string().trim().min(1).max(255).default("signed_in"),
+  /** For requiredTier "password". Hashed by the service; never stored as typed. */
+  password: z.string().min(4).max(200).optional(),
 });
 
 assetsCreatorRouter.post(
@@ -281,8 +287,9 @@ const patchSchema = z.object({
   siteId: siteIdSchema,
   name: z.string().max(200).optional(),
   fileName: z.string().trim().min(1).max(255).optional(),
-  requiredTier: z.string().trim().min(1).max(50).optional(),
+  requiredTier: z.string().trim().min(1).max(255).optional(),
   url: z.string().trim().min(1).max(2000).optional(),
+  password: z.string().min(4).max(200).optional(),
 });
 
 function assetIdParam(req: Request): string {

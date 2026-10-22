@@ -13,13 +13,14 @@
  * what the server decides.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { prisma } from "../../config/db.js";
 import { env } from "../../config/env.js";
 import { badRequest, forbidden, notFound, unauthorized } from "../../middleware/errors.js";
 import { isEntitled, type MemberSessionData, type TierLadderEntry } from "../../lib/entitlement.js";
+import { hashPassword, verifyAgainstNothing, verifyPassword } from "../../lib/password.js";
 import { loadTierLadder } from "../sessionService.js";
 import { createLinkToken, readLinkToken } from "./downloadLink.js";
 import { RemoteUrlError, assertPublicUrl, checkRemoteUrlShape } from "./remoteUrl.js";
@@ -106,12 +107,36 @@ export function directDownloadUrl(value: string): string {
   return url.toString();
 }
 
-/** `signed_in`, or one of the site's tier keys. */
+/** A file anyone with its shared password may download, with no account (32-canvas-downloads.md). */
+export const PASSWORD_RULE = "password";
+
+/**
+ * Who may download: `signed_in`, `any_paid`, `password`, one of the site's
+ * tier keys (that tier or higher), or `only:a,b` (exactly those tiers), the
+ * same choices as page and section locks. Every key must be the site's.
+ */
 async function checkTier(siteId: string, requiredTier: string): Promise<string> {
-  if (requiredTier === "signed_in") return requiredTier;
-  const tier = await prisma.tier.findFirst({ where: { siteId, key: requiredTier }, select: { key: true } });
-  if (!tier) throw badRequest("unknown_tier");
-  return tier.key;
+  if (requiredTier === "signed_in" || requiredTier === "any_paid" || requiredTier === PASSWORD_RULE) return requiredTier;
+  const only = requiredTier.startsWith("only:");
+  const keys = Array.from(new Set((only ? requiredTier.slice(5).split(",") : [requiredTier]).map((key) => key.trim()).filter(Boolean)));
+  if (keys.length === 0) throw badRequest("unknown_tier");
+  const found = await prisma.tier.findMany({ where: { siteId, key: { in: keys } }, select: { key: true } });
+  if (found.length !== keys.length) throw badRequest("unknown_tier");
+  return only ? `only:${keys.join(",")}` : keys[0]!;
+}
+
+/** A shared password: 4 to 200 characters. Hashed before it is stored; never kept. */
+async function passwordHashFor(password: string): Promise<string> {
+  if (password.length < 4 || password.length > 200) throw badRequest("invalid_password", { message: "Use a password of 4 to 200 characters." });
+  return hashPassword(password);
+}
+
+/**
+ * What a password download link carries instead of a member: a fingerprint of
+ * the current hash. A new password makes every older link fail.
+ */
+export function passwordGrant(passwordHash: string): string {
+  return `pw:${createHash("sha256").update(passwordHash, "utf8").digest("hex").slice(0, 16)}`;
 }
 
 type AssetRow = NonNullable<Awaited<ReturnType<typeof prisma.asset.findFirst>>>;
@@ -127,6 +152,8 @@ function creatorShape(asset: AssetRow) {
     source: asset.source,
     remoteUrl: asset.source === "url" ? asset.remoteUrl : null,
     requiredTier: asset.requiredTier,
+    /** Whether a shared password is set. Never the password or its hash. */
+    hasPassword: asset.passwordHash !== null,
     downloadCount: asset.downloadCount,
     lastDownloadAt: asset.lastDownloadAt?.toISOString() ?? null,
     createdAt: asset.createdAt.toISOString(),
@@ -204,6 +231,8 @@ export interface LinkInput {
   url: string;
   fileName?: string;
   requiredTier: string;
+  /** Required when requiredTier is "password". */
+  password?: string;
 }
 
 export async function createLinkedAsset(siteId: string, input: LinkInput): Promise<CreatorAsset> {
@@ -219,6 +248,8 @@ export async function createLinkedAsset(siteId: string, input: LinkInput): Promi
 
   const fromPath = decodeURIComponent(new URL(remoteUrl).pathname.split("/").pop() ?? "");
   const fileName = safeFileName(input.fileName || fromPath || input.name);
+  if (requiredTier === PASSWORD_RULE && !input.password) throw badRequest("password_required", { message: "Set a password for this file." });
+  const passwordHash = requiredTier === PASSWORD_RULE && input.password ? await passwordHashFor(input.password) : null;
 
   const asset = await prisma.asset.create({
     data: {
@@ -231,6 +262,7 @@ export async function createLinkedAsset(siteId: string, input: LinkInput): Promi
       source: "url",
       remoteUrl,
       requiredTier,
+      passwordHash,
     },
   });
   return creatorShape(asset);
@@ -241,6 +273,8 @@ export interface AssetPatch {
   fileName?: string;
   requiredTier?: string;
   url?: string;
+  /** A new shared password. Only for a password file. */
+  password?: string;
 }
 
 export async function updateAsset(siteId: string, assetId: string, patch: AssetPatch): Promise<CreatorAsset> {
@@ -254,6 +288,14 @@ export async function updateAsset(siteId: string, assetId: string, patch: AssetP
     data["mimeType"] = mimeFor(data["fileName"] as string, asset.source === "upload" ? asset.mimeType : null);
   }
   if (patch.requiredTier !== undefined) data["requiredTier"] = await checkTier(siteId, patch.requiredTier);
+  const rule = (data["requiredTier"] as string | undefined) ?? asset.requiredTier;
+  if (rule === PASSWORD_RULE) {
+    if (patch.password) data["passwordHash"] = await passwordHashFor(patch.password);
+    else if (asset.passwordHash === null) throw badRequest("password_required", { message: "Set a password for this file." });
+  } else if (asset.passwordHash !== null) {
+    // No longer a password file: the old password must not open it again.
+    data["passwordHash"] = null;
+  }
   if (patch.url !== undefined) {
     if (asset.source !== "url") throw badRequest("not_a_link");
     try {
@@ -284,9 +326,17 @@ export interface MemberContext {
   tiers: ReadonlyArray<TierLadderEntry>;
 }
 
+/** Who a rule lets in, in words: "Member", "Paid", "Silver or Gold", "Password", or a tier's name. */
 function tierName(tiers: ReadonlyArray<TierLadderEntry>, key: string): string {
   if (key === "signed_in") return "Member";
-  return tiers.find((tier) => tier.key === key)?.name ?? key;
+  if (key === "any_paid") return "Paid";
+  if (key === PASSWORD_RULE) return "Password";
+  const nameOf = (one: string) => tiers.find((tier) => tier.key === one)?.name ?? one;
+  if (key.startsWith("only:")) {
+    const names = key.slice(5).split(",").filter(Boolean).map(nameOf);
+    return names.length > 2 ? `${names.slice(0, -1).join(", ")} or ${names[names.length - 1]}` : names.join(" or ");
+  }
+  return nameOf(key);
 }
 
 /**
@@ -298,11 +348,15 @@ export async function publicAsset(siteId: string, assetId: string, context: Memb
   if (!asset) throw notFound("asset_not_found");
 
   const tiers = context?.tiers ?? (await loadTierLadder(siteId));
-  const access = !context
-    ? "sign_in"
-    : isEntitled(context.member, asset.requiredTier as never, tiers)
-      ? "granted"
-      : "upgrade";
+  // A password file asks everyone for the password, member or not.
+  const access =
+    asset.requiredTier === PASSWORD_RULE
+      ? "password"
+      : !context
+        ? "sign_in"
+        : isEntitled(context.member, asset.requiredTier as never, tiers)
+          ? "granted"
+          : "upgrade";
 
   return {
     asset: {
@@ -321,26 +375,43 @@ export async function publicAsset(siteId: string, assetId: string, context: Memb
 /**
  * Check and sign. 401 for a visitor who is not signed in, 404 for an asset
  * that is not this site's, 403 for a member below the asset's tier, and never
- * a link in any of those three.
+ * a link in any of those three. A password file needs no account: 401
+ * `invalid_password` for a wrong one, and a link that names the password's
+ * fingerprint instead of a member.
  */
-export async function signDownload(siteId: string, assetId: string, context: MemberContext | null, apiBase: string) {
-  if (!context) throw unauthorized("unauthenticated");
-
+export async function signDownload(
+  siteId: string,
+  assetId: string,
+  context: MemberContext | null,
+  apiBase: string,
+  password?: string
+) {
   const asset = ASSET_ID_PATTERN.test(assetId) ? await prisma.asset.findFirst({ where: { id: assetId, siteId } }) : null;
-  if (!asset) throw notFound("asset_not_found");
 
-  if (!isEntitled(context.member, asset.requiredTier as never, context.tiers)) {
-    throw forbidden("tier_upgrade_required", {
-      requiredTier: asset.requiredTier,
-      requiredTierName: tierName(context.tiers, asset.requiredTier),
-    });
+  let holder: string;
+  if (asset && asset.requiredTier === PASSWORD_RULE) {
+    const given = typeof password === "string" ? password : "";
+    // The same time whether the file has a password or not.
+    const matches = asset.passwordHash && given !== "" ? await verifyPassword(given, asset.passwordHash) : await verifyAgainstNothing(given);
+    if (!matches || !asset.passwordHash) throw unauthorized("invalid_password");
+    holder = passwordGrant(asset.passwordHash);
+  } else {
+    if (!context) throw unauthorized("unauthenticated");
+    if (!asset) throw notFound("asset_not_found");
+    if (!isEntitled(context.member, asset.requiredTier as never, context.tiers)) {
+      throw forbidden("tier_upgrade_required", {
+        requiredTier: asset.requiredTier,
+        requiredTierName: tierName(context.tiers, asset.requiredTier),
+      });
+    }
+    holder = context.member.memberId;
   }
 
   const expiresInSeconds = env.assets.linkSeconds;
   const token = createLinkToken({
     assetId: asset.id,
     siteId,
-    memberId: context.member.memberId,
+    memberId: holder,
     expiresAt: Math.floor(Date.now() / 1000) + expiresInSeconds,
   });
 
@@ -382,11 +453,17 @@ export async function openDownload(token: string): Promise<DownloadOutcome> {
   if (!check.ok) return { ok: false, status: check.reason === "link_expired" ? 410 : 404, reason: check.reason };
 
   const { assetId, siteId, memberId } = check.claims;
+  const byPassword = memberId.startsWith("pw:");
   const [asset, member] = await Promise.all([
     prisma.asset.findFirst({ where: { id: assetId, siteId } }),
-    prisma.member.findFirst({ where: { id: memberId, siteId, deletedAt: null }, select: { id: true } }),
+    byPassword ? Promise.resolve(null) : prisma.member.findFirst({ where: { id: memberId, siteId, deletedAt: null }, select: { id: true } }),
   ]);
-  if (!asset || !member) return { ok: false, status: 404, reason: "asset_not_found" };
+  if (!asset) return { ok: false, status: 404, reason: "asset_not_found" };
+  // A password link holds only while that password is the file's password.
+  const allowed = byPassword
+    ? asset.requiredTier === PASSWORD_RULE && asset.passwordHash !== null && passwordGrant(asset.passwordHash) === memberId
+    : member !== null;
+  if (!allowed) return { ok: false, status: 404, reason: "asset_not_found" };
 
   try {
     if (asset.source === "upload" && asset.storageKey) {
