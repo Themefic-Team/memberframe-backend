@@ -29,6 +29,7 @@ import {
   toJsonDocument,
   validatePatch,
   withDefaults,
+  readRequiredTier,
   sectionLockSlug,
 } from "../src/lib/siteSettings.js";
 
@@ -553,5 +554,40 @@ describe("password rules (05-member-auth.md 13)", () => {
     expect(next.auth.passwordPolicy).toMatchObject({ minLength: 12, requireNumber: false, requireSymbol: true });
     expect(next.auth.requirePasswordStrength).toBe(false);
     expect(toJsonDocument(next).auth).toMatchObject({ passwordPolicy: { minLength: 12, requireSymbol: true } });
+  });
+});
+
+describe("exact tiers in locks (19-section-locks.md 8)", () => {
+  it("reads only:a,b, tidying keys and dropping junk", () => {
+    expect(readRequiredTier("only:Standard, vip,vip")).toBe("only:standard,vip");
+    expect(readRequiredTier("only:")).toBe("signed_in");
+    expect(readRequiredTier("only:<script>")).toBe("signed_in");
+    expect(readRequiredTier("premium")).toBe("premium");
+  });
+
+  it("keeps an only: rule on a page lock and a section lock", () => {
+    const doc = withDefaults({
+      gatedPages: [{ path: "/vip", enabled: true, requiredTier: "only:standard,vip", fallbackAction: "redirect" }],
+      sectionLocks: [{ name: "Bonus", enabled: true, audience: "others", requiredTier: "only:premium", lockedAction: "blur" }],
+    });
+    expect(doc.gatedPages[0]!.requiredTier).toBe("only:standard,vip");
+    expect(doc.sectionLocks[0]!.requiredTier).toBe("only:premium");
+  });
+});
+
+describe("a page lock for those without access (19-section-locks.md 9)", () => {
+  it("keeps audience others, and leaves members implied", () => {
+    const doc = withDefaults({
+      gatedPages: [
+        { path: "/join", enabled: true, audience: "others", requiredTier: "any_paid", fallbackAction: "redirect" },
+        { path: "/vip", enabled: true, audience: "members", requiredTier: "vip", fallbackAction: "redirect" },
+      ],
+    });
+    expect(doc.gatedPages[0]).toMatchObject({ audience: "others", requiredTier: "any_paid" });
+    expect(doc.gatedPages[1]!.audience).toBeUndefined();
+    expect(toJsonDocument(doc).gatedPages).toEqual([
+      expect.objectContaining({ path: "/join", audience: "others" }),
+      expect.not.objectContaining({ audience: expect.anything() }),
+    ]);
   });
 });

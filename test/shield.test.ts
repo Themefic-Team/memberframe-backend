@@ -66,7 +66,9 @@ describe("generateShieldJs", () => {
     expect(js).toContain("memberframe-shield-veil");
     expect(js).toContain("html { visibility: hidden !important; opacity: 0 !important; }");
     // Locked pages fail closed on a slow check: the timer denies, never reveals.
-    expect(js).toContain("if (id === seq) deny(rule, path, null);");
+    // A page for others (19-section-locks.md 9) opens instead: the visitor counts as signed out.
+    expect(js).toContain('if (rule.audience === "others") show();\n        else deny(rule, path, null);');
+    expect(js).toContain("var lockedTimer = setTimeout(noAnswer, LOCKED_TIMEOUT_MS);");
     expect(js).toContain("window.location.replace");
   });
 

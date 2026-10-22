@@ -102,6 +102,20 @@ export function isEntitled(
 
   if (!statusOk) return false;
   if (requiredTier === "signed_in") return true;
+  // "any_paid": any tier above the lowest one, which is Free.
+  if (requiredTier === "any_paid") {
+    const held = tiers.find((tier) => tier.key === session.activeTier);
+    return held !== undefined && tiers.some((tier) => tier.rank < held.rank);
+  }
+
+  // "only:a,b": exactly these tiers, not "or higher". A key the site no
+  // longer has matches nobody, so a deleted tier fails closed.
+  if (requiredTier.startsWith("only:")) {
+    return requiredTier
+      .slice(5)
+      .split(",")
+      .some((key) => key === session.activeTier && tiers.some((tier) => tier.key === key));
+  }
 
   const required = tiers.find((tier) => tier.key === requiredTier);
   const held = tiers.find((tier) => tier.key === session.activeTier);

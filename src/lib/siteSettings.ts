@@ -254,10 +254,35 @@ export type GatedPageFallbackAction = "redirect" | "blur" | "custom_card";
 export type GatedPageTier = string;
 
 const GATED_TIER_PATTERN = /^[a-z][a-z0-9_]{1,49}$/;
+/** At most this many tiers in an "only:" choice. */
+const ONLY_TIERS_MAX = 20;
+
+/**
+ * A lock's tier choice, read defensively: "signed_in", a tier key (that tier
+ * or higher), or "only:a,b" (exactly those tiers, 19-section-locks.md).
+ * Keys are lowercased, checked, and deduplicated; anything unusable is
+ * "signed_in", as a malformed single key always was.
+ */
+export function readRequiredTier(raw: unknown): string {
+  if (typeof raw !== "string") return "signed_in";
+  if (raw.startsWith("only:")) {
+    const keys = [...new Set(raw.slice(5).split(",").map((key) => key.trim().toLowerCase()))]
+      .filter((key) => GATED_TIER_PATTERN.test(key))
+      .slice(0, ONLY_TIERS_MAX);
+    return keys.length > 0 ? `only:${keys.join(",")}` : "signed_in";
+  }
+  return GATED_TIER_PATTERN.test(raw) ? raw : "signed_in";
+}
 
 export interface GatedPageRule {
   path: string;
   enabled: boolean;
+  /**
+   * "members" (the default): the page is for those the tier choice lets in.
+   * "others": for everyone it does not, such as a join page members never see
+   * (19-section-locks.md 9). The same pair a section lock has.
+   */
+  audience?: "members" | "others";
   requiredTier: GatedPageTier;
   fallbackAction: GatedPageFallbackAction;
   redirectPath?: string;
@@ -620,7 +645,7 @@ function readSectionLocks(value: unknown): SectionLockRule[] {
       name,
       enabled: entry["enabled"] !== false,
       audience: entry["audience"] === "others" ? "others" : "members",
-      requiredTier: typeof rawTier === "string" && GATED_TIER_PATTERN.test(rawTier) ? rawTier : "signed_in",
+      requiredTier: readRequiredTier(rawTier),
       lockedAction: entry["lockedAction"] === "blur" ? "blur" : "hide",
     });
   }
@@ -640,8 +665,7 @@ function readGatedPages(value: unknown): GatedPageRule[] {
     if (!isSafeSitePath(pathVal) || seen.has(pathVal)) continue;
 
     const rawTier = entry["requiredTier"];
-    const tier: GatedPageTier =
-      typeof rawTier === "string" && GATED_TIER_PATTERN.test(rawTier) ? rawTier : "signed_in";
+    const tier: GatedPageTier = readRequiredTier(rawTier);
 
     const rawFallback = entry["fallbackAction"];
     const fallback: GatedPageFallbackAction =
@@ -659,6 +683,7 @@ function readGatedPages(value: unknown): GatedPageRule[] {
     const rule: GatedPageRule = {
       path: pathVal,
       enabled: entry["enabled"] !== false,
+      ...(entry["audience"] === "others" ? { audience: "others" as const } : {}),
       requiredTier: tier,
       fallbackAction: fallback,
     };
@@ -1261,6 +1286,7 @@ export function toJsonDocument(document: SiteSettingsDocument): Prisma.InputJson
     gatedPages: (document.gatedPages ?? []).map((rule) => ({
       path: rule.path,
       enabled: rule.enabled,
+      ...(rule.audience === "others" ? { audience: "others" } : {}),
       requiredTier: rule.requiredTier,
       fallbackAction: rule.fallbackAction,
       ...(rule.redirectPath !== undefined ? { redirectPath: rule.redirectPath } : {}),

@@ -774,3 +774,37 @@ describe("the reset page is a sign-in page, except with a reset token (2026-10-2
     expect(js).toContain('if (path === RESET_PATH && /[?&]token=/.test(window.location.search || "")) return false;');
   });
 });
+
+describe("exact tiers in a section lock (2026-10-22)", () => {
+  it("shows an only: section to the listed tier (Free) and not to a higher one (VIP)", async () => {
+    const section: SectionLockRule = { name: "Standard bonus", enabled: true, audience: "members", requiredTier: "only:free_member", lockedAction: "hide" };
+    const selector = '.mf-lock-standard-bonus';
+    const standard = boot("/about", { answers: [signedIn()], sectionRules: [section] });
+    const vip = boot("/about", { answers: [signedIn({ ...FREE_MEMBER, activeTier: "vip" })], sectionRules: [section] });
+    await flush();
+    expect(standard.sectionCss().split("{display:none")[0]).toContain(selector);
+    expect(vip.sectionCss().split("{display:none")[0]).not.toContain(selector);
+  });
+});
+
+describe("a page for those without access (2026-10-22)", () => {
+  const JOIN: GatedPageRule = { path: "/join", enabled: true, audience: "others", requiredTier: "signed_in", fallbackAction: "redirect", redirectPath: "/login" };
+
+  it("shows a signed-out visitor the page at once", () => {
+    const shield = boot("/join", { rules: [JOIN] });
+    expect(shield.hidden()).toBe(false);
+  });
+
+  it("moves a signed-in member on to After sign in", async () => {
+    const shield = boot("/join", { rules: [JOIN], local: { [HINT_KEY]: "1" }, answers: [signedIn()] });
+    await flush();
+    expect(shield.location.replace).toHaveBeenCalledWith("/dashboard");
+  });
+
+  it("opens the page when the check fails: the visitor counts as signed out", async () => {
+    const shield = boot("/join", { rules: [JOIN], local: { [HINT_KEY]: "1" }, answers: ["network_error"] });
+    await flush();
+    expect(shield.hidden()).toBe(false);
+    expect(shield.location.replace).not.toHaveBeenCalled();
+  });
+});

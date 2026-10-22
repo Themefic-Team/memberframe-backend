@@ -245,6 +245,25 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
       (session.status === "canceled" && nowSeconds < (session.currentPeriodEnd || 0));
     if (!statusOk) return false;
     if (requiredTier === "signed_in") return true;
+    // "any_paid": any tier above the lowest one, the same rule as isEntitled.
+    if (requiredTier === "any_paid") {
+      var heldPaid = -1;
+      var lowest = 999;
+      for (var m = 0; m < ladder.length; m++) {
+        if (ladder[m].key === session.activeTier) heldPaid = ladder[m].rank;
+        if (ladder[m].rank < lowest) lowest = ladder[m].rank;
+      }
+      return heldPaid > lowest;
+    }
+    // "only:a,b": exactly these tiers, the same rule as isEntitled.
+    if (requiredTier.indexOf("only:") === 0) {
+      var keys = requiredTier.slice(5).split(",");
+      for (var k = 0; k < keys.length; k++) {
+        if (keys[k] !== session.activeTier) continue;
+        for (var l = 0; l < ladder.length; l++) if (ladder[l].key === keys[k]) return true;
+      }
+      return false;
+    }
 
     var heldRank = -1;
     var reqRank = 999;
@@ -253,6 +272,16 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
       if (ladder[j].key === requiredTier) reqRank = ladder[j].rank;
     }
     return heldRank >= reqRank;
+  }
+
+  /**
+   * May this member open a page under this rule? A rule for "members" lets in
+   * those its tier choice matches; one for "others" (19-section-locks.md 9)
+   * lets in everyone it does not, signed-out visitors included.
+   */
+  function allowedOn(rule, member, ladder) {
+    var entitled = checkEntitled(member, rule.requiredTier, ladder || TIERS);
+    return rule.audience === "others" ? !entitled : entitled;
   }
 
   /** One request at a time, shared by every check that is waiting on it. */
@@ -341,7 +370,7 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
       var candidate = norm(candidates[i]);
       if (candidate === path || isGuestPath(candidate)) continue;
       var candidateRule = ruleFor(candidate);
-      if (candidateRule && !checkEntitled(member, candidateRule.requiredTier, ladder || TIERS)) continue;
+      if (candidateRule && !allowedOn(candidateRule, member, ladder)) continue;
       return candidate;
     }
     return dest;
@@ -367,7 +396,7 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
     var dest = norm(AFTER_LOGIN_PATH || "/");
     if (dest === path) return false;
     var destRule = ruleFor(dest);
-    if (destRule && !checkEntitled(member, destRule.requiredTier, ladder)) return false;
+    if (destRule && !allowedOn(destRule, member, ladder)) return false;
     if (recentlyDenied(dest)) return false;
     // A page remembered for "back here after signing in", or a plan chosen
     // while signed out, belongs to a sign in that is not happening: this
@@ -397,7 +426,7 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
     var rule = ruleFor(path);
     if (rule) {
       var cached = readCache();
-      return !(cached && checkEntitled(cached.member, rule.requiredTier, cached.ladder));
+      return !(cached && allowedOn(rule, cached.member, cached.ladder));
     }
     return isGuestPath(path) && (hasHint() || readCache() !== null);
   }
@@ -682,24 +711,41 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
     if (rule) {
       var cached = readCache();
       if (cached) {
-        if (checkEntitled(cached.member, rule.requiredTier, cached.ladder)) show();
+        if (allowedOn(rule, cached.member, cached.ladder)) show();
         else deny(rule, path, cached.member, cached.ladder);
         return;
       }
 
+      // A page for those without access, and no sign of a session: almost
+      // certainly a guest, who may see it. Show it now; a member is still
+      // moved on when the check answers.
+      if (rule.audience === "others" && !hasHint()) {
+        show();
+        fetchSession().then(function(result) {
+          if (id === seq && !allowedOn(rule, result.member, result.ladder)) deny(rule, path, result.member, result.ladder);
+        }, function() {});
+        return;
+      }
+
+      // No answer: a members' page stays shut; a page for others opens, since
+      // the visitor is treated as signed out.
+      var noAnswer = function() {
+        if (id !== seq) return;
+        if (rule.audience === "others") show();
+        else deny(rule, path, null);
+      };
+
       hide();
-      var lockedTimer = setTimeout(function() {
-        if (id === seq) deny(rule, path, null);
-      }, LOCKED_TIMEOUT_MS);
+      var lockedTimer = setTimeout(noAnswer, LOCKED_TIMEOUT_MS);
 
       fetchSession().then(function(result) {
         clearTimeout(lockedTimer);
         if (id !== seq) return;
-        if (checkEntitled(result.member, rule.requiredTier, result.ladder)) show();
+        if (allowedOn(rule, result.member, result.ladder)) show();
         else deny(rule, path, result.member, result.ladder);
       }, function() {
         clearTimeout(lockedTimer);
-        if (id === seq) deny(rule, path, null);
+        noAnswer();
       });
       return;
     }
