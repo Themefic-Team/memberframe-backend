@@ -458,11 +458,25 @@ describe("in-site navigation", () => {
 });
 
 describe("the sign in page", () => {
-  it("shows at once to a visitor who has never signed in here, with no request", () => {
-    const shield = boot("/login");
+  it("shows at once to a visitor who has never signed in here, and stays for a guest", async () => {
+    const shield = boot("/login", { answers: [signedOut] });
 
     expect(shield.hidden()).toBe(false);
-    expect(shield.fetch).not.toHaveBeenCalled();
+    await flush();
+    expect(shield.location.replace).not.toHaveBeenCalled();
+  });
+
+  it("still moves a signed-in member whose hint was lost, and forgets any remembered page", async () => {
+    const returnKey = `memberframe:return-to:${SITE_KEY}`;
+    const shield = boot("/login", {
+      answers: [signedIn()],
+      session: { [returnKey]: JSON.stringify({ path: "/sign-in", ts: Date.now() }) },
+    });
+
+    expect(shield.hidden()).toBe(false);
+    await flush();
+    expect(shield.location.replace).toHaveBeenCalledWith("/dashboard");
+    expect(shield.window.sessionStorage.getItem(returnKey)).toBeNull();
   });
 
   it("sends a signed-in member to the After sign in page before the form paints", async () => {

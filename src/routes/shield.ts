@@ -369,8 +369,21 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
     var destRule = ruleFor(dest);
     if (destRule && !checkEntitled(member, destRule.requiredTier, ladder)) return false;
     if (recentlyDenied(dest)) return false;
+    // A page remembered for "back here after signing in", or a plan chosen
+    // while signed out, belongs to a sign in that is not happening: this
+    // member is signed in already. Left in place, a sign-in form on the page
+    // would send them there instead of After sign in.
+    forgetReturnPages();
     hardRedirect(dest);
     return true;
+  }
+
+  /** The keys the MemberFrame components share for "back here after signing in". */
+  function forgetReturnPages() {
+    try {
+      window.sessionStorage.removeItem("memberframe:return-to:" + SITE_KEY);
+      window.sessionStorage.removeItem("memberframe:checkout-intent:" + SITE_KEY);
+    } catch (e) {}
   }
 
   function handoffInProgress() {
@@ -698,7 +711,13 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
         return;
       }
       if (!hasHint()) {
+        // No sign of a session in this browser, so show the form at once, and
+        // still ask: a member whose hint was lost (another tab, cleared
+        // storage) is moved on as soon as the answer comes back.
         show();
+        fetchSession().then(function(result) {
+          if (id === seq && result.member) leaveGuestPage(result.member, result.ladder, path);
+        }, function() {});
         return;
       }
 
