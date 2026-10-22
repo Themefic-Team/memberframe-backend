@@ -49,8 +49,10 @@ export interface ShieldScriptConfig {
   pricingPath?: string;
   /** Where a signed-in member on a guest page is sent. */
   afterLoginPath?: string;
-  /** Sign in and sign up pages. A signed-in member is moved off them. */
+  /** Sign in, sign up, and reset pages. A signed-in member is moved off them. */
   guestPaths?: string[];
+  /** The reset page: a guest page, except when it carries a reset token. */
+  resetPath?: string;
   rules: GatedPageRule[];
   tiers: TierLadderEntry[];
   /** Section locks: layers named "Lock: <rule name>". */
@@ -103,6 +105,7 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
   var PRICING_PATH = ${JSON.stringify(config.pricingPath || "/pricing")};
   var AFTER_LOGIN_PATH = ${JSON.stringify(config.afterLoginPath || "")};
   var GUEST_PATHS = ${JSON.stringify(config.guestPaths || [])};
+  var RESET_PATH = ${JSON.stringify(config.resetPath || "")};
   var RULES = ${JSON.stringify(activeRules)};
   var TIERS = ${JSON.stringify(config.tiers || [])};
   var SECTION_RULES = ${JSON.stringify(sectionRules)};
@@ -154,6 +157,8 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
   }
 
   function isGuestPath(path) {
+    // A reset link (?token=) is for setting a password, signed in or not.
+    if (path === RESET_PATH && /[?&]token=/.test(window.location.search || "")) return false;
     for (var i = 0; i < GUEST_PATHS.length; i++) if (GUEST_PATHS[i] === path) return true;
     return false;
   }
@@ -893,7 +898,8 @@ export async function handleShieldScript(req: Request, res: Response): Promise<v
     loginPath,
     pricingPath,
     afterLoginPath: settings.auth?.afterLoginPath || "/",
-    guestPaths: shieldGuestPaths([settings.auth?.loginPath, settings.auth?.signupPath]),
+    guestPaths: shieldGuestPaths([settings.auth?.loginPath, settings.auth?.signupPath, settings.auth?.resetPath]),
+    resetPath: (settings.auth?.resetPath || "").trim().replace(/\/+$/, ""),
     rules,
     tiers,
     sectionRules: settings.sectionLocks || [],

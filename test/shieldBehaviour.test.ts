@@ -739,3 +739,24 @@ describe("section gates: the card over a blurred members' section", () => {
     expect(shield.card()!.children[2]!.href).toBe("/pricing");
   });
 });
+
+describe("the reset page is a sign-in page, except with a reset token (2026-10-22)", () => {
+  const js = generateShieldJs({
+    siteKey: SITE_KEY,
+    apiBase: "https://api.test",
+    loginPath: "/login",
+    guestPaths: shieldGuestPaths(["/login", "/signup", "/reset-password"]),
+    resetPath: "/reset-password",
+    rules: [],
+    tiers: TIERS,
+  });
+
+  it("lists the reset page among the pages a signed-in member is moved off", () => {
+    expect(js).toContain('var GUEST_PATHS = ["/login","/signup","/reset-password"];');
+    expect(js).toContain('var RESET_PATH = "/reset-password";');
+  });
+
+  it("leaves a reset link alone, signed in or not", () => {
+    expect(js).toContain('if (path === RESET_PATH && /[?&]token=/.test(window.location.search || "")) return false;');
+  });
+});
