@@ -467,6 +467,10 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
     var shown = [];
     var blurred = [];
     gateRules = [];
+    // Locked content leaves the live page only once the check has answered:
+    // until then every tagged layer is display:none, and an entitled member
+    // must not see it scrambled first.
+    redactActive = result !== null;
     for (var i = 0; i < SECTION_RULES.length; i++) {
       var r = SECTION_RULES[i];
       var visible;
@@ -485,6 +489,7 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
       }
     }
 
+    redactShown = shown.join(",");
     var exempt = shown.concat(blurred);
     var not = exempt.length ? ":not(" + exempt.join(",") + ")" : "";
     var hide = [];
@@ -505,6 +510,184 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
     sectionStyle.textContent = sectionCss(result);
     gateResult = result;
     resetGates();
+    scheduleRedaction();
+  }
+
+  /* ---- Locked content out of the live page (2026-10-22) ----
+   *
+   * CSS alone keeps a locked section's words and pictures in the page, where
+   * unticking display:none or blur in the browser's tools shows them. So once
+   * the check has answered, every locked layer's text is scrambled in place
+   * (letters and digits swapped, spaces and punctuation kept, so a blurred
+   * section still looks like text) and its images, videos, and frames lose
+   * their sources, alt text, and titles. The real values live only in this
+   * script's memory, and come back when the member gets access.
+   *
+   * In place, never removed: the nodes are React's, and React updates and
+   * removes them later (another breakpoint, the next CMS item); a node taken
+   * out of the page makes that throw. And only once React has taken a node
+   * over, which it marks on the node itself: text changed before hydration is
+   * a mismatch React answers by rebuilding the whole page.
+   *
+   * What the page's HTML source carries, Framer wrote there before any
+   * script runs: content that must stay secret belongs on the server.
+   */
+  var REDACT_SKIP = { STYLE: 1, SCRIPT: 1, NOSCRIPT: 1, TEMPLATE: 1 };
+  var REDACT_ATTRS = ["src", "srcset", "poster", "alt", "title", "aria-label"];
+  var BLANK_IMAGE = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+  var redactions = typeof WeakMap === "function" ? new WeakMap() : null;
+  var redactActive = false;
+  var redactShown = "";
+  var redactedRoots = [];
+  var redactFrame = 0;
+  var redactObserver = null;
+
+  /** Letters and digits swapped for random ones; spaces and punctuation kept. */
+  function scramble(text) {
+    var out = "";
+    for (var i = 0; i < text.length; i++) {
+      var c = text.charCodeAt(i);
+      if (c >= 65 && c <= 90) out += String.fromCharCode(65 + Math.floor(Math.random() * 26));
+      else if (c >= 97 && c <= 122) out += String.fromCharCode(97 + Math.floor(Math.random() * 26));
+      else if (c >= 48 && c <= 57) out += String.fromCharCode(48 + Math.floor(Math.random() * 10));
+      else if (c > 127 && text.charAt(i).trim() !== "") out += "x";
+      else out += text.charAt(i);
+    }
+    return out;
+  }
+
+  /** React has taken this element over: it marks its nodes with its own keys. */
+  function hydrated(el) {
+    var keys = Object.keys(el);
+    for (var i = 0; i < keys.length; i++) {
+      if (keys[i].indexOf("__reactFiber$") === 0 || keys[i].indexOf("__reactInternalInstance$") === 0) return true;
+    }
+    return false;
+  }
+
+  /** What an attribute holds while redacted. */
+  function blankFor(el, name) {
+    if (name === "src" && el.nodeName === "IMG") return BLANK_IMAGE;
+    if (name === "src" && el.nodeName === "IFRAME") return "about:blank";
+    return "";
+  }
+
+  function redactNode(node) {
+    if (node.nodeType === 3) {
+      var parent = node.parentNode;
+      var text = node.nodeValue;
+      if (!parent || REDACT_SKIP[parent.nodeName] || !text || !text.trim() || !hydrated(parent)) return;
+      var entry = redactions.get(node);
+      if (entry && entry.fake === text) return;
+      // New text from React, or never seen: keep it, show a scramble.
+      var fake = scramble(text);
+      redactions.set(node, { real: text, fake: fake });
+      node.nodeValue = fake;
+      return;
+    }
+    if (node.nodeType !== 1 || REDACT_SKIP[node.nodeName] || !hydrated(node)) return;
+    var saved = redactions.get(node) || {};
+    var touched = false;
+    for (var a = 0; a < REDACT_ATTRS.length; a++) {
+      var name = REDACT_ATTRS[a];
+      if (!node.hasAttribute(name)) continue;
+      var value = node.getAttribute(name);
+      var blank = blankFor(node, name);
+      if (value === blank) continue;
+      saved[name] = { real: value, fake: blank };
+      node.setAttribute(name, blank);
+      touched = true;
+    }
+    if (touched) redactions.set(node, saved);
+    for (var child = node.firstChild; child; child = child.nextSibling) redactNode(child);
+  }
+
+  function restoreNode(node) {
+    var entry = redactions.get(node);
+    if (node.nodeType === 3) {
+      if (entry && node.nodeValue === entry.fake) node.nodeValue = entry.real;
+      if (entry) redactions["delete"](node);
+      return;
+    }
+    if (node.nodeType !== 1) return;
+    if (entry) {
+      for (var name in entry) {
+        if (Object.prototype.hasOwnProperty.call(entry, name) && node.getAttribute(name) === entry[name].fake) {
+          node.setAttribute(name, entry[name].real);
+        }
+      }
+      redactions["delete"](node);
+    }
+    for (var child = node.firstChild; child; child = child.nextSibling) restoreNode(child);
+  }
+
+  /** Every tagged layer this visitor may not see: locked by a rule, or tagged for none. */
+  function lockedRoots() {
+    var roots = [];
+    if (!redactActive) return roots;
+    var all = document.querySelectorAll(SECTION_TAGS.join(","));
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (redactShown && el.matches && el.matches(redactShown)) continue;
+      roots.push(el);
+    }
+    return roots;
+  }
+
+  function syncRedaction() {
+    redactFrame = 0;
+    if (!redactions) return;
+    if (!document.body) {
+      document.addEventListener("DOMContentLoaded", scheduleRedaction);
+      return;
+    }
+    var roots = lockedRoots();
+    for (var i = 0; i < redactedRoots.length; i++) {
+      if (roots.indexOf(redactedRoots[i]) === -1) restoreNode(redactedRoots[i]);
+    }
+    for (var j = 0; j < roots.length; j++) redactNode(roots[j]);
+    redactedRoots = roots;
+    watchRedaction();
+  }
+
+  function scheduleRedaction() {
+    if (redactFrame || !redactions) return;
+    redactFrame = 1;
+    var frame = window.requestAnimationFrame || function(fn) { return setTimeout(fn, 16); };
+    frame(syncRedaction);
+  }
+
+  /*
+    Again when React writes into a locked layer (new text, a new image), and
+    when it hydrates more of the page. Its own writes are seen too, and find
+    nothing left to do. Style and class changes, which Framer's animations
+    make all the time, are not watched.
+  */
+  function watchRedaction() {
+    if (redactObserver || typeof MutationObserver === "undefined" || !document.body) return;
+    redactObserver = new MutationObserver(function(records) {
+      if (!redactActive) return;
+      for (var i = 0; i < records.length; i++) {
+        var target = records[i].target;
+        var el = target && target.nodeType === 3 ? target.parentNode : target;
+        if (el && el.closest && (el.closest(SECTION_TAGS.join(",")) || records[i].type === "childList")) {
+          scheduleRedaction();
+          return;
+        }
+      }
+    });
+    redactObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: REDACT_ATTRS
+    });
+    window.addEventListener("load", scheduleRedaction);
+    // Hydration runs after the page loads, in parts: look again as it goes.
+    setTimeout(scheduleRedaction, 800);
+    setTimeout(scheduleRedaction, 2000);
+    setTimeout(scheduleRedaction, 5000);
   }
 
   /* ---- Section gates ----
