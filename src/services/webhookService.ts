@@ -181,7 +181,11 @@ export async function sendWebhook(
       },
       body,
     });
-    const ok = response.status >= 200 && response.status < 300;
+    // 2xx, and 3xx too (2026-10-25): a redirect after a POST means the service
+    // took the request (beta.crmfic.com stored the member and answered 302).
+    // Counting it failed retried for hours and could store the member again.
+    // The redirect itself is not followed: that would send the data twice.
+    const ok = response.status >= 200 && response.status < 400;
     return { ok, status: response.status, error: ok ? null : `The service answered ${response.status}.` };
   } catch (error) {
     const aborted = error instanceof Error && error.name === "AbortError";

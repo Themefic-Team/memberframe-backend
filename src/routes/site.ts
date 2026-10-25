@@ -50,6 +50,7 @@ siteRouter.use("/webhooks", webhookRouter);
 
 /** PRD section 10.3 paginates members at 25. The plugin's `MEMBER_PAGE_SIZE`. */
 const PAGE_SIZE = 25;
+const MEMBER_EXPORT_PAGE_MAX = 500;
 
 const siteIdSchema = z
   .string({ required_error: "A site id is required." })
@@ -81,6 +82,8 @@ function siteIdFrom(value: unknown): string {
 const memberQuerySchema = z.object({
   siteId: siteIdSchema,
   page: z.coerce.number().int().min(1).max(10_000).optional().default(1),
+  // Larger pages are for the Reports tab's export; the Manage list uses 25.
+  pageSize: z.coerce.number().int().min(1).max(MEMBER_EXPORT_PAGE_MAX).optional().default(PAGE_SIZE),
   search: z.string().trim().max(255).optional(),
   tier: z.string().trim().max(50).optional(),
   status: z.enum(["active", "trialing", "past_due", "canceled"]).optional(),
@@ -147,8 +150,8 @@ siteRouter.get(
       prisma.member.findMany({
         where,
         orderBy: { createdAt: "desc" },
-        skip: (query.page - 1) * PAGE_SIZE,
-        take: PAGE_SIZE,
+        skip: (query.page - 1) * query.pageSize,
+        take: query.pageSize,
         select: {
           id: true,
           email: true,
@@ -213,7 +216,7 @@ siteRouter.get(
         ...signInMethods(row),
       })),
       page: query.page,
-      pageSize: PAGE_SIZE,
+      pageSize: query.pageSize,
       totalCount,
     });
   })

@@ -437,7 +437,7 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
   /* ---- Section locks ----
    *
    * A layer opts in through the code override the plugin writes into the
-   * creator's project, MemberLocks, one per rule: it adds data-mf-lock and a
+   * creator's project, MemberFrameLocks (MemberLocks before 2026-10-25), one per rule: it adds data-mf-lock and a
    * mf-lock-<slug> class to the layer. A layer named "Lock: <rule name>" opts
    * in the same way, through the data-framer-name Framer publishes. Every
    * tagged layer is hidden from the first paint by a stylesheet this script

@@ -192,7 +192,21 @@ describe("sendWebhook", () => {
     expect(v1).toBe(createHmac("sha256", "whsec_s").update(`${t}.${body}`).digest("hex"));
   });
 
-  it("reports a non-2xx answer and a network failure", async () => {
+  it("counts a redirect as received, without following it (2026-10-25)", async () => {
+    // beta.crmfic.com stores the member, then answers 302.
+    const redirect = vi.fn(async () => new Response(null, { status: 302, headers: { Location: "https://example.com/thanks" } }));
+    expect(await sendWebhook("https://example.com", "s", "member.created", "d1", standardBody(), redirect as typeof fetch)).toMatchObject({
+      ok: true,
+      status: 302,
+      error: null,
+    });
+    expect(redirect).toHaveBeenCalledTimes(1);
+    expect((redirect.mock.calls[0] as unknown as [string, RequestInit])[1].redirect).toBe("manual");
+  });
+
+  it("reports a 4xx or 5xx answer and a network failure", async () => {
+    const refused = vi.fn(async () => new Response("bad", { status: 400 }));
+    expect(await sendWebhook("https://example.com", "s", "member.created", "d1", standardBody(), refused as typeof fetch)).toMatchObject({ ok: false, status: 400 });
     const down = vi.fn(async () => new Response("nope", { status: 503 }));
     expect(await sendWebhook("https://example.com", "s", "member.created", "d1", standardBody(), down as typeof fetch)).toMatchObject({ ok: false, status: 503 });
 
