@@ -8,6 +8,9 @@
  * lock out of the code file gains nothing: the member API refuses an
  * unlicensed site on its own (`middleware/license.ts`).
  *
+ * A trial answer also carries `trialEndsAt`, so the component locks itself at
+ * the second the trial ends, like BEAF's countdown, instead of at its next check.
+ *
  * Since 27-instance-seal.md it also says whether this copy of the component
  * may run at all: `copied` when its seal is missing or was not signed for this
  * site (pasted, not inserted from the Builder), `foreign` when the page is on
@@ -71,6 +74,15 @@ export function componentState(input: {
   return publicLicenseState(input.license);
 }
 
+/**
+ * The body a component reads. A trial's end goes with a trial answer only: the
+ * component counts down to it and locks at that second without a reload, as
+ * BEAF's slider does. Every other answer is the state alone.
+ */
+export function licenseAnswer(state: ComponentState, trialEndsAt: string | null): { state: ComponentState; trialEndsAt?: string } {
+  return state === "trial" && trialEndsAt ? { state, trialEndsAt } : { state };
+}
+
 licenseRouter.get(
   "/",
   route(async (req, res) => {
@@ -86,13 +98,12 @@ licenseRouter.get(
     // The answer depends on the page's origin, so a shared cache must key on it.
     res.setHeader("Cache-Control", "public, max-age=60");
     res.setHeader("Vary", "Origin");
-    ok(res, {
-      state: componentState({
-        license: license.state,
-        seal,
-        sealValid: seal !== undefined && verifySeal(site.id, seal),
-        originOk: originBelongs(req.header("origin"), site.allowedOrigins),
-      }),
+    const state = componentState({
+      license: license.state,
+      seal,
+      sealValid: seal !== undefined && verifySeal(site.id, seal),
+      originOk: originBelongs(req.header("origin"), site.allowedOrigins),
     });
+    ok(res, licenseAnswer(state, license.trialEndsAt));
   })
 );

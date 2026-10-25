@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("../src/config/db.js", () => ({ prisma: {} }));
 
 import { issueSeal, verifySeal } from "../src/lib/instanceSeal.js";
-import { componentState, originBelongs } from "../src/routes/license.js";
+import { componentState, licenseAnswer, originBelongs } from "../src/routes/license.js";
 
 describe("the instance seal", () => {
   it("verifies for the site it was issued to, and no other", () => {
@@ -54,5 +54,14 @@ describe("what a component draws", () => {
     expect(componentState({ license: "expired", seal: "s1.x.y", sealValid: true, originOk: true })).toBe("expired");
     expect(componentState({ license: "trial_claimed_other_site", seal: undefined, sealValid: false, originOk: true })).toBe("expired");
     expect(componentState({ license: "active", seal: undefined, sealValid: false, originOk: true })).toBe("active");
+  });
+
+  it("sends a trial's end with a trial answer only, so the component can count down to it", () => {
+    const end = "2026-11-01T10:00:00.000Z";
+    expect(licenseAnswer("trial", end)).toEqual({ state: "trial", trialEndsAt: end });
+    expect(licenseAnswer("active", end)).toEqual({ state: "active" });
+    expect(licenseAnswer("expired", null)).toEqual({ state: "expired" });
+    expect(licenseAnswer("copied", end)).toEqual({ state: "copied" });
+    expect(licenseAnswer("trial", null)).toEqual({ state: "trial" });
   });
 });

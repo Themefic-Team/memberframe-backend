@@ -204,15 +204,21 @@ export async function resolveLicense(siteId: string, now: Date = new Date()): Pr
 // license calls `invalidateLicense`.
 
 const CACHE_MS = 30_000;
-const cache = new Map<string, { licensed: boolean; state: LicenseState; at: number }>();
+const cache = new Map<string, { licensed: boolean; state: LicenseState; trialEndsAt: string | null; at: number }>();
 
-export async function siteLicense(siteId: string): Promise<{ licensed: boolean; state: LicenseState }> {
+export async function siteLicense(siteId: string): Promise<{ licensed: boolean; state: LicenseState; trialEndsAt: string | null }> {
   const now = Date.now();
   const hit = cache.get(siteId);
   if (hit && now - hit.at < CACHE_MS) return hit;
 
   const view = await resolveLicense(siteId, new Date(now));
-  const entry = { licensed: view.state === "active" || view.state === "trial", state: view.state, at: now };
+  const entry = {
+    licensed: view.state === "active" || view.state === "trial",
+    state: view.state,
+    // While a trial runs: when it ends, so a component can lock at that second (BEAF's countdown).
+    trialEndsAt: view.state === "trial" ? view.trialEndsAt : null,
+    at: now,
+  };
   cache.set(siteId, entry);
   if (cache.size > 5_000) cache.delete(cache.keys().next().value as string);
   return entry;
