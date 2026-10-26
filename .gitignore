@@ -4,6 +4,6 @@ dist/
 .env.local
 storage/
 *.log
-
+framefic-ui-kit/
 # Prisma writes the generated client here
 src/generated/
