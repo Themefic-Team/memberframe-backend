@@ -26,6 +26,7 @@
 import type { NextFunction, Request, RequestHandler, Response } from "express";
 import { prisma } from "../config/db.js";
 import { badRequest, unauthorized } from "./errors.js";
+import { verifyOAuthState } from "../lib/oauthState.js";
 
 export const SITE_KEY_HEADER = "x-memberframe-site";
 
@@ -155,22 +156,24 @@ async function resolve(req: Request, res: Response): Promise<void> {
       },
     });
   } else if (queryState) {
-    try {
-      const decoded = JSON.parse(Buffer.from(queryState, "base64url").toString("utf8")) as { siteId?: string };
-      if (decoded.siteId) {
-        site = await prisma.site.findUnique({
-          where: { id: decoded.siteId },
-          select: {
-            id: true,
-            siteName: true,
-            siteKey: true,
-            allowedOrigins: true,
-            defaultLocale: true,
-          },
-        });
-      }
-    } catch {
-      // not base64url JSON
+    // A provider's redirect back (Google, GitHub, Discord, Apple's form post)
+    // carries no key and no site origin: only the state this server signed
+    // names the site. Signed since 2026-10-20 (`<payload>.<signature>`), so it
+    // is read with the callback's own verifier; a plain JSON decode of the
+    // whole string fails on the signature and left every callback
+    // `missing_site_key`.
+    const decoded = verifyOAuthState(queryState);
+    if (decoded) {
+      site = await prisma.site.findUnique({
+        where: { id: decoded.siteId },
+        select: {
+          id: true,
+          siteName: true,
+          siteKey: true,
+          allowedOrigins: true,
+          defaultLocale: true,
+        },
+      });
     }
   } else if (origin !== undefined && origin !== "") {
     // Canvas components on published Framer sites identify by their Origin
