@@ -323,7 +323,9 @@ async function handlePreflight(req: Request, res: Response): Promise<void> {
 
   res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Access-Control-Allow-Credentials", "true");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS");
+  // DELETE for the member's own account area: unlink, sign out a device,
+  // remove the photo, delete the account (routes/memberAccount.ts).
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
     // The test country header is honoured only in test mode; see gatewayRouter.

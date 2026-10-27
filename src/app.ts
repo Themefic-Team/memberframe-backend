@@ -14,6 +14,7 @@ import { errorHandler, notFoundHandler, ok, route } from "./middleware/errors.js
 import { preflight, resolveSite } from "./middleware/site.js";
 import { pluginCors } from "./middleware/creator.js";
 import { memberRouter } from "./routes/member.js";
+import { handleAvatar, memberAccountRouter } from "./routes/memberAccount.js";
 import { connectRouter } from "./routes/connect.js";
 import { siteRouter } from "./routes/site.js";
 import { previewRouter } from "./routes/preview.js";
@@ -149,6 +150,10 @@ export function createApp(): Express {
   app.get("/api/member/shield.js", handleShieldScript);
   app.get("/api/shield.js", handleShieldScript);
 
+  // A member's uploaded photo. Before resolveSite for the same reason: an
+  // <img> request carries no Origin. The signed token is what scopes it.
+  app.get("/api/avatars/:token", (req, res) => void handleAvatar(req, res));
+
   // ------------------------------------------------------------------------
   // Member runtime
   // ------------------------------------------------------------------------
@@ -164,6 +169,8 @@ export function createApp(): Express {
   // Bookmarks and the reading meter, FP-10 and FP-07.
   app.use("/api/member/bookmarks", resolveSite, requireActiveLicense, bookmarksRouter);
   app.use("/api/member/meter", resolveSite, requireActiveLicense, meterRouter);
+  // The member's own account area: security, photo, deleting the account.
+  app.use("/api/member", resolveSite, requireActiveLicense, memberAccountRouter);
   app.use("/api/member", resolveSite, requireActiveLicense, memberRouter);
 
   // Pricing and checkout for the published site, FP-16. Same tenant check.
