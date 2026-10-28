@@ -141,7 +141,6 @@ export interface VerifyConnectInput {
   /** Origins this site will be served from. Added to the allowlist on claim. */
   origins: string[];
   userAgent?: string | undefined;
-  ipAddress?: string | undefined;
 }
 
 export interface ConnectedSite {
@@ -295,7 +294,7 @@ export async function attachProject(
 /** A new bearer token for the panel. Only its hash is stored. */
 export async function issueCreatorSession(
   userId: string,
-  meta: { userAgent?: string | undefined; ipAddress?: string | undefined },
+  meta: { userAgent?: string | undefined },
   now: Date = new Date()
 ): Promise<{ token: string; expiresAt: Date }> {
   const token = generateToken();
@@ -307,7 +306,6 @@ export async function issueCreatorSession(
       tokenHash: hashToken(token),
       expiresAt,
       userAgent: meta.userAgent?.slice(0, 512) ?? null,
-      ipAddress: meta.ipAddress?.slice(0, 45) ?? null,
     },
   });
 

@@ -215,7 +215,6 @@ memberRouter.post(
     const ttl = sessionLifetimeSeconds(input.rememberMe);
     const session = await issueSession(member.id, site.id, ttl, {
       userAgent: req.header("user-agent"),
-      ipAddress: req.ip,
     });
 
     setSessionCookie(res, session.token, { maxAgeSeconds: ttl });
@@ -282,7 +281,6 @@ memberRouter.post(
     const ttl = sessionLifetimeSeconds(false);
     const session = await issueSession(result.memberId, site.id, ttl, {
       userAgent: req.header("user-agent"),
-      ipAddress: req.ip,
     });
 
     setSessionCookie(res, session.token, { maxAgeSeconds: ttl });
@@ -348,7 +346,6 @@ memberRouter.post(
     const ttl = sessionLifetimeSeconds(false);
     const session = await issueSession(member.id, site.id, ttl, {
       userAgent: req.header("user-agent"),
-      ipAddress: req.ip,
     });
 
     setSessionCookie(res, session.token, { maxAgeSeconds: ttl });
@@ -751,7 +748,6 @@ async function completeOAuthMemberLogin(
   const ttl = sessionLifetimeSeconds(true);
   const session = await issueSession(member.id, siteId, ttl, {
     userAgent: req.header("user-agent"),
-    ipAddress: req.ip,
   });
   setSessionCookie(res, session.token, { maxAgeSeconds: ttl });
 
@@ -759,7 +755,6 @@ async function completeOAuthMemberLogin(
   // safeReturnTo), so it also gets a code to exchange from the site's page.
   const handoff = await issueSession(member.id, siteId, OAUTH_HANDOFF_TTL_SECONDS, {
     userAgent: req.header("user-agent"),
-    ipAddress: req.ip,
   });
 
   return { handoff: handoff.token };
@@ -791,7 +786,6 @@ memberRouter.post(
     const ttl = sessionLifetimeSeconds(true);
     const session = await issueSession(handoff.member.memberId, site.id, ttl, {
       userAgent: req.header("user-agent"),
-      ipAddress: req.ip,
     });
     setSessionCookie(res, session.token, { maxAgeSeconds: ttl });
 

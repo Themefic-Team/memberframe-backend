@@ -385,7 +385,7 @@ siteRouter.post(
     const target = await prisma.member.findFirst({ where: { id: memberId, siteId: site.id }, select: { email: true } });
     if (target) guardEmailSend(req, "magic_link", target.email);
 
-    const link = await issueMagicLink(site, memberId, { userAgent: "magic-link", ipAddress: req.ip });
+    const link = await issueMagicLink(site, memberId, { userAgent: "magic-link" });
     ok(res, { sent: true, expiresInMinutes: link.minutes });
   })
 );

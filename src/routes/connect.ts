@@ -113,7 +113,6 @@ connectRouter.post(
     const result = await verifyConnect({
       ...input,
       userAgent: req.header("user-agent"),
-      ipAddress: req.ip,
     });
 
     const settings = await prisma.siteSettings.findUnique({
@@ -150,7 +149,7 @@ connectRouter.get(
       ok(res, { status: "pending" });
       return;
     }
-    const claimed = await claimHandoff(id, { userAgent: req.header("user-agent"), ipAddress: req.ip });
+    const claimed = await claimHandoff(id, { userAgent: req.header("user-agent") });
     if (!claimed) {
       ok(res, { status: "pending" });
       return;

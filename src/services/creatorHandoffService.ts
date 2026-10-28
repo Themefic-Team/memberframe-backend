@@ -48,7 +48,7 @@ export interface ClaimedHandoff {
 /** The panel's poll. A session token the first time; null before sign-in, after expiry, and ever after. */
 export async function claimHandoff(
   sessionId: string,
-  meta: { userAgent?: string | undefined; ipAddress?: string | undefined },
+  meta: { userAgent?: string | undefined },
   now: Date = new Date()
 ): Promise<ClaimedHandoff | null> {
   const row = await prisma.creatorAuthHandoff.findUnique({

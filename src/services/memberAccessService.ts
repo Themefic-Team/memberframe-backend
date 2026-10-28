@@ -120,7 +120,7 @@ export async function restoreMemberAccess(siteId: string, memberId: string): Pro
 export async function issueMagicLink(
   site: { id: string; siteName: string; allowedOrigins: unknown },
   memberId: string,
-  context: { userAgent?: string | undefined; ipAddress?: string | undefined } = {}
+  context: { userAgent?: string | undefined } = {}
 ): Promise<{ url: string; email: string; minutes: number }> {
   const member = await findMember(site.id, memberId);
   if (member.status === "canceled") {

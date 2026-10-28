@@ -307,6 +307,8 @@ model MemberSession {
   /// Diagnostics only. Never used to authorize: an IP changes mid-session on
   /// mobile, and pinning a session to one would log members out on the train.
   userAgent String? @map("user_agent") @db.VarChar(512)
+  /// No longer written: visitor IP addresses are not collected (Marketplace
+  /// audit I5, 2026-10-28). Always null; dropped in a later release.
   ipAddress String? @map("ip_address") @db.VarChar(45)
 
   expiresAt  DateTime  @map("expires_at") @db.DateTime(3)
@@ -511,6 +513,7 @@ model CreatorSession {
 
   /// Diagnostics only, never used to authorize. See MemberSession.
   userAgent String? @map("user_agent") @db.VarChar(512)
+  /// No longer written (Marketplace audit I5). Always null; dropped later.
   ipAddress String? @map("ip_address") @db.VarChar(45)
 
   expiresAt  DateTime  @map("expires_at") @db.DateTime(3)

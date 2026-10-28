@@ -44,7 +44,7 @@ export async function issueSession(
   memberId: string,
   siteId: string,
   ttlSeconds: number,
-  context: { userAgent?: string | undefined; ipAddress?: string | undefined } = {}
+  context: { userAgent?: string | undefined } = {}
 ): Promise<IssuedSession> {
   const token = generateToken();
   const expiresAt = expiryFrom(ttlSeconds);
@@ -58,7 +58,6 @@ export async function issueSession(
       // Truncated rather than rejected: a browser can send a very long UA and
       // that is not a reason to fail a sign-in.
       userAgent: context.userAgent?.slice(0, 512) ?? null,
-      ipAddress: context.ipAddress?.slice(0, 45) ?? null,
       lastSeenAt: new Date(),
     },
   });
