@@ -452,13 +452,20 @@ export function generateShieldJs(config: ShieldScriptConfig): string {
    * rule that is switched off is a lock that is off: its layers show.
    */
 
-  var SECTION_TAGS = ['[data-framer-name^="Lock:" i]', "[data-mf-lock]", '[class*="mf-lock-"]'];
+  // MemberFrame's own lock card, drawn by a canvas component over itself when
+  // its trial ended, its site key is unknown, or this domain is not listed,
+  // used the classes mf-lock-card, -icon, -title, and -text: the class match
+  // below took it for a locked layer, blurred it, and scrambled its words
+  // (2026-10-28). Never ours to lock. Components since then use mf-lic-*;
+  // this keeps sites published before that readable without a republish.
+  var OWN_UI = ":not(.mf-lock-card):not(.mf-lock-icon):not(.mf-lock-title):not(.mf-lock-text)";
+  var SECTION_TAGS = ['[data-framer-name^="Lock:" i]', "[data-mf-lock]", '[class*="mf-lock-"]' + OWN_UI];
   var sectionStyle = null;
 
   function sectionSelector(rule) {
     return (
       '[data-framer-name="Lock: ' + rule.name + '" i],[data-framer-name="Lock:' + rule.name + '" i],' +
-      '[data-mf-lock="' + rule.name + '" i],.mf-lock-' + rule.slug
+      '[data-mf-lock="' + rule.name + '" i],.mf-lock-' + rule.slug + OWN_UI
     );
   }
 

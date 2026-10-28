@@ -42,7 +42,19 @@ export interface SightingView {
 
 const lastWrite = new Map<string, number>();
 
-/** An origin worth recording: a published site, never the Framer editor. */
+/**
+ * Top level domains that can never be a published site (RFC 2606 and 6761).
+ * Framer renders previews and social images on `screenshot.framer.invalid`:
+ * that page loads our components too, and is no domain a creator could add.
+ */
+const RESERVED_TLDS = ["invalid", "test", "example", "local"];
+
+function reservedHost(hostname: string): boolean {
+  const tld = hostname.toLowerCase().split(".").pop() ?? "";
+  return RESERVED_TLDS.includes(tld);
+}
+
+/** An origin worth recording: a published site, never the Framer editor or a Framer renderer. */
 export function recordableOrigin(origin: string | undefined): string | null {
   if (!origin) return null;
   let url: URL;
@@ -52,7 +64,7 @@ export function recordableOrigin(origin: string | undefined): string | null {
     return null;
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") return null;
-  if (isEditorHost(url.hostname)) return null;
+  if (isEditorHost(url.hostname) || reservedHost(url.hostname)) return null;
   return url.origin;
 }
 
@@ -90,6 +102,8 @@ export function withSighting(stored: unknown, origin: string, now: Date): Sighti
 /** Every sighting, newest first, marked with whether it is on the allowlist. */
 export function sightingViews(stored: unknown, allowed: ReadonlyArray<string>): SightingView[] {
   return Object.entries(readSightings(stored))
+    // Drops what an earlier version recorded but would not now (a Framer renderer).
+    .filter(([origin]) => recordableOrigin(origin) !== null)
     .map(([origin, value]) => ({ origin, lastSeenAt: value.lastSeenAt, allowed: allowed.includes(origin) }))
     .sort((a, b) => Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt));
 }

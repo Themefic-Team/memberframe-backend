@@ -48,6 +48,17 @@ describe("sightings", () => {
     expect(recordableOrigin("not a url")).toBeNull();
   });
 
+  it("ignores Framer's screenshot renderer and every reserved domain (2026-10-28)", () => {
+    expect(recordableOrigin("https://screenshot.framer.invalid")).toBeNull();
+    for (const host of ["site.test", "acme.example", "printer.local"]) expect(recordableOrigin(`https://${host}`), host).toBeNull();
+    expect(recordableOrigin("http://localhost:3000")).toBe("http://localhost:3000");
+  });
+
+  it("hides a renderer sighting stored before it was ignored", () => {
+    const stored = { "https://screenshot.framer.invalid": { lastSeenAt: now.toISOString() }, "https://acme.com": { lastSeenAt: now.toISOString() } };
+    expect(sightingViews(stored, []).map((entry) => entry.origin)).toEqual(["https://acme.com"]);
+  });
+
   it("keeps the newest, at most the cap", () => {
     let stored: unknown = null;
     for (let i = 0; i < MAX_SIGHTINGS + 5; i += 1) {

@@ -565,16 +565,26 @@ describe("section locks", () => {
     { name: "Member preview", enabled: true, audience: "members", requiredTier: "signed_in", lockedAction: "blur" },
   ];
 
+  /** MemberFrame's own lock card, which the class match must never take for a locked layer. */
+  const OWN_UI = ":not(.mf-lock-card):not(.mf-lock-icon):not(.mf-lock-title):not(.mf-lock-text)";
   /** Every way a layer can be tagged with a rule: name, override attribute, override class. */
   const sel = (name: string, slug: string) =>
-    `[data-framer-name="Lock: ${name}" i],[data-framer-name="Lock:${name}" i],[data-mf-lock="${name}" i],.mf-lock-${slug}`;
+    `[data-framer-name="Lock: ${name}" i],[data-framer-name="Lock:${name}" i],[data-mf-lock="${name}" i],.mf-lock-${slug}${OWN_UI}`;
   const VIP = sel("VIP article", "vip-article");
   const TEASER = sel("Upgrade teaser", "upgrade-teaser");
   const PREVIEW = sel("Member preview", "member-preview");
 
-  const BASE = ['[data-framer-name^="Lock:" i]', "[data-mf-lock]", '[class*="mf-lock-"]'];
+  const BASE = ['[data-framer-name^="Lock:" i]', "[data-mf-lock]", '[class*="mf-lock-"]' + OWN_UI];
   /** The exempt list inside the hide rule: the layers that are shown or blurred. */
   const exempt = (css: string) => css.slice(css.indexOf(":not(") + 5, css.indexOf(")" + "," + BASE[1]));
+
+  it("never takes MemberFrame's own lock card for a locked layer (2026-10-28)", () => {
+    // The card's classes contain "mf-lock-": matched, it was blurred and its
+    // words scrambled, so a creator could not read why the component locked.
+    const shield = boot("/about", { answers: ["pending"], sectionRules: SECTIONS });
+    const css = shield.sectionCss();
+    for (const part of [".mf-lock-card", ".mf-lock-icon", ".mf-lock-title", ".mf-lock-text"]) expect(css).toContain(`:not(${part})`);
+  });
 
   it("hides every tagged layer, however it was tagged, before the session is known", () => {
     const shield = boot("/about", { answers: ["pending"], sectionRules: SECTIONS });
