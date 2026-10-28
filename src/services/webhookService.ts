@@ -101,7 +101,7 @@ export async function emitMemberEvent(
           deliveryId: id,
           type: event,
           now,
-          site: { id: site.id, name: site.siteName },
+          site: { id: site.id, name: site.siteName ?? "" },
           member: snapshot,
           ladder,
           ...(options.previousTier !== undefined ? { previousTier: options.previousTier } : {}),
@@ -292,7 +292,7 @@ export async function sendTestEvent(webhookId: string, siteId: string): Promise<
     deliveryId: id,
     type: "webhook.test",
     now,
-    site: { id: hook.site.id, name: hook.site.siteName },
+    site: { id: hook.site.id, name: hook.site.siteName ?? "" },
     member: {
       id: "00000000-0000-7000-8000-000000000000",
       email: "jordan@example.com",

@@ -30,7 +30,7 @@ import {
 
 const APP = "memberframe";
 
-async function ownerOf(siteId: string): Promise<{ email: string; name: string; projectName: string; siteId: string } | null> {
+async function ownerOf(siteId: string): Promise<{ email: string; name: string; projectName: string | null; siteId: string } | null> {
   const site = await prisma.site.findUnique({
     where: { id: siteId },
     select: { siteName: true, user: { select: { email: true, name: true } } },

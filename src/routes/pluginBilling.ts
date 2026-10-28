@@ -175,8 +175,8 @@ pluginBillingRouter.get(
 /**
  * Profile's "Start Free Trial" (BEAF's button). Attaching a project already
  * starts the trial when it can; this is the same check, for a project that
- * was attached without one. One trial per account, email, Framer user, and
- * project, as always: a refusal answers the license as it stands.
+ * was attached without one. One trial per account, email, and site, as
+ * always: a refusal answers the license as it stands.
  */
 pluginBillingRouter.post(
   "/start-trial",
@@ -188,17 +188,10 @@ pluginBillingRouter.post(
       ok(res, { started: false, license: before });
       return;
     }
-    const [user, site] = await Promise.all([
-      prisma.user.findUnique({ where: { id: owner.id }, select: { framerUserId: true } }),
-      prisma.site.findUnique({ where: { id: project.siteId }, select: { framerSiteId: true } }),
-    ]);
     const trial = await startTrialIfEligible({
       userId: owner.id,
       email: owner.email,
-      framerUserId: user?.framerUserId ?? null,
-      framerProjectId: site?.framerSiteId ?? project.siteId,
       siteId: project.siteId,
-      projectName: project.siteName,
     });
     if (trial.started) {
       invalidateLicense(project.siteId);

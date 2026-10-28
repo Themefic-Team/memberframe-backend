@@ -30,45 +30,53 @@ export function formatDate(date: Date): string {
   return date.toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric", timeZone: "UTC" });
 }
 
+/**
+ * The project as an email names it. A site created since 2026-10-28 has no
+ * name (the plugin no longer reads it from Framer), so it is "your project".
+ */
+function projectLabel(name: string | null | undefined): string {
+  return name?.trim() || "your project";
+}
+
 const SUPPORT = "Questions? Reply to this email or visit framefic.com/support.";
 
 // ============================================================================
 // TO THE CREATOR
 // ============================================================================
 
-export function trialStartedMail(to: string, projectName: string, endsAt: Date, name = "there"): Mail {
+export function trialStartedMail(to: string, projectName: string | null, endsAt: Date, name = "there"): Mail {
   return customerMail(to, "plugin_trial_started", "Your 7-day MemberFrame trial has started", {
     heading: "You're all set!",
     subheading: "Your 7-day free trial has started",
     greetingName: name,
     paragraphs: [
-      `Every MemberFrame feature is unlocked for **${projectName}** until **${formatDate(endsAt)}**.`,
+      `Every MemberFrame feature is unlocked for **${projectLabel(projectName)}** until **${formatDate(endsAt)}**.`,
       "During the trial your published components show a small Made with Framefic mark. Upgrade to PRO anytime to remove it.",
     ],
     footnote: SUPPORT,
   });
 }
 
-export function trialEndingMail(to: string, projectName: string, endsAt: Date, name = "there"): Mail {
+export function trialEndingMail(to: string, projectName: string | null, endsAt: Date, name = "there"): Mail {
   return customerMail(to, "plugin_trial_ending", "Your MemberFrame trial ends soon", {
     heading: "Your trial ends soon",
-    subheading: `Free trial for ${projectName}`,
+    subheading: `Free trial for ${projectLabel(projectName)}`,
     greetingName: name,
     paragraphs: [
-      `Your free trial for **${projectName}** ends on **${formatDate(endsAt)}**.`,
+      `Your free trial for **${projectLabel(projectName)}** ends on **${formatDate(endsAt)}**.`,
       "Upgrade in the MemberFrame plugin to keep your members signing in and your content protected.",
     ],
     footnote: SUPPORT,
   });
 }
 
-export function trialEndedMail(to: string, projectName: string, name = "there"): Mail {
+export function trialEndedMail(to: string, projectName: string | null, name = "there"): Mail {
   return customerMail(to, "plugin_trial_ended", "Your MemberFrame trial has ended", {
     heading: "Your trial has ended",
     subheading: "Upgrade now to keep using MemberFrame",
     greetingName: name,
     paragraphs: [
-      `The free trial for **${projectName}** has ended, so its MemberFrame components are locked and members cannot sign in.`,
+      `The free trial for **${projectLabel(projectName)}** has ended, so its MemberFrame components are locked and members cannot sign in.`,
       "Open the MemberFrame plugin and upgrade to restore everything. Your members and settings are saved and waiting.",
     ],
     footnote: SUPPORT,
@@ -77,11 +85,11 @@ export function trialEndedMail(to: string, projectName: string, name = "there"):
 
 export function planReceiptMail(
   to: string,
-  input: { projectName: string; plan: string; amountMinor: number; creditMinor: number; currency: string; periodEnd: Date | null; kind: string },
+  input: { projectName: string | null; plan: string; amountMinor: number; creditMinor: number; currency: string; periodEnd: Date | null; kind: string },
   name = "there"
 ): Mail {
   const label = PLAN_LABELS[input.plan] ?? input.plan;
-  const paragraphs = [`Thank you. We received **${formatMoney(input.amountMinor, input.currency)}** for **${label}** on ${input.projectName}.`];
+  const paragraphs = [`Thank you. We received **${formatMoney(input.amountMinor, input.currency)}** for **${label}** on ${projectLabel(input.projectName)}.`];
   if (input.creditMinor > 0) paragraphs.push(`**${formatMoney(input.creditMinor, input.currency)}** of unused time on your previous plan was taken off.`);
   if (input.periodEnd) paragraphs.push(`Your plan renews on **${formatDate(input.periodEnd)}**.`);
   else if (input.plan === "lifetime") paragraphs.push("Lifetime access never renews and never expires. The watermark has been removed.");
@@ -96,7 +104,7 @@ export function planReceiptMail(
 
 export function renewalReminderMail(
   to: string,
-  input: { projectName: string; plan: string; amountMinor: number; currency: string; renewsAt: Date },
+  input: { projectName: string | null; plan: string; amountMinor: number; currency: string; renewsAt: Date },
   name = "there"
 ): Mail {
   const label = PLAN_LABELS[input.plan] ?? input.plan;
@@ -105,28 +113,28 @@ export function renewalReminderMail(
     subheading: label,
     greetingName: name,
     paragraphs: [
-      `**${label}** for ${input.projectName} renews on **${formatDate(input.renewsAt)}** for **${formatMoney(input.amountMinor, input.currency)}**.`,
+      `**${label}** for ${projectLabel(input.projectName)} renews on **${formatDate(input.renewsAt)}** for **${formatMoney(input.amountMinor, input.currency)}**.`,
       "Nothing to do if you want to keep it. To change or cancel, open Profile, Manage Subscription in the MemberFrame plugin.",
     ],
     footnote: SUPPORT,
   });
 }
 
-export function paymentFailedMail(to: string, input: { projectName: string; plan: string }, name = "there"): Mail {
+export function paymentFailedMail(to: string, input: { projectName: string | null; plan: string }, name = "there"): Mail {
   const label = PLAN_LABELS[input.plan] ?? input.plan;
   return customerMail(to, "plugin_payment_failed", "Your MemberFrame payment failed", {
     heading: "Your payment failed",
     subheading: label,
     greetingName: name,
     paragraphs: [
-      `We could not charge your card for **${label}** on ${input.projectName}. We will try again over the next few days.`,
+      `We could not charge your card for **${label}** on ${projectLabel(input.projectName)}. We will try again over the next few days.`,
       "Update your card in the MemberFrame plugin: Profile, Manage Subscription, Manage Billing.",
     ],
     footnote: SUPPORT,
   });
 }
 
-export function planCanceledMail(to: string, input: { projectName: string; plan: string; endsAt: Date | null }, name = "there"): Mail {
+export function planCanceledMail(to: string, input: { projectName: string | null; plan: string; endsAt: Date | null }, name = "there"): Mail {
   const label = PLAN_LABELS[input.plan] ?? input.plan;
   return customerMail(to, "plugin_plan_canceled", `Your ${label} plan is cancelled`, {
     heading: "Subscription canceled",
@@ -134,21 +142,21 @@ export function planCanceledMail(to: string, input: { projectName: string; plan:
     greetingName: name,
     paragraphs: [
       input.endsAt
-        ? `You'll have full access to **${input.projectName}** until **${formatDate(input.endsAt)}**. We'd love to have you back anytime.`
-        : `**${label}** for ${input.projectName} is cancelled. We'd love to have you back anytime.`,
+        ? `You'll have full access to **${projectLabel(input.projectName)}** until **${formatDate(input.endsAt)}**. We'd love to have you back anytime.`
+        : `**${label}** for ${projectLabel(input.projectName)} is cancelled. We'd love to have you back anytime.`,
       "Changed your mind? Resubscribe anytime from the MemberFrame plugin.",
     ],
     footnote: SUPPORT,
   });
 }
 
-export function planExpiredMail(to: string, input: { projectName: string }, name = "there"): Mail {
+export function planExpiredMail(to: string, input: { projectName: string | null }, name = "there"): Mail {
   return customerMail(to, "plugin_plan_expired", "Your MemberFrame plan has ended", {
     heading: "Your plan has ended",
     subheading: "Upgrade now to keep using MemberFrame",
     greetingName: name,
     paragraphs: [
-      `The MemberFrame plan for **${input.projectName}** has ended, so its components are locked and members cannot sign in.`,
+      `The MemberFrame plan for **${projectLabel(input.projectName)}** has ended, so its components are locked and members cannot sign in.`,
       "Open the MemberFrame plugin and upgrade to restore everything. Your members and settings are saved and waiting.",
     ],
     footnote: SUPPORT,
@@ -162,7 +170,7 @@ export function planExpiredMail(to: string, input: { projectName: string }, name
 export interface TeamPerson {
   name: string;
   email: string;
-  projectName?: string;
+  projectName?: string | null;
   siteId?: string;
 }
 
@@ -198,7 +206,7 @@ export function teamNotice(
   const who = [
     { label: "Customer Name", value: person.name },
     { label: "Customer Email", value: person.email, kind: "email" as const },
-    { label: "Framer Site Name", value: person.projectName ?? "-" },
+    { label: "Site Name", value: person.projectName || "-" },
     { label: "Framer Site ID", value: person.siteId ?? "-", kind: "mono" as const },
   ];
 
@@ -290,7 +298,7 @@ export function teamNotice(
         heading: "Free Trial Ended",
         intro: "A MemberFrame free trial has ended without a purchase. Details are provided below:",
         summaryLabel: "Trial Project",
-        summaryValue: person.projectName ?? "-",
+        summaryValue: person.projectName || "-",
         rows: [
           ...who,
           { label: "Trial Start", value: details.trialStart ? formatDate(details.trialStart) : "-" },

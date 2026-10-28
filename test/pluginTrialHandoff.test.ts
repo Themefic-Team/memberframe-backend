@@ -26,7 +26,7 @@ import { claimHandoff, completeHandoff } from "../src/services/creatorHandoffSer
 import { hashToken } from "../src/lib/tokens.js";
 
 const NOW = new Date("2026-10-18T12:00:00Z");
-const INPUT = { userId: "u1", email: "Me@Example.com", framerUserId: "fu1", framerProjectId: "proj1", siteId: "site1", projectName: "Portfolio" };
+const INPUT = { userId: "u1", email: "Me@Example.com", siteId: "site1" };
 
 beforeEach(() => vi.clearAllMocks());
 
@@ -40,21 +40,25 @@ describe("starting a trial", () => {
     expect(trialDurationMs()).toBe(7 * 86_400_000);
     expect(result).toEqual({ started: true, endsAt: new Date(NOW.getTime() + 7 * 86_400_000) });
     const created = db.pluginTrial.create.mock.calls[0]![0] as { data: Record<string, unknown> };
-    expect(created.data).toMatchObject({ userId: "u1", email: "me@example.com", framerUserId: "fu1", framerProjectId: "proj1", siteId: "site1", status: "trialing" });
+    expect(created.data).toMatchObject({ userId: "u1", email: "me@example.com", siteId: "site1", status: "trialing" });
+    // Nothing read from Framer is stored (Marketplace review, 2026-10-28).
+    expect(created.data).not.toHaveProperty("framerUserId");
+    expect(created.data).not.toHaveProperty("framerProjectId");
+    expect(created.data).not.toHaveProperty("projectName");
   });
 
-  it("checks the account, the email, the project, the site, and the Framer user", async () => {
+  it("checks the account, the email, and the site", async () => {
     db.pluginTrial.findFirst.mockResolvedValue(null);
     db.pluginTrial.create.mockResolvedValue({});
     await startTrialIfEligible(INPUT, NOW);
     const where = (db.pluginTrial.findFirst.mock.calls[0]![0] as { where: { OR: unknown[] } }).where.OR;
-    expect(where).toEqual([{ userId: "u1" }, { email: "me@example.com" }, { framerProjectId: "proj1" }, { siteId: "site1" }, { framerUserId: "fu1" }]);
+    expect(where).toEqual([{ userId: "u1" }, { email: "me@example.com" }, { siteId: "site1" }]);
   });
 
   it("refuses with no fallback when any identifier already had one", async () => {
     // BEAF inserted a trial anyway after a failed check. Never here.
-    db.pluginTrial.findFirst.mockResolvedValue({ userId: "other", email: "x@y.com", framerUserId: "fu1", framerProjectId: "elsewhere" });
-    expect(await startTrialIfEligible(INPUT, NOW)).toEqual({ started: false, reason: "framer_user" });
+    db.pluginTrial.findFirst.mockResolvedValue({ userId: "other", email: "x@y.com" });
+    expect(await startTrialIfEligible(INPUT, NOW)).toEqual({ started: false, reason: "site" });
     expect(db.pluginTrial.create).not.toHaveBeenCalled();
   });
 

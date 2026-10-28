@@ -150,12 +150,13 @@ describe("the public answer", () => {
 });
 
 describe("trial refusals", () => {
-  const input = { userId: "u1", email: "me@x.com", framerUserId: "f1", framerProjectId: "p1", siteId: "s1", projectName: "P" };
+  // Account, email, and site only: the Framer user and project are no longer
+  // read (Marketplace review, 2026-10-28).
+  const input = { userId: "u1", email: "me@x.com", siteId: "s1" };
   it("name the identifier that already had a trial", () => {
-    expect(trialRefusal({ userId: "u1", email: "o@x.com", framerUserId: null, framerProjectId: null }, input)).toBe("account");
-    expect(trialRefusal({ userId: "u2", email: "me@x.com", framerUserId: null, framerProjectId: null }, input)).toBe("email");
-    expect(trialRefusal({ userId: "u2", email: "o@x.com", framerUserId: "f1", framerProjectId: null }, input)).toBe("framer_user");
-    expect(trialRefusal({ userId: "u2", email: "o@x.com", framerUserId: "f9", framerProjectId: "p1" }, input)).toBe("project");
+    expect(trialRefusal({ userId: "u1", email: "o@x.com" }, input)).toBe("account");
+    expect(trialRefusal({ userId: "u2", email: "me@x.com" }, input)).toBe("email");
+    expect(trialRefusal({ userId: "u2", email: "o@x.com" }, input)).toBe("site");
   });
 });
 

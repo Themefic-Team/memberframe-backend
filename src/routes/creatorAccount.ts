@@ -115,7 +115,7 @@ accountRouter.post(
     try {
       await startConnect({
         email: input.email,
-        framerProjectId: ACCOUNT_CODE_SCOPE,
+        scope: ACCOUNT_CODE_SCOPE,
         purpose: "account",
         accountPurpose: input.purpose,
         name: input.name || user?.name || "there",

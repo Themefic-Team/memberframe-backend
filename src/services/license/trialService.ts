@@ -1,11 +1,15 @@
 /**
  * The 7-day trial. F19, development doc 19-pro-lock-and-trial.md.
  *
- * One trial per creator account, per email, per Framer user, and per Framer
- * project: a match on any one of them means it was used (F19's three
- * identifiers, plus the project). It starts the first time the plugin is used
- * in a project and stays bound to that project; every other project of the
- * same creator then reports `trial_claimed_other_site`.
+ * One trial per creator account, per email, and per site: a match on any one
+ * of them means it was used. It starts the first time the plugin is used in a
+ * project and stays bound to that site; every other site of the same creator
+ * then reports `trial_claimed_other_site`.
+ *
+ * The Framer user and the Framer project used to count too. Since 2026-10-28
+ * the plugin reads neither (Marketplace review), so they are no longer stored
+ * or matched; older rows keep their values. The trade off: a new account with
+ * a new address, on a new site, gets a new trial.
  *
  * BEAF fell through to a "direct insert" when its eligibility check failed,
  * so a second account on an already-trialled project got a second trial.
@@ -21,26 +25,22 @@ export function trialDurationMs(): number {
   return env.billing.trialMinutes > 0 ? env.billing.trialMinutes * 60_000 : env.billing.trialDays * 86_400_000;
 }
 
-export type TrialRefusal = "account" | "email" | "framer_user" | "project";
+export type TrialRefusal = "account" | "email" | "site";
 
 export interface StartTrialInput {
   userId: string;
   email: string;
-  framerUserId: string | null;
-  framerProjectId: string;
   siteId: string;
-  projectName: string;
 }
 
 /** Which identifier, if any, has already had a trial. */
 export function trialRefusal(
-  existing: { userId: string; email: string; framerUserId: string | null; framerProjectId: string | null },
+  existing: { userId: string; email: string },
   input: StartTrialInput
 ): TrialRefusal {
   if (existing.userId === input.userId) return "account";
   if (existing.email === input.email.toLowerCase()) return "email";
-  if (input.framerUserId && existing.framerUserId === input.framerUserId) return "framer_user";
-  return "project";
+  return "site";
 }
 
 export async function startTrialIfEligible(
@@ -48,17 +48,11 @@ export async function startTrialIfEligible(
   now: Date = new Date()
 ): Promise<{ started: true; endsAt: Date } | { started: false; reason: TrialRefusal }> {
   const email = input.email.trim().toLowerCase();
-  const or: Prisma.PluginTrialWhereInput[] = [
-    { userId: input.userId },
-    { email },
-    { framerProjectId: input.framerProjectId },
-    { siteId: input.siteId },
-  ];
-  if (input.framerUserId) or.push({ framerUserId: input.framerUserId });
+  const or: Prisma.PluginTrialWhereInput[] = [{ userId: input.userId }, { email }, { siteId: input.siteId }];
 
   const existing = await prisma.pluginTrial.findFirst({
     where: { OR: or },
-    select: { userId: true, email: true, framerUserId: true, framerProjectId: true },
+    select: { userId: true, email: true },
   });
   if (existing) return { started: false, reason: trialRefusal(existing, { ...input, email }) };
 
@@ -68,10 +62,7 @@ export async function startTrialIfEligible(
       data: {
         userId: input.userId,
         email,
-        framerUserId: input.framerUserId || null,
-        framerProjectId: input.framerProjectId,
         siteId: input.siteId,
-        projectName: input.projectName.slice(0, 255),
         startedAt: now,
         endsAt,
         status: "trialing",

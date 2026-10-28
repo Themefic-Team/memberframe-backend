@@ -90,7 +90,9 @@ model User {
 model Site {
   id       String @id @default(uuid(7)) @db.Char(36)
   userId   String @map("user_id") @db.Char(36)
-  siteName String @map("site_name") @db.VarChar(255)
+  /// Null for a site created since 2026-10-28: the plugin no longer reads the
+  /// Framer project name (Marketplace review). Older rows keep theirs.
+  siteName String? @map("site_name") @db.VarChar(255)
 
   /// Public. Baked into each generated canvas component, exactly like
   /// `apiBaseUrl` already is, and no more secret than a Stripe publishable key.
@@ -950,7 +952,8 @@ model PluginTrial {
   /// The project the trial is bound to. Not unique by itself: the project id
   /// above is the stable identity, this is the row it currently points at.
   siteId          String  @map("site_id") @db.Char(36)
-  projectName     String  @default("") @map("project_name") @db.VarChar(255)
+  /// Null since 2026-10-28, as `Site.siteName`. Older rows keep theirs.
+  projectName     String? @map("project_name") @db.VarChar(255)
 
   startedAt DateTime @map("started_at") @db.DateTime(3)
   endsAt    DateTime @map("ends_at") @db.DateTime(3)

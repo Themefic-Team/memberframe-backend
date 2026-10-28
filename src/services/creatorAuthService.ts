@@ -1,37 +1,26 @@
 /**
- * Creator identity, and the connect handshake.
+ * Creator identity, and how a Framer project becomes a site.
  *
- * This closes conflict C10. Every `/api/site/*` route needed a creator session
- * and nothing in the 72-task plan built one, so the plugin's Manage and
- * Settings tabs have rendered their signed-out state since the project began.
+ * Sign in happens on the hosted account page (`routes/creatorAccount.ts`):
+ * the creator proves their address with a six-digit code or a password there,
+ * and the panel receives a token through the hand-off. The panel then calls
+ * `attachProject` with the site id it keeps in the project's plugin data.
  *
- * ## The handshake, and why it has two steps
+ * ## Nothing from Framer is stored
  *
- * The plugin knows the Framer project id and the creator's name, from
- * `framer.getProjectInfo()` and `framer.getCurrentUser()`. It does NOT know
- * their email address: blocker B7 records that the SDK exposes none. So the
- * creator types one, and an address a creator typed is a claim, not a fact.
+ * Since 2026-10-28 (Marketplace review, memberframe/docs/development-docs/
+ * 35-marketplace-review-report.md) the panel reads neither the Framer user nor
+ * the project's name, id, or published domains, and this server would not
+ * keep them if it did. A site is known by its own id only. Its name starts
+ * empty and its domains are the ones the creator types in Profile.
  *
- * One step would mean: send a project id and an address, receive a token that
- * reads every member of that site. Anyone who learned a project id could type
- * any address and take the site. So:
+ * ## Ownership is first come, and that is a real limitation
  *
- *   1. `startConnect` sends a six-digit code to the address and answers 200
- *      whatever happens.
- *   2. `verifyConnect` takes the code and only then creates the account, claims
- *      the project, and issues a token.
- *
- * The code proves the address belongs to whoever is typing. That is the whole
- * security model of this flow, and it is the same one the member OTP uses.
- *
- * ## Claiming is first come, and that is a real limitation
- *
- * The first address to verify against a Framer project id owns that site.
- * A second creator connecting the same project gets 403 rather than access,
- * which is correct and also means a project connected by mistake, or by a
- * contractor who has left, needs support to reassign. There is no transfer
- * flow and no team model. Recorded as conflict C28 rather than invented here:
- * a wrong guess about ownership transfer is expensive to undo.
+ * A site belongs to the account that created it. Another account opening the
+ * same project finds the site id in plugin data and gets 403, which is
+ * correct and also means a project set up by a contractor who has left needs
+ * support to reassign. There is no transfer flow and no team model (conflict
+ * C28).
  */
 
 import { prisma } from "../config/db.js";
@@ -56,7 +45,8 @@ export const CREATOR_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 export interface StartConnectInput {
   email: string;
-  framerProjectId: string;
+  /** What the code is scoped to, stored in `creator_otps.framer_project_id`. Always `ACCOUNT_CODE_SCOPE` now. */
+  scope: string;
   /**
    * Which email to send. `connect` is the panel's own code form; `account`
    * is the hosted account page opened in a browser tab (F19), whose codes are
@@ -68,7 +58,7 @@ export interface StartConnectInput {
   name?: string;
 }
 
-/** The `framerProjectId` a hosted account page code is stored under. */
+/** The scope a hosted account page code is stored under. */
 export const ACCOUNT_CODE_SCOPE = "account";
 
 /**
@@ -90,7 +80,7 @@ export async function startConnect(input: StartConnectInput): Promise<void> {
   const outstanding = await prisma.creatorOtp.findFirst({
     where: {
       email,
-      framerProjectId: input.framerProjectId,
+      framerProjectId: input.scope,
       consumedAt: null,
       expiresAt: { gt: now },
     },
@@ -111,14 +101,14 @@ export async function startConnect(input: StartConnectInput): Promise<void> {
   // Otherwise requesting five codes leaves five valid, which multiplies the
   // guessing surface by five for no benefit to anyone.
   await prisma.creatorOtp.updateMany({
-    where: { email, framerProjectId: input.framerProjectId, consumedAt: null },
+    where: { email, framerProjectId: input.scope, consumedAt: null },
     data: { consumedAt: now },
   });
 
   await prisma.creatorOtp.create({
     data: {
       email,
-      framerProjectId: input.framerProjectId,
+      framerProjectId: input.scope,
       codeHash: hashToken(code),
       expiresAt: expiryFrom(env.otp.ttlSeconds, now),
       resendAvailableAt: expiryFrom(env.otp.resendLockSeconds, now),
@@ -132,66 +122,26 @@ export async function startConnect(input: StartConnectInput): Promise<void> {
   await sendMail(input.purpose === "account" ? accountCodeMail(email, code, input.accountPurpose, input.name || "there") : creatorCodeMail(email, code));
 }
 
-export interface VerifyConnectInput {
-  email: string;
-  code: string;
-  framerProjectId: string;
-  projectName: string;
-  creatorName: string | null;
-  /** Origins this site will be served from. Added to the allowlist on claim. */
-  origins: string[];
-  userAgent?: string | undefined;
-}
-
 export interface ConnectedSite {
   siteId: string;
   siteKey: string;
-  siteName: string;
-  framerProjectId: string;
+  /** Null for a site created since 2026-10-28. */
+  siteName: string | null;
   allowedOrigins: string[];
 }
 
-export interface VerifyConnectResult {
-  token: string;
-  expiresAt: Date;
-  user: { id: string; email: string; name: string };
-  site: ConnectedSite;
-}
 
-/**
- * Check the code, then create or find everything behind it.
- *
- * The order is deliberate and it is the whole of the authorization story:
- * nothing below the code check reads or writes a site. A wrong code returns
- * before `framerProjectId` has been used for anything at all.
- */
-export async function verifyConnect(input: VerifyConnectInput): Promise<VerifyConnectResult> {
-  const email = input.email.trim().toLowerCase();
-  const now = new Date();
-
-  await consumeCreatorCode(email, input.code, input.framerProjectId, now);
-
-  // ------------------------------------------------------------------------
-  // The address is proven. Everything below is ordinary bookkeeping.
-  // ------------------------------------------------------------------------
-
-  const user = await findOrCreateCreator(email, input.creatorName, now);
-  const site = await attachProject(user.id, input);
-  const session = await issueCreatorSession(user.id, input, now);
-
-  return { ...session, user, site };
-}
 
 /**
  * Check a creator's six-digit code and spend it, or throw `invalid_code`.
  *
  * The order is deliberate and it is the whole of the authorization story:
  * nothing below the code check reads or writes a site. A wrong code returns
- * before `framerProjectId` has been used for anything at all.
+ * before anything else has been read.
  */
-export async function consumeCreatorCode(email: string, code: string, framerProjectId: string, now: Date = new Date()): Promise<void> {
+export async function consumeCreatorCode(email: string, code: string, scope: string, now: Date = new Date()): Promise<void> {
   const otp = await prisma.creatorOtp.findFirst({
-    where: { email, framerProjectId, consumedAt: null },
+    where: { email, framerProjectId: scope, consumedAt: null },
     orderBy: { createdAt: "desc" },
   });
 
@@ -222,8 +172,8 @@ export async function consumeCreatorCode(email: string, code: string, framerProj
  * The creator behind a proven address, made if new.
  *
  * Find, then create. Not an upsert with an empty update branch: an existing
- * creator's name is theirs, and overwriting it with whatever Framer reports
- * on this machine would silently rename them every reconnect.
+ * creator's name is theirs, typed on the account page, and overwriting it on
+ * a later sign in would silently rename them.
  */
 export async function findOrCreateCreator(
   email: string,
@@ -251,42 +201,29 @@ export async function findOrCreateCreator(
 }
 
 /**
- * Find or claim this Framer project for a creator.
+ * The site for this project, by the id the panel keeps in plugin data.
  *
- * First claim wins. See the header note: there is no transfer flow, and
- * inventing one here would be a product decision made in a service file.
+ * No id, or an id that no longer exists: a new site. An id that belongs to
+ * another account: 403, as before (first claim wins, see the header). The
+ * creator's own id: that site, untouched. Nothing about the Framer project
+ * is read or written here.
  */
-export async function attachProject(
-  userId: string,
-  input: { framerProjectId: string; projectName: string; origins: ReadonlyArray<string> }
-): Promise<ConnectedSite> {
-  const existing = await prisma.site.findUnique({
-    where: { framerSiteId: input.framerProjectId },
-    select: { id: true, userId: true, siteKey: true, siteName: true, allowedOrigins: true },
-  });
+export async function attachProject(userId: string, input: { siteId?: string | undefined }): Promise<ConnectedSite> {
+  const existing = input.siteId
+    ? await prisma.site.findUnique({
+        where: { id: input.siteId },
+        select: { id: true, userId: true, siteKey: true, siteName: true, allowedOrigins: true },
+      })
+    : null;
 
   if (existing && existing.userId !== userId) throw forbidden("project_claimed_by_another_account");
 
-  const origins = normalizeOrigins(input.origins);
-
-  const site = existing
-    ? await prisma.site.update({
-        where: { id: existing.id },
-        data: {
-          siteName: input.projectName.trim() || existing.siteName,
-          // Union, never replace. A creator reconnecting from a preview URL
-          // must not lose the custom domain they added last week.
-          allowedOrigins: mergeOrigins(existing.allowedOrigins, origins),
-        },
-        select: { id: true, siteKey: true, siteName: true, allowedOrigins: true },
-      })
-    : await createSite(userId, input, origins);
+  const site = existing ?? (await createSite(userId));
 
   return {
     siteId: site.id,
     siteKey: site.siteKey,
     siteName: site.siteName,
-    framerProjectId: input.framerProjectId,
     allowedOrigins: readOrigins(site.allowedOrigins),
   };
 }
@@ -320,19 +257,16 @@ export async function issueCreatorSession(
  * this table, and an empty ladder means every gate on the canvas denies
  * everyone with no error anywhere.
  */
-async function createSite(
-  userId: string,
-  input: { framerProjectId: string; projectName: string },
-  origins: string[]
-): Promise<{ id: string; siteKey: string; siteName: string; allowedOrigins: unknown }> {
+async function createSite(userId: string): Promise<{ id: string; siteKey: string; siteName: string | null; allowedOrigins: unknown }> {
   return prisma.$transaction(async (tx) => {
+    // No name and no domains: both are the creator's to type (Profile), never
+    // read from Framer. `framerSiteId` stays null.
     const site = await tx.site.create({
       data: {
         userId,
-        siteName: input.projectName.trim() || "Untitled project",
+        siteName: null,
         siteKey: generateSiteKey(),
-        framerSiteId: input.framerProjectId,
-        allowedOrigins: origins,
+        allowedOrigins: [],
         grantSalt: generateGrantSalt(),
       },
       select: { id: true, siteKey: true, siteName: true, allowedOrigins: true },
@@ -353,7 +287,7 @@ async function createSite(
         siteId: site.id,
         settings: toJsonDocument({
           ...defaultSettings(),
-          branding: { displayName: site.siteName, supportEmail: "" },
+          branding: { displayName: "", supportEmail: "" },
         }),
       },
     });
@@ -441,7 +375,9 @@ export async function requireOwnedSite(
 
   if (!site) throw notFound("site_not_found");
 
-  return site;
+  // A site created since 2026-10-28 has no name. Every reader gets "" and
+  // falls back where it shows one (a member email signs as "MemberFrame").
+  return { ...site, siteName: site.siteName ?? "" };
 }
 
 // ============================================================================

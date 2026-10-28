@@ -27,7 +27,8 @@ export interface TrialRow {
   status: string;
   startedAt: Date;
   endsAt: Date;
-  projectName: string;
+  /** Null for a trial started since 2026-10-28. */
+  projectName: string | null;
 }
 
 export interface SubscriptionRow {

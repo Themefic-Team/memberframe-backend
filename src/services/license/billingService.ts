@@ -229,7 +229,7 @@ async function createLifetimePayment(
     currency: price.currency,
     customer,
     receipt_email: owner.email,
-    description: `MemberFrame Lifetime for ${project.siteName}`.slice(0, 250),
+    description: (project.siteName ? `MemberFrame Lifetime for ${project.siteName}` : "MemberFrame Lifetime").slice(0, 250),
     automatic_payment_methods: { enabled: true },
     metadata: {
       ...metadata,

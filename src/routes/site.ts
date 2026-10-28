@@ -933,8 +933,11 @@ siteRouter.post(
 
 const originsSchema = z.object({
   siteId: siteIdSchema,
-  origins: z.array(z.string().max(2048)).min(1).max(25),
-  /** Replace rather than add. The Connect tab uses this when removing one. */
+  origins: z.array(z.string().max(2048)).max(25),
+  /**
+   * Replace rather than add. Settings uses this when a creator removes a
+   * domain, so an empty list is allowed only here: removing the last domain.
+   */
   replace: z.boolean().optional().default(false),
 });
 
@@ -947,10 +950,13 @@ siteRouter.post(
 
     const normalized = normalizeOrigins(input.origins);
 
+    // Adding nothing is a mistake; replacing with nothing removes the last domain.
+    if (input.origins.length === 0 && !input.replace) throw badRequest("no_valid_origins");
+
     // Everything was rejected, which almost always means a creator typed a
     // bare domain or an `http://` address for a real host. Saying so beats
     // saving an empty list and leaving them to wonder.
-    if (normalized.length === 0) throw badRequest("no_valid_origins");
+    if (input.origins.length > 0 && normalized.length === 0) throw badRequest("no_valid_origins");
 
     const updated = await prisma.site.update({
       where: { id: site.id },

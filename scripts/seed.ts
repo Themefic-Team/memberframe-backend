@@ -105,7 +105,7 @@ async function main(): Promise<void> {
       siteId: site.id,
       settings: toJsonDocument({
         ...defaultSettings(),
-        branding: { displayName: site.siteName, supportEmail: CREATOR_EMAIL },
+        branding: { displayName: site.siteName ?? "", supportEmail: CREATOR_EMAIL },
       }),
     },
     update: {},

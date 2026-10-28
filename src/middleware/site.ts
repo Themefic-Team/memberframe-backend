@@ -125,7 +125,7 @@ async function resolve(req: Request, res: Response): Promise<void> {
 
   let site: {
     id: string;
-    siteName: string;
+    siteName: string | null;
     siteKey: string;
     allowedOrigins: unknown;
     defaultLocale: string;
@@ -262,7 +262,8 @@ async function resolve(req: Request, res: Response): Promise<void> {
 
   req.site = {
     id: site.id,
-    siteName: site.siteName,
+    // Null for a site created since 2026-10-28; member emails sign as "MemberFrame".
+    siteName: site.siteName ?? "",
     siteKey: site.siteKey,
     allowedOrigins: allowed,
     defaultLocale: site.defaultLocale,
