@@ -56,8 +56,19 @@ export function recordableOrigin(origin: string | undefined): string | null {
   return url.origin;
 }
 
-/** The stored map, narrowed: anything malformed is dropped rather than trusted. */
+/**
+ * The stored map, narrowed: anything malformed is dropped rather than trusted.
+ * A JSON column can reach us as text (MariaDB keeps JSON as LONGTEXT, and a
+ * driver may not parse it), so a string is parsed first.
+ */
 export function readSightings(stored: unknown): Sightings {
+  if (typeof stored === "string") {
+    try {
+      stored = JSON.parse(stored) as unknown;
+    } catch {
+      return {};
+    }
+  }
   if (typeof stored !== "object" || stored === null || Array.isArray(stored)) return {};
   const out: Sightings = {};
   for (const [origin, value] of Object.entries(stored as Record<string, unknown>)) {

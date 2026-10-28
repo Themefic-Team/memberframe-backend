@@ -66,6 +66,12 @@ describe("sightings", () => {
     expect(readSightings([1, 2])).toEqual({});
   });
 
+  it("reads the column when the driver hands it back as text", () => {
+    const at = now.toISOString();
+    expect(readSightings(JSON.stringify({ "https://acme.com": { lastSeenAt: at } }))).toEqual({ "https://acme.com": { lastSeenAt: at } });
+    expect(readSightings("not json")).toEqual({});
+  });
+
   it("marks which sightings are listed, newest first, so Profile can suggest the rest", () => {
     const stored = withSighting(withSighting(null, "https://old.framer.app", now), "https://acme.com", new Date(now.getTime() + 60_000));
     expect(sightingViews(stored, ["https://old.framer.app"])).toEqual([
