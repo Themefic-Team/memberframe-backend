@@ -27,6 +27,7 @@ import type { NextFunction, Request, RequestHandler, Response } from "express";
 import { prisma } from "../config/db.js";
 import { badRequest, unauthorized } from "./errors.js";
 import { verifyOAuthState } from "../lib/oauthState.js";
+import { noteOrigin } from "../lib/originSightings.js";
 
 export const SITE_KEY_HEADER = "x-memberframe-site";
 
@@ -236,6 +237,10 @@ async function resolve(req: Request, res: Response): Promise<void> {
   }
 
   const allowed = parseAllowedOrigins(site.allowedOrigins);
+
+  // Where this site's component called from, allowed or not, for Profile's
+  // Site Domains (lib/originSightings.ts). Evidence only, never permission.
+  noteOrigin(site.id, origin);
 
   // A request with no `Origin` at all is not from a browser: curl, a server,
   // or a mobile app. Allowed through, because the cookie is what authorizes

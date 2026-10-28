@@ -25,6 +25,7 @@ import { siteLicense } from "../services/license/licenseService.js";
 import { verifySeal } from "../lib/instanceSeal.js";
 import { isEditorHost } from "../lib/siteLinks.js";
 import { originAllowed, parseAllowedOrigins } from "../middleware/site.js";
+import { noteOrigin } from "../lib/originSightings.js";
 
 export const licenseRouter = Router();
 
@@ -92,6 +93,9 @@ licenseRouter.get(
       ? await prisma.site.findUnique({ where: { siteKey }, select: { id: true, allowedOrigins: true } })
       : null;
     if (!site) throw notFound("site_not_found");
+    // Every component asks this on load: the clearest sign of where the site
+    // is really published (Profile, Site Domains). Recorded, never trusted.
+    noteOrigin(site.id, req.header("origin"));
 
     const seal = typeof req.query["seal"] === "string" ? req.query["seal"].trim() : undefined;
     const license = await siteLicense(site.id);

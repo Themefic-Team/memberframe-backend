@@ -107,6 +107,12 @@ model Site {
   /// `Allow-Credentials: true` and `Allow-Origin: *` mutually exclusive.
   allowedOrigins Json @map("allowed_origins")
 
+  /// Where this site's own components have called from, with when: `{ "<origin>":
+  /// { "lastSeenAt": "<iso>" } }`, at most 20. Lets Profile show a domain as
+  /// working and suggest one the creator has not added (a custom domain).
+  /// Recorded from our own requests, never read from Framer. 2026-10-28.
+  seenOrigins Json? @map("seen_origins")
+
   /// The Framer project id from framer.getProjectInfo(). Unique, because one
   /// Framer project is one tenant: a second connect attempt for the same
   /// project must find this row rather than make another. MySQL treats every

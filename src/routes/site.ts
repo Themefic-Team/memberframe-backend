@@ -17,6 +17,8 @@ import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../config/db.js";
 import { badRequest, ok, route } from "../middleware/errors.js";
+import { checkDomain, type DomainProblem } from "../lib/domainCheck.js";
+import { sightingViews } from "../lib/originSightings.js";
 import { creatorAuth, requireCreator } from "../middleware/creator.js";
 import { guardEmailSend } from "../middleware/rateLimit.js";
 import { issueMagicLink, restoreMemberAccess, revokeMemberAccess } from "../services/memberAccessService.js";
@@ -941,6 +943,49 @@ const originsSchema = z.object({
   replace: z.boolean().optional().default(false),
 });
 
+/** What the creator reads under the field when a domain is refused. */
+function domainProblemMessage(host: string, problem: DomainProblem): string {
+  switch (problem) {
+    case "not_found":
+      return `We could not find ${host}. Check the spelling.`;
+    case "not_published":
+      return `Nothing is published at ${host}. Check the spelling, or publish the site in Framer first.`;
+    case "not_public":
+      return `${host} does not point to a public website.`;
+    case "port":
+      return "Use the address without a port, as your visitors type it.";
+    default:
+      return `${host} did not answer. Check that the site is published, then try again.`;
+  }
+}
+
+function isLoopbackOrigin(origin: string): boolean {
+  try {
+    const host = new URL(origin).hostname;
+    return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The domains, and where this site's components have really called from
+ * (lib/originSightings.ts). Profile shows a listed domain as working once a
+ * page there has called, and suggests one that called but is not listed: a
+ * custom domain, or a new `*.framer.app` address. Nothing here comes from Framer.
+ */
+siteRouter.get(
+  "/origins",
+  route(async (req, res) => {
+    const creator = requireCreator(req);
+    const input = z.object({ siteId: siteIdSchema }).parse(req.query);
+    const site = await requireOwnedSite(creator.userId, input.siteId);
+    const row = await prisma.site.findUnique({ where: { id: site.id }, select: { seenOrigins: true } });
+    const allowed = Array.isArray(site.allowedOrigins) ? (site.allowedOrigins as string[]) : [];
+    ok(res, { allowedOrigins: allowed, seen: sightingViews(row?.seenOrigins, allowed) });
+  })
+);
+
 siteRouter.post(
   "/origins",
   route(async (req, res) => {
@@ -957,6 +1002,23 @@ siteRouter.post(
     // bare domain or an `http://` address for a real host. Saying so beats
     // saving an empty list and leaving them to wonder.
     if (input.origins.length > 0 && normalized.length === 0) throw badRequest("no_valid_origins");
+
+    // A domain new to this list must be a real, public site that answers
+    // HTTPS: a typo is caught here rather than found by a member on launch day.
+    // Loopback stays unchecked, for a creator testing on their own machine.
+    // Whether it is really this site shows later, in GET /origins.
+    const current = Array.isArray(site.allowedOrigins) ? (site.allowedOrigins as string[]) : [];
+    const added = normalized.filter((origin) => !current.includes(origin) && !isLoopbackOrigin(origin));
+    const checks = await Promise.all(added.map(async (origin) => ({ origin, result: await checkDomain(origin) })));
+    const failed = checks.find((check) => !check.result.ok);
+    if (failed && !failed.result.ok) {
+      const host = new URL(failed.origin).host;
+      throw badRequest("domain_unreachable", {
+        domain: host,
+        problem: failed.result.reason,
+        message: domainProblemMessage(host, failed.result.reason),
+      });
+    }
 
     const updated = await prisma.site.update({
       where: { id: site.id },
