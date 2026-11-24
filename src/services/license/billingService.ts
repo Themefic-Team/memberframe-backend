@@ -31,10 +31,14 @@ const APP = "memberframe";
 export interface PlanPrice {
   id: PlanId;
   priceId: string;
+  /** The Stripe product the price belongs to: a coupon's `applies_to` names products. */
+  productId: string;
   amountMinor: number;
   currency: string;
   interval: "month" | "year" | null;
 }
+
+const PLAN_IDS: ReadonlyArray<PlanId> = ["monthly", "yearly", "lifetime"];
 
 // ============================================================================
 // PRICES
@@ -56,16 +60,27 @@ export async function planPrices(): Promise<Record<PlanId, PlanPrice>> {
     return {
       id,
       priceId,
+      productId: asString(price["product"]) ?? "",
       amountMinor: asNumber(price["unit_amount"]) ?? 0,
       currency: asString(price["currency"]) ?? "usd",
       interval: interval === "month" || interval === "year" ? interval : null,
     };
   };
+  // A plan switched off (ENABLE_<PLAN>_PLAN=no) may have no price: it stands at 0 and is never sold (assertSold).
+  const readOrOff = async (id: PlanId): Promise<PlanPrice> => {
+    if (env.billing.enabled[id]) return read(id);
+    return read(id).catch(() => ({ id, priceId: "", productId: "", amountMinor: 0, currency: "usd", interval: id === "monthly" ? "month" : id === "yearly" ? "year" : null }));
+  };
 
-  const [monthly, yearly, lifetime] = await Promise.all([read("monthly"), read("yearly"), read("lifetime")]);
-  const prices = { monthly, yearly, lifetime };
+  const [monthly, yearly, lifetime] = await Promise.all(PLAN_IDS.map(readOrOff));
+  const prices = { monthly: monthly!, yearly: yearly!, lifetime: lifetime! };
   priceCache = { at: Date.now(), prices };
   return prices;
+}
+
+/** A plan switched off in env is not sold: not bought, not upgraded to. */
+export function assertSold(plan: PlanId): void {
+  if (!env.billing.enabled[plan]) throw new PlatformBillingError(400, "This plan is not currently available.", "plan_unavailable");
 }
 
 /** Lifetime is sold `LIFETIME_MAX` times, then closes (BEAF's "spots left"). */
@@ -76,8 +91,22 @@ export async function lifetimeAvailability(): Promise<{ total: number; remaining
 
 export async function plansView() {
   const prices = await planPrices();
+  const plans = [];
+  for (const price of [prices.monthly, prices.yearly, prices.lifetime]) {
+    const { id, amountMinor, currency, interval } = price;
+    // The plan's own discount (env), with the price it leaves, so the cards show both.
+    const discount = env.billing.enabled[id] ? await defaultDiscount(id, price) : null;
+    plans.push({
+      id,
+      enabled: env.billing.enabled[id],
+      amountMinor,
+      currency,
+      interval,
+      discount: discount ? { code: discount.code, percentOff: discount.percentOff, amountOffMinor: discount.amountOffMinor, amountMinor: discountedMinor(amountMinor, discount) } : null,
+    });
+  }
   return {
-    plans: [prices.monthly, prices.yearly, prices.lifetime].map(({ id, amountMinor, currency, interval }) => ({ id, amountMinor, currency, interval })),
+    plans,
     yearlySavingPercent: yearlySavingPercent(prices.monthly.amountMinor, prices.yearly.amountMinor),
     lifetime: await lifetimeAvailability(),
     publishableKey: env.billing.stripePublishableKey,
@@ -99,30 +128,124 @@ interface Project {
   siteName: string;
 }
 
-/** One Stripe customer per creator, made on their first checkout. */
+/**
+ * Whether a stored customer id still exists on the Stripe account this server
+ * now uses. False when Stripe does not know it (`resource_missing`: the keys
+ * moved between test and live mode, or to another account) or it was deleted.
+ * Any other failure is thrown, so a Stripe outage never replaces a good customer.
+ */
+async function customerExists(id: string): Promise<boolean> {
+  try {
+    const customer = await platformStripe("GET", `/customers/${encodeURIComponent(id)}`);
+    return customer["deleted"] !== true;
+  } catch (error) {
+    if (error instanceof PlatformBillingError && error.code === "resource_missing") return false;
+    throw error;
+  }
+}
+
+/**
+ * One Stripe customer per creator, made on their first checkout. A stored id
+ * Stripe no longer knows ("No such customer", after the platform keys changed
+ * mode or account) is replaced by a fresh customer instead of failing every
+ * checkout, upgrade, coupon, and portal call.
+ */
 async function ensureCustomer(owner: Owner): Promise<string> {
   const user = await prisma.user.findUnique({ where: { id: owner.id }, select: { stripeCustomerId: true } });
-  if (user?.stripeCustomerId) return user.stripeCustomerId;
+  const stale = user?.stripeCustomerId ?? null;
+  if (stale && (await customerExists(stale))) return stale;
 
   const customer = await platformStripe(
     "POST",
     "/customers",
     { email: owner.email, name: owner.name, metadata: { app: APP, user_id: owner.id } },
-    `customer-${owner.id}`
+    // A replacement gets its own key: the first one may still be cached by Stripe for 24 hours.
+    stale ? `customer-${owner.id}-replaces-${stale}` : `customer-${owner.id}`
   );
   const id = asString(customer["id"])!;
   await prisma.user.update({ where: { id: owner.id }, data: { stripeCustomerId: id } });
+  if (stale) console.warn(`[billing] replaced a Stripe customer this account does not know, for user ${owner.id}`);
   return id;
 }
 
-/** A promotion code's id, or a clear refusal. */
-async function promotionCode(code: string): Promise<{ id: string; percentOff: number | null; amountOffMinor: number | null }> {
-  const list = await platformStripe("GET", "/promotion_codes", { code, active: true, limit: 1 });
+/** An active Stripe promotion code, as the plans and checkout use it. */
+export interface Promo {
+  id: string;
+  /** The customer facing code, as Stripe stores it. */
+  code: string;
+  percentOff: number | null;
+  amountOffMinor: number | null;
+  /** The products its coupon is limited to; null or empty: every product. */
+  products: string[] | null;
+}
+
+/** A promotion code, active, or a clear refusal. */
+async function promotionCode(code: string): Promise<Promo> {
+  const list = await platformStripe("GET", "/promotion_codes", { code, active: true, limit: 1, expand: ["data.coupon.applies_to"] });
   const found = asRecord(Array.isArray(list["data"]) ? list["data"][0] : null);
   const id = asString(found["id"]);
   if (!id) throw new PlatformBillingError(400, "That coupon code is not valid.", "invalid_coupon");
   const coupon = asRecord(found["coupon"]);
-  return { id, percentOff: asNumber(coupon["percent_off"]), amountOffMinor: asNumber(coupon["amount_off"]) };
+  const products = asRecord(coupon["applies_to"])["products"];
+  return {
+    id,
+    code: asString(found["code"]) ?? code,
+    percentOff: asNumber(coupon["percent_off"]),
+    amountOffMinor: asNumber(coupon["amount_off"]),
+    products: Array.isArray(products) ? products.filter((entry): entry is string => typeof entry === "string") : null,
+  };
+}
+
+/** Whether Stripe would take this promotion code on this plan's price (its coupon's products). */
+export function promoFits(promo: Pick<Promo, "products">, price: Pick<PlanPrice, "productId">): boolean {
+  const only = promo.products ?? [];
+  return only.length === 0 || only.includes(price.productId);
+}
+
+/** What a price comes to with a discount, never below zero. */
+export function discountedMinor(amountMinor: number, discount: Pick<Promo, "percentOff" | "amountOffMinor"> | null): number {
+  if (!discount) return amountMinor;
+  if (discount.percentOff !== null) return Math.max(Math.round(amountMinor * (1 - discount.percentOff / 100)), 0);
+  return Math.max(amountMinor - (discount.amountOffMinor ?? 0), 0);
+}
+
+const discountCache = new Map<PlanId, { at: number; promo: Promo | null }>();
+
+/**
+ * The plan's own discount (<PLAN>_DISCOUNT_CODE): the promotion code set in env
+ * for it, when Stripe has it active and it applies to the plan's product. A code
+ * Stripe refuses, or one for another product, is left out, never an error: the
+ * plan then sells at its price.
+ */
+export async function defaultDiscount(plan: PlanId, price: PlanPrice): Promise<Promo | null> {
+  const code = env.billing.discounts[plan];
+  if (!code) return null;
+  const cached = discountCache.get(plan);
+  let promo: Promo | null;
+  if (cached && Date.now() - cached.at < PRICE_CACHE_MS) promo = cached.promo;
+  else {
+    promo = await promotionCode(code).catch(() => null);
+    discountCache.set(plan, { at: Date.now(), promo });
+  }
+  return promo && promoFits(promo, price) ? promo : null;
+}
+
+/** Test only. */
+export function resetBillingCaches(): void {
+  priceCache = null;
+  discountCache.clear();
+}
+
+/** A typed code that would not apply to this plan: said plainly, before Stripe is asked. */
+function assertFits(promo: Promo, price: PlanPrice): Promo {
+  if (!promoFits(promo, price)) throw new PlatformBillingError(400, "That code does not apply to this plan.", "coupon_not_eligible");
+  return promo;
+}
+
+/** The code the creator typed (checked for this plan), else the plan's own discount. */
+async function chosenPromo(plan: PlanId, coupon: string | undefined, price: PlanPrice): Promise<Promo | null> {
+  if (coupon) return assertFits(await promotionCode(coupon), price);
+  return defaultDiscount(plan, price);
 }
 
 // ============================================================================
@@ -146,12 +269,14 @@ const clientSecretOf = (invoice: StripeObject): string | null =>
 export async function startCheckout(owner: Owner, project: Project, plan: PlanId, coupon?: string): Promise<CheckoutResult> {
   const license = await resolveLicense(project.siteId);
   if (license.state === "active") throw new PlatformBillingError(400, "This project already has a plan. Upgrade it instead.", "already_subscribed");
+  assertSold(plan);
 
   const prices = await planPrices();
   const price = prices[plan];
   const customer = await ensureCustomer(owner);
   const metadata = { app: APP, site_id: project.siteId, user_id: owner.id, plan, project_name: project.siteName.slice(0, 200) };
-  const promo = coupon ? await promotionCode(coupon) : null;
+  // A typed code must apply to this plan; without one, the plan's own discount (env) if any.
+  const promo = await chosenPromo(plan, coupon, price);
 
   // Abandoned checkouts for this project: closed, so only one can ever complete.
   const stale = await prisma.pluginSubscription.findMany({
@@ -268,7 +393,7 @@ export async function applyCoupon(owner: Owner, project: Project, code: string):
     orderBy: { createdAt: "desc" },
   });
   if (!row) throw new PlatformBillingError(400, "Start the payment again, then apply the coupon.", "no_checkout");
-  const promo = await promotionCode(code);
+  const promo = assertFits(await promotionCode(code), (await planPrices())[row.plan as PlanId]);
 
   if (row.stripeSubscriptionId) {
     const prices = await planPrices();
@@ -582,6 +707,7 @@ export interface UpgradePreview {
 
 /** What an upgrade costs today, before the creator confirms it. */
 export async function upgradePreview(siteId: string, target: PlanId, now: Date = new Date()): Promise<UpgradePreview> {
+  assertSold(target);
   const current = await currentPlan(siteId);
   const prices = await planPrices();
   const quote = upgradeQuote({

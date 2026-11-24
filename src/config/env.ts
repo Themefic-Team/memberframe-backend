@@ -142,6 +142,27 @@ function intOf(keys: string[], fallback: number): number {
   return key ? int(key, fallback) : fallback;
 }
 
+/**
+ * Whether a plan is sold (as Hydra Booking and Social Share): ENABLE_<PLAN>_PLAN,
+ * or <PLAN>_PLAN_ENABLE, <PLAN>_PLAN_ENABLED, PLAN_<PLAN>_ENABLED. Unset: sold.
+ * yes, true, 1, on, enabled: sold; anything else: not.
+ */
+export function planEnabledEnv(plan: "MONTHLY" | "YEARLY" | "LIFETIME", source: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = source[`ENABLE_${plan}_PLAN`] ?? source[`${plan}_PLAN_ENABLE`] ?? source[`${plan}_PLAN_ENABLED`] ?? source[`PLAN_${plan}_ENABLED`];
+  if (raw === undefined || raw.trim() === "") return true;
+  return ["yes", "true", "1", "on", "enabled"].includes(raw.trim().toLowerCase());
+}
+
+/**
+ * A plan's own discount: a Stripe promotion code (its customer facing code),
+ * or null when unset or switched off (empty, null, undefined, none, false, 0).
+ * Kept as written: Stripe matches promotion codes case insensitively.
+ */
+export function discountCodeEnv(key: string, source: NodeJS.ProcessEnv = process.env): string | null {
+  const value = source[key]?.trim() ?? "";
+  return value === "" || ["null", "undefined", "none", "false", "0"].includes(value.toLowerCase()) ? null : value;
+}
+
 // ============================================================================
 // THE CONFIGURATION
 // ============================================================================
@@ -302,6 +323,22 @@ export const env = {
       yearly: firstOf("PLATFORM_PRICE_YEARLY", "STRIPE_PRICE_YEARLY"),
       lifetime: firstOf("PLATFORM_PRICE_LIFETIME", "STRIPE_PRICE_LIFETIME"),
     },
+    /**
+     * A Stripe promotion code each plan gets on its own (as Hydra's *_DISCOUNT_CODE):
+     * shown struck through on the plan cards and applied at checkout unless the
+     * creator types another code. Unset: none.
+     */
+    discounts: {
+      monthly: discountCodeEnv("MONTHLY_DISCOUNT_CODE"),
+      yearly: discountCodeEnv("YEARLY_DISCOUNT_CODE"),
+      lifetime: discountCodeEnv("LIFETIME_DISCOUNT_CODE"),
+    },
+    /** Which plans are sold. A plan switched off is hidden in the panel, refused at checkout, and needs no price. */
+    enabled: {
+      monthly: planEnabledEnv("MONTHLY"),
+      yearly: planEnabledEnv("YEARLY"),
+      lifetime: planEnabledEnv("LIFETIME"),
+    },
     /** How many lifetime plans are sold before the offer closes. BEAF: 20. */
     lifetimeMax: intOf(["LIFETIME_MAX", "LIFETIME_DEAL_MAX_USERS"], 20),
     trialDays: int("TRIAL_DURATION_DAYS", 7),
@@ -390,8 +427,13 @@ function crossChecks(): void {
         "PLATFORM_STRIPE_SECRET_KEY, PLATFORM_STRIPE_PUBLISHABLE_KEY and PLATFORM_STRIPE_WEBHOOK_SECRET (or BEAF's STRIPE_SECRET_KEY, STRIPE_PUBLISHABLE_KEY, STRIPE_WEBHOOK_SECRET) are required in production: without them no creator can subscribe."
       );
     }
-    if (!billing.prices.monthly || !billing.prices.yearly || !billing.prices.lifetime) {
-      invalid.push("PLATFORM_PRICE_MONTHLY, PLATFORM_PRICE_YEARLY and PLATFORM_PRICE_LIFETIME (or STRIPE_PRICE_*) are required in production. Create them with: npm run stripe:prices");
+    // Only a plan that is sold needs a price (ENABLE_<PLAN>_PLAN).
+    const unpriced = (["monthly", "yearly", "lifetime"] as const).filter((plan) => billing.enabled[plan] && !billing.prices[plan]);
+    if (unpriced.length > 0) {
+      invalid.push(`${unpriced.map((plan) => `PLATFORM_PRICE_${plan.toUpperCase()}`).join(", ")} (or STRIPE_PRICE_*) required in production for every plan that is sold. Create them with: npm run stripe:prices, or switch the plan off with ENABLE_<PLAN>_PLAN=no`);
+    }
+    if (!billing.enabled.monthly && !billing.enabled.yearly && !billing.enabled.lifetime) {
+      invalid.push("ENABLE_MONTHLY_PLAN, ENABLE_YEARLY_PLAN and ENABLE_LIFETIME_PLAN are all off: at least one plan must be sold");
     }
     if (!billing.instanceSealSecret) {
       invalid.push("INSTANCE_SEAL_SECRET is required in production. Generate one with: openssl rand -base64 32");
