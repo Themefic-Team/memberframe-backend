@@ -240,10 +240,11 @@ pluginBillingRouter.get(
 pluginBillingRouter.post(
   "/checkout",
   route(async (req, res) => {
-    const input = z.object({ siteId, plan, coupon: z.string().trim().max(60).optional() }).parse(req.body);
+    // `noDiscount`: the creator removed the code in the payment dialog, so not even the plan's own applies.
+    const input = z.object({ siteId, plan, coupon: z.string().trim().max(60).optional(), noDiscount: z.boolean().optional() }).parse(req.body);
     const { owner, project } = await ownedProject(req, input.siteId);
     guardPayments(req);
-    ok(res, { ...(await billing(() => startCheckout(owner, project, input.plan, input.coupon || undefined))) });
+    ok(res, { ...(await billing(() => startCheckout(owner, project, input.plan, input.coupon || undefined, input.noDiscount === true))) });
   })
 );
 
@@ -270,19 +271,19 @@ pluginBillingRouter.post(
 pluginBillingRouter.get(
   "/upgrade-preview",
   route(async (req, res) => {
-    const input = z.object({ siteId, targetPlan: plan }).parse(req.query);
+    const input = z.object({ siteId, targetPlan: plan, coupon: z.string().trim().max(60).optional() }).parse(req.query);
     const { project } = await ownedProject(req, input.siteId);
-    ok(res, { preview: await billing(() => upgradePreview(project.siteId, input.targetPlan)) });
+    ok(res, { preview: await billing(() => upgradePreview(project.siteId, input.targetPlan, new Date(), input.coupon || undefined)) });
   })
 );
 
 pluginBillingRouter.post(
   "/upgrade",
   route(async (req, res) => {
-    const input = z.object({ siteId, targetPlan: plan }).parse(req.body);
+    const input = z.object({ siteId, targetPlan: plan, coupon: z.string().trim().max(60).optional() }).parse(req.body);
     const { owner, project } = await ownedProject(req, input.siteId);
     guardPayments(req);
-    ok(res, { ...(await billing(() => upgrade(owner, project, input.targetPlan))) });
+    ok(res, { ...(await billing(() => upgrade(owner, project, input.targetPlan, input.coupon || undefined))) });
   })
 );
 

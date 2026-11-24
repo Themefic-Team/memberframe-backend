@@ -260,13 +260,18 @@ export interface CheckoutResult {
   currency: string;
   /** True when nothing is left to pay (a 100% coupon): the plan is already active. */
   complete: boolean;
+  /** The promotion code on this checkout (typed, or the plan's own), or null. */
+  couponCode?: string | null;
 }
 
 const clientSecretOf = (invoice: StripeObject): string | null =>
   asString(asRecord(invoice["payment_intent"])["client_secret"]);
 
-/** A first plan for a project with none. A project already on a plan upgrades instead. */
-export async function startCheckout(owner: Owner, project: Project, plan: PlanId, coupon?: string): Promise<CheckoutResult> {
+/**
+ * A first plan for a project with none. A project already on a plan upgrades instead.
+ * `noDiscount`: the creator removed the code, so not even the plan's own discount applies.
+ */
+export async function startCheckout(owner: Owner, project: Project, plan: PlanId, coupon?: string, noDiscount = false): Promise<CheckoutResult> {
   const license = await resolveLicense(project.siteId);
   if (license.state === "active") throw new PlatformBillingError(400, "This project already has a plan. Upgrade it instead.", "already_subscribed");
   assertSold(plan);
@@ -276,7 +281,8 @@ export async function startCheckout(owner: Owner, project: Project, plan: PlanId
   const customer = await ensureCustomer(owner);
   const metadata = { app: APP, site_id: project.siteId, user_id: owner.id, plan, project_name: project.siteName.slice(0, 200) };
   // A typed code must apply to this plan; without one, the plan's own discount (env) if any.
-  const promo = await chosenPromo(plan, coupon, price);
+  const promo = noDiscount && !coupon ? null : await chosenPromo(plan, coupon, price);
+  const couponCode = promo?.code ?? null;
 
   // Abandoned checkouts for this project: closed, so only one can ever complete.
   const stale = await prisma.pluginSubscription.findMany({
@@ -296,7 +302,7 @@ export async function startCheckout(owner: Owner, project: Project, plan: PlanId
         ? Math.round((price.amountMinor * promo.percentOff) / 100)
         : promo.amountOffMinor ?? 0
       : 0;
-    return createLifetimePayment(owner, project, customer, price, discount, 0, null, metadata, promo?.id ?? null);
+    return { ...(await createLifetimePayment(owner, project, customer, price, discount, 0, null, metadata, promo?.id ?? null)), couponCode };
   }
 
   const subscription = await platformStripe("POST", "/subscriptions", {
@@ -327,9 +333,9 @@ export async function startCheckout(owner: Owner, project: Project, plan: PlanId
 
   if (due === 0) {
     await syncSubscription(id);
-    return { clientSecret: null, mode: "subscription", amountDueMinor: 0, creditMinor: 0, currency: price.currency, complete: true };
+    return { clientSecret: null, mode: "subscription", amountDueMinor: 0, creditMinor: 0, currency: price.currency, complete: true, couponCode };
   }
-  return { clientSecret: clientSecretOf(invoice), mode: "subscription", amountDueMinor: due, creditMinor: 0, currency: price.currency, complete: false };
+  return { clientSecret: clientSecretOf(invoice), mode: "subscription", amountDueMinor: due, creditMinor: 0, currency: price.currency, complete: false, couponCode };
 }
 
 async function createLifetimePayment(
@@ -416,17 +422,18 @@ export async function applyCoupon(owner: Owner, project: Project, code: string):
     const due = asNumber(invoice["amount_due"]) ?? price.amountMinor;
     if (due === 0) {
       await syncSubscription(id);
-      return { clientSecret: null, mode: "subscription", amountDueMinor: 0, creditMinor: 0, currency: price.currency, complete: true };
+      return { clientSecret: null, mode: "subscription", amountDueMinor: 0, creditMinor: 0, currency: price.currency, complete: true, couponCode: promo.code };
     }
-    return { clientSecret: clientSecretOf(invoice), mode: "subscription", amountDueMinor: due, creditMinor: 0, currency: price.currency, complete: false };
+    return { clientSecret: clientSecretOf(invoice), mode: "subscription", amountDueMinor: due, creditMinor: 0, currency: price.currency, complete: false, couponCode: promo.code };
   }
 
   if (!row.stripePaymentIntentId) throw new PlatformBillingError(400, "Start the payment again, then apply the coupon.", "no_checkout");
   const intent = await platformStripe("GET", `/payment_intents/${row.stripePaymentIntentId}`);
-  const amount = asNumber(intent["amount"]) ?? row.amountMinor;
-  const discount = promo.percentOff !== null ? Math.round((amount * promo.percentOff) / 100) : promo.amountOffMinor ?? 0;
-  const next = Math.max(amount - discount, 0);
   const credit = Number(asRecord(intent["metadata"])["credit_minor"] ?? 0) || 0;
+  // The typed code replaces any code already on the payment (the plan's own, or an
+  // earlier one): worked out from the plan's price, never from the lowered amount.
+  const list = (await planPrices()).lifetime.amountMinor;
+  const next = Math.max(discountedMinor(list, promo) - credit, 0);
 
   if (next === 0) {
     await platformStripe("POST", `/payment_intents/${row.stripePaymentIntentId}/cancel`).catch(() => undefined);
@@ -439,7 +446,7 @@ export async function applyCoupon(owner: Owner, project: Project, code: string):
       paymentIntentId: row.stripePaymentIntentId,
       replacesSubscription: asString(asRecord(intent["metadata"])["replaces_subscription"]),
     });
-    return { clientSecret: null, mode: "payment", amountDueMinor: 0, creditMinor: credit, currency: row.currency, complete: true };
+    return { clientSecret: null, mode: "payment", amountDueMinor: 0, creditMinor: credit, currency: row.currency, complete: true, couponCode: promo.code };
   }
 
   const updated = await platformStripe("POST", `/payment_intents/${row.stripePaymentIntentId}`, {
@@ -447,7 +454,7 @@ export async function applyCoupon(owner: Owner, project: Project, code: string):
     metadata: { promotion_code: promo.id, coupon: code },
   });
   await prisma.pluginSubscription.update({ where: { id: row.id }, data: { amountMinor: next } });
-  return { clientSecret: asString(updated["client_secret"]), mode: "payment", amountDueMinor: next, creditMinor: credit, currency: row.currency, complete: false };
+  return { clientSecret: asString(updated["client_secret"]), mode: "payment", amountDueMinor: next, creditMinor: credit, currency: row.currency, complete: false, couponCode: promo.code };
 }
 
 // ============================================================================
@@ -703,20 +710,28 @@ export interface UpgradePreview {
   currency: string;
   /** When the new plan next renews; null for lifetime. */
   nextRenewal: string | null;
+  /** The promotion code on the upgrade (typed, or the plan's own), and what it takes off the plan's price. */
+  couponCode: string | null;
+  discountMinor: number | null;
 }
 
 /** What an upgrade costs today, before the creator confirms it. */
-export async function upgradePreview(siteId: string, target: PlanId, now: Date = new Date()): Promise<UpgradePreview> {
+export async function upgradePreview(siteId: string, target: PlanId, now: Date = new Date(), coupon?: string): Promise<UpgradePreview> {
   assertSold(target);
   const current = await currentPlan(siteId);
   const prices = await planPrices();
+  // A typed code must apply to the target plan; without one, the plan's own discount (env) if any.
+  const promo = await chosenPromo(target, coupon, prices[target]);
+  const targetPriceMinor = discountedMinor(prices[target].amountMinor, promo);
+  const couponCode = promo?.code ?? null;
+  const discountMinor = promo ? prices[target].amountMinor - targetPriceMinor : null;
   const quote = upgradeQuote({
     from: current.plan,
     to: target,
     paidMinor: current.amountMinor,
     periodStart: current.periodStart,
     periodEnd: current.periodEnd,
-    targetPriceMinor: prices[target].amountMinor,
+    targetPriceMinor,
     now,
   });
   if (!quote.allowed) throw new PlatformBillingError(400, quote.reason === "same_plan" ? "This project is already on that plan." : "Moving to a smaller plan is not available.", quote.reason ?? "downgrade_not_allowed");
@@ -732,6 +747,7 @@ export async function upgradePreview(siteId: string, target: PlanId, now: Date =
       subscription_proration_behavior: "always_invoice",
       subscription_billing_cycle_anchor: "now",
       subscription_proration_date: Math.floor(now.getTime() / 1000),
+      ...(promo ? { discounts: [{ promotion_code: promo.id }] } : {}),
     }).catch(() => null);
 
     if (upcoming) {
@@ -747,6 +763,8 @@ export async function upgradePreview(siteId: string, target: PlanId, now: Date =
         amountDueMinor: asNumber(upcoming["amount_due"]) ?? quote.amountDueMinor,
         currency: asString(upcoming["currency"]) ?? current.currency,
         nextRenewal: new Date(now.getTime() + 365 * 86_400_000).toISOString(),
+        couponCode,
+        discountMinor,
       };
     }
   }
@@ -758,6 +776,8 @@ export async function upgradePreview(siteId: string, target: PlanId, now: Date =
     amountDueMinor: quote.amountDueMinor,
     currency: prices[target].currency,
     nextRenewal: target === "lifetime" ? null : new Date(now.getTime() + 365 * 86_400_000).toISOString(),
+    couponCode,
+    discountMinor,
   };
 }
 
@@ -766,16 +786,18 @@ export async function upgradePreview(siteId: string, target: PlanId, now: Date =
  * immediate proration, charged to the saved card; to lifetime is a one-off
  * payment for the price less the credit, after which the old plan stops.
  */
-export async function upgrade(owner: Owner, project: Project, target: PlanId): Promise<CheckoutResult> {
-  const preview = await upgradePreview(project.siteId, target);
+export async function upgrade(owner: Owner, project: Project, target: PlanId, coupon?: string): Promise<CheckoutResult> {
+  const preview = await upgradePreview(project.siteId, target, new Date(), coupon);
   const current = await currentPlan(project.siteId);
   const prices = await planPrices();
+  const promo = await chosenPromo(target, coupon, prices[target]);
+  const couponCode = promo?.code ?? null;
 
   if (target === "lifetime") {
     if ((await lifetimeAvailability()).remaining <= 0) throw new PlatformBillingError(400, "Lifetime access is sold out.", "lifetime_sold_out");
     const customer = await ensureCustomer(owner);
     const metadata = { app: APP, site_id: project.siteId, user_id: owner.id, plan: "lifetime", project_name: project.siteName.slice(0, 200) };
-    return createLifetimePayment(owner, project, customer, prices.lifetime, 0, preview.creditMinor, current.stripeSubscriptionId, metadata, null);
+    return { ...(await createLifetimePayment(owner, project, customer, prices.lifetime, preview.discountMinor ?? 0, preview.creditMinor, current.stripeSubscriptionId, metadata, promo?.id ?? null)), couponCode };
   }
 
   if (!current.stripeSubscriptionId) throw new PlatformBillingError(400, "This plan cannot be changed here.", "no_subscription");
@@ -791,6 +813,7 @@ export async function upgrade(owner: Owner, project: Project, target: PlanId): P
     // leaves the creator on the plan they had.
     payment_behavior: "pending_if_incomplete",
     expand: ["latest_invoice.payment_intent"],
+    ...(promo ? { discounts: [{ promotion_code: promo.id }] } : {}),
   });
   await platformStripe("POST", `/subscriptions/${current.stripeSubscriptionId}`, { metadata: { plan: "yearly" } }).catch(() => undefined);
 
@@ -798,11 +821,11 @@ export async function upgrade(owner: Owner, project: Project, target: PlanId): P
   const intent = asRecord(invoice["payment_intent"]);
   const intentStatus = asString(intent["status"]);
   if (intentStatus === "requires_action" || intentStatus === "requires_payment_method" || intentStatus === "requires_confirmation") {
-    return { clientSecret: asString(intent["client_secret"]), mode: "subscription", amountDueMinor: preview.amountDueMinor, creditMinor: preview.creditMinor, currency: preview.currency, complete: false };
+    return { clientSecret: asString(intent["client_secret"]), mode: "subscription", amountDueMinor: preview.amountDueMinor, creditMinor: preview.creditMinor, currency: preview.currency, complete: false, couponCode };
   }
 
   await syncSubscription(current.stripeSubscriptionId);
-  return { clientSecret: null, mode: "subscription", amountDueMinor: preview.amountDueMinor, creditMinor: preview.creditMinor, currency: preview.currency, complete: true };
+  return { clientSecret: null, mode: "subscription", amountDueMinor: preview.amountDueMinor, creditMinor: preview.creditMinor, currency: preview.currency, complete: true, couponCode };
 }
 
 // ============================================================================
