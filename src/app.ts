@@ -22,6 +22,7 @@ import { reportsRouter } from "./routes/reports.js";
 import { emailRouter } from "./routes/email.js";
 import { licenseRouter } from "./routes/license.js";
 import { pluginBillingRouter } from "./routes/pluginBilling.js";
+import { pluginAnnouncementRouter } from "./routes/pluginAnnouncement.js";
 import { accountRouter, authPageRouter } from "./routes/creatorAccount.js";
 import { handlePlatformWebhook } from "./services/license/platformWebhook.js";
 import { requireActiveLicense } from "./middleware/license.js";
@@ -196,6 +197,9 @@ export function createApp(): Express {
   // the member list to anyone who viewed the page source.
 
   app.use("/api/connect", connectRouter);
+  // The Home promo campaign card (37-promo-campaign-card.md): public, ahead of
+  // the billing router, whose creatorAuth would refuse a signed out panel.
+  app.use("/api/plugin", pluginCors, pluginAnnouncementRouter);
   // MemberFrame's own plans, F19: license, checkout, upgrade, cancel, portal.
   app.use("/api/plugin", pluginCors, pluginBillingRouter);
   app.use("/api/site/payments", paymentsRouter);

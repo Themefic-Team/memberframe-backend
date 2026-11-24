@@ -273,6 +273,24 @@ export const env = {
    * own Stripe account, entirely separate from the creators' gateway keys in
    * `payments` above, which take their members' money.
    */
+  /**
+   * The promo campaign card on the panel's Home (37-promo-campaign-card.md),
+   * the same env names as Hydra Booking. Read by GET /api/plugin/announcement.
+   * Kept as raw strings on purpose: services/license/announcement.ts parses and
+   * validates them, and a bad value hides the card instead of stopping the server.
+   */
+  announcement: {
+    enabled: process.env["ANNOUNCEMENT_ENABLED"]?.trim() ?? "",
+    campaignId: process.env["ANNOUNCEMENT_CAMPAIGN_ID"]?.trim() ?? "",
+    couponCode: process.env["ANNOUNCEMENT_COUPON_CODE"]?.trim() ?? "",
+    countdownEnabled: process.env["ANNOUNCEMENT_COUNTDOWN_ENABLED"]?.trim() ?? "",
+    durationMinutes: process.env["ANNOUNCEMENT_DURATION_MINUTES"]?.trim() ?? "",
+    countdownVisibleMinutes: process.env["ANNOUNCEMENT_COUNTDOWN_VISIBLE_MINUTES"]?.trim() ?? "",
+    title: process.env["ANNOUNCEMENT_TITLE"]?.trim() ?? "",
+    subtitle: process.env["ANNOUNCEMENT_SUBTITLE"]?.trim() ?? "",
+    buttonText: process.env["ANNOUNCEMENT_BUTTON_TEXT"]?.trim() ?? "",
+    showTo: process.env["ANNOUNCEMENT_SHOW_TO"]?.trim() ?? "",
+  },
   billing: {
     // Each also reads BEAF's name (STRIPE_SECRET_KEY, ...). See `firstOf`.
     stripeSecretKey: firstOf("PLATFORM_STRIPE_SECRET_KEY", "STRIPE_SECRET_KEY"),
